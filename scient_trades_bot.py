@@ -3,7 +3,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from discord.ui import View, Button
-import os, json, re, hashlib
+from discord.ext import tasks
+import os, json, re, hashlib, aiohttp
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -15,6 +16,7 @@ if _env_file.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 BOT_TOKEN = os.getenv("SCIENT_BOT_TOKEN", "PASTE_TOKEN_HERE")
+TWITTERAPIS_KEY = os.getenv("TWITTERAPIS_KEY", "")
 GUILD_ID = 1524447325714518068
 TRADES_CHANNEL_ID = 1524447387974897665
 TRADE_UPDATES_CHANNEL_ID = 1525464605835530302
@@ -23,6 +25,11 @@ X_FEED_CHANNEL_ID = 1525470955810328696
 ANALYST_ROLE_NAME = "Analyst"
 PING_ROLE_ID = 1524499302502891570
 X_PING_ROLE_ID = 1525602499460071515
+
+# ---- X auto-feed config ----
+X_AUTO_USERNAME = "Crypto_Scient"
+X_POLL_MINUTES = 30
+X_AUTO_ENABLED = True
 
 ANALYSTS = {
     "scient":  {"color": "#1C4E80", "ping_role_id": 1525464714291970289, "user_ids": []},
@@ -35,6 +42,7 @@ ANALYSTS = {
 
 JOURNAL_FILE = Path(__file__).with_name("trades.json")
 BOARD_FILE = Path(__file__).with_name("board.json")
+XSEEN_FILE = Path(__file__).with_name("x_posted.json")
 NAVY = discord.Color.from_str("#1C4E80")
 GREEN = discord.Color.from_str("#2E7D32")
 RED = discord.Color.from_str("#C62828")
@@ -76,6 +84,19 @@ def load_board() -> dict:
 
 def save_board(d: dict):
     BOARD_FILE.write_text(json.dumps(d, indent=2))
+
+
+def load_xseen() -> dict:
+    if XSEEN_FILE.exists():
+        try:
+            return json.loads(XSEEN_FILE.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_xseen(d: dict):
+    XSEEN_FILE.write_text(json.dumps(d, indent=2))
 
 
 def is_analyst(interaction: discord.Interaction) -> bool:
@@ -301,7 +322,71 @@ async def refresh_board():
     save_board({"message_id": msg.id, "channel_id": ch.id})
 
 
-# ---------- Follow panel (buttons) ----------
+@tasks.loop(minutes=X_POLL_MINUTES)
+async def x_poll_loop():
+    if not (X_AUTO_ENABLED and TWITTERAPIS_KEY and X_FEED_CHANNEL_ID and X_AUTO_USERNAME):
+        return
+    channel = bot.get_channel(X_FEED_CHANNEL_ID)
+    if channel is None:
+        return
+    query = f"from:{X_AUTO_USERNAME} -filter:replies -filter:retweets"
+    url = "https://api.twitterapis.com/twitter/tweet/advanced_search"
+    params = {"query": query, "product": "Latest"}
+    headers = {"Authorization": f"Bearer {TWITTERAPIS_KEY}"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers, timeout=30) as resp:
+                if resp.status != 200:
+                    print(f"[x_poll] non-200: {resp.status}")
+                    return
+                data = await resp.json()
+    except Exception as e:
+        print(f"[x_poll] error: {e}")
+        return
+    tweets = data.get("tweets", []) or []
+    if not tweets:
+        return
+    seen = load_xseen()
+    seen_ids = set(seen.get("ids", []))
+    first_run = not seen.get("initialized", False)
+    new_tweets = [tw for tw in tweets if str(tw.get("id")) not in seen_ids]
+    new_tweets.reverse()
+    if first_run:
+        for tw in tweets:
+            seen_ids.add(str(tw.get("id")))
+        seen["ids"] = list(seen_ids)[-500:]
+        seen["initialized"] = True
+        save_xseen(seen)
+        print(f"[x_poll] first run - seeded {len(tweets)} tweets, none posted")
+        return
+    for tw in new_tweets:
+        tid = str(tw.get("id"))
+        username = (tw.get("author") or {}).get("username", X_AUTO_USERNAME)
+        link = f"https://x.com/{username}/status/{tid}"
+        fixed = fix_x_link(link)
+        parts = []
+        allowed = discord.AllowedMentions.none()
+        if X_PING_ROLE_ID:
+            parts.append(f"<@&{X_PING_ROLE_ID}>")
+            allowed = discord.AllowedMentions(roles=True)
+        parts.append(fixed)
+        try:
+            await channel.send(content="\n".join(parts), allowed_mentions=allowed)
+            seen_ids.add(tid)
+        except Exception as e:
+            print(f"[x_poll] post error: {e}")
+    seen["ids"] = list(seen_ids)[-500:]
+    seen["initialized"] = True
+    save_xseen(seen)
+    if new_tweets:
+        print(f"[x_poll] posted {len(new_tweets)} new tweet(s)")
+
+
+@x_poll_loop.before_loop
+async def before_x_poll():
+    await bot.wait_until_ready()
+
+
 async def toggle_role(interaction: discord.Interaction, role_id, label: str):
     if not role_id:
         await interaction.response.send_message(f"Pings for **{label}** aren't set up yet.", ephemeral=True)
@@ -361,8 +446,10 @@ async def on_ready():
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
     await bot.tree.sync(guild=guild)
-    bot.add_view(FollowPanel())  # persistent buttons across restarts
+    bot.add_view(FollowPanel())
     await refresh_board()
+    if X_AUTO_ENABLED and not x_poll_loop.is_running():
+        x_poll_loop.start()
     print(f"Logged in as {bot.user} - commands synced.")
 
 
@@ -729,6 +816,41 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     embed.add_field(name="Worst", value=(f"{worst:+g}R" if worst is not None else "-"), inline=True)
     embed.set_footer(text="Scient Lounge - Journal")
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="xtest", description="(Admin) Test the X auto-feed connection")
+async def xtest(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if not TWITTERAPIS_KEY:
+        await interaction.followup.send("TWITTERAPIS_KEY not set in .env.", ephemeral=True)
+        return
+    query = f"from:{X_AUTO_USERNAME} -filter:replies -filter:retweets"
+    url = "https://api.twitterapis.com/twitter/tweet/advanced_search"
+    params = {"query": query, "product": "Latest"}
+    headers = {"Authorization": f"Bearer {TWITTERAPIS_KEY}"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers, timeout=30) as resp:
+                status = resp.status
+                data = await resp.json()
+    except Exception as e:
+        await interaction.followup.send(f"Error: {e}", ephemeral=True)
+        return
+    if status != 200:
+        await interaction.followup.send(f"API returned {status}: {str(data)[:400]}", ephemeral=True)
+        return
+    tweets = data.get("tweets", []) or []
+    if not tweets:
+        await interaction.followup.send("Connected OK, but no tweets returned for that query.", ephemeral=True)
+        return
+    latest = tweets[0]
+    await interaction.followup.send(
+        f"Connected. Latest tweet from @{X_AUTO_USERNAME}:\nID: {latest.get('id')}\nText: {str(latest.get('text'))[:200]}",
+        ephemeral=True,
+    )
 
 
 bot.run(BOT_TOKEN)
