@@ -17,14 +17,14 @@ if _env_file.exists():
 
 BOT_TOKEN = os.getenv("SCIENT_BOT_TOKEN", "PASTE_TOKEN_HERE")
 TWITTERAPIS_KEY = os.getenv("TWITTERAPIS_KEY", "")
-GUILD_ID = 1524447325714518068
-TRADES_CHANNEL_ID = 1524447387974897665
-TRADE_UPDATES_CHANNEL_ID = 1525464605835530302
-OPEN_BOARD_CHANNEL_ID = 1525468999695995001
-X_FEED_CHANNEL_ID = 1525470955810328696
+GUILD_ID = 1213101801675554846
+TRADES_CHANNEL_ID = 1525147189360332840
+TRADE_UPDATES_CHANNEL_ID = 1525863205174378617
+OPEN_BOARD_CHANNEL_ID = 1525863082256109690
+X_FEED_CHANNEL_ID = 1525862152076923020
 ANALYST_ROLE_NAME = "Analyst"
-PING_ROLE_ID = 1524499302502891570
-X_PING_ROLE_ID = 1525602499460071515
+PING_ROLE_ID = 1525861312729452704
+X_PING_ROLE_ID = 1525861448088031462
 
 # ---- X auto-feed config ----
 X_AUTO_USERNAME = "Crypto_Scient"
@@ -32,12 +32,9 @@ X_POLL_MINUTES = 30
 X_AUTO_ENABLED = True
 
 ANALYSTS = {
-    "scient":  {"color": "#1C4E80", "ping_role_id": 1525464714291970289, "user_ids": []},
-    "owais":   {"color": "#7C3AED", "ping_role_id": None, "user_ids": []},
-    "94":      {"color": "#2E7D32", "ping_role_id": None, "user_ids": []},
-    "michael": {"color": "#C0392B", "ping_role_id": None, "user_ids": []},
-    "delta":   {"color": "#F1C40F", "ping_role_id": None, "user_ids": []},
-    "gaijin":  {"color": "#14B8A6", "ping_role_id": None, "user_ids": []},
+    "scient":  {"color": "#1C4E80", "ping_role_id": 1481692018211291186, "user_ids": [249880856993202187]},
+    "owais":   {"color": "#7C3AED", "ping_role_id": 1498738610118066286, "user_ids": [1120017600026513468]},
+    "94":      {"color": "#2E7D32", "ping_role_id": 1493498310558748742, "user_ids": [1268246432197120090]},
 }
 
 JOURNAL_FILE = Path(__file__).with_name("trades.json")
