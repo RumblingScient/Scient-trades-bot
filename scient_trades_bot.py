@@ -115,6 +115,11 @@ def parse_r(val):
         return None
 
 
+def tf(t: dict) -> str:
+    v = t.get("timeframe")
+    return v.upper() if v else ""
+
+
 def fmt_risk(val):
     if val is None:
         return None
@@ -142,32 +147,15 @@ def fix_x_link(url: str) -> str:
     return re.sub(r"https?://(www\.)?(twitter|x)\.com", "https://fxtwitter.com", url, flags=re.I)
 
 
-def has_ladder(t: dict) -> bool:
-    return bool(t.get("entry2"))
-
-
 def any_entry_filled(t: dict) -> bool:
-    return bool(t.get("entry1_filled") or t.get("entry2_filled"))
+    return bool(t.get("entry1_filled"))
 
 
 def entry_display(t: dict, marks: bool = True) -> str:
-    e1 = t.get("entry")
-    e2 = t.get("entry2")
-    w1 = t.get("weight1")
-    w2 = t.get("weight2")
-    f1 = t.get("entry1_filled")
-    f2 = t.get("entry2_filled")
-    if not e2:
-        s = str(e1)
-        if marks:
-            s += " OK" if f1 else " ..."
-        return s
-    p1 = f"{e1}" + (f" ({w1}%)" if w1 else "")
-    p2 = f"{e2}" + (f" ({w2}%)" if w2 else "")
+    s = str(t.get("entry"))
     if marks:
-        p1 += " OK" if f1 else " []"
-        p2 += " OK" if f2 else " []"
-    return f"{p1} + {p2}"
+        s += " OK" if t.get("entry1_filled") else " ..."
+    return s
 
 
 def full_status(t: dict) -> str:
@@ -189,11 +177,7 @@ def full_status(t: dict) -> str:
     if t.get("be"):
         return "MOVED TO BREAKEVEN"
     if any_entry_filled(t):
-        if has_ladder(t) and not (t.get("entry1_filled") and t.get("entry2_filled")):
-            filled_w = t.get("weight1") if t.get("entry1_filled") else t.get("weight2")
-            wtxt = f" ({filled_w}%)" if filled_w else ""
-            return f"ACTIVE - partial{wtxt}"
-        return "ACTIVE - full position" if has_ladder(t) else "ACTIVE"
+        return "ACTIVE"
     return "PENDING - waiting for fill"
 
 
@@ -207,8 +191,6 @@ def short_status(t: dict) -> str:
     if t.get("be"):
         return "BE"
     if any_entry_filled(t):
-        if has_ladder(t) and not (t.get("entry1_filled") and t.get("entry2_filled")):
-            return "Partial"
         return "Active"
     return "Pending"
 
@@ -251,7 +233,11 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
         prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "")
     elif not any_entry_filled(t):
         prefix = "[PENDING] "
-    embed = discord.Embed(title=f"{prefix}{arrow} | {t['pair'].upper()} | {t['timeframe'].upper()}", color=color)
+    tftxt = tf(t)
+    title = f"{prefix}{arrow} | {t['pair'].upper()}"
+    if tftxt:
+        title += f" | {tftxt}"
+    embed = discord.Embed(title=title, color=color)
     if t.get("created_at"):
         try:
             embed.timestamp = datetime.fromisoformat(t["created_at"])
@@ -265,12 +251,9 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     if t.get("setup_detail"):
         fw = f"{fw} - {t['setup_detail']}"
     embed.add_field(name="Setup", value=fw, inline=False)
-    laddered = has_ladder(t)
-    embed.add_field(name="Entry" + (" (laddered)" if laddered else ""), value=entry_display(t), inline=not laddered)
+    embed.add_field(name="Entry", value=entry_display(t), inline=True)
     embed.add_field(name="Stop Loss", value=f"{t['sl']}{sl_mark}", inline=True)
     embed.add_field(name="Risk", value=fmt_risk(t.get("risk")) or "-", inline=True)
-    if laddered:
-        embed.add_field(name="\u200b", value="\u200b", inline=True)
     embed.add_field(name="TP1", value=(f"{t['tp1']}{tp1_mark}" if t.get("tp1") else "-"), inline=True)
     embed.add_field(name="TP2", value=(f"{t['tp2']}{tp2_mark}" if t.get("tp2") else "-"), inline=True)
     embed.add_field(name="TP3", value=(f"{t['tp3']}{tp3_mark}" if t.get("tp3") else "-"), inline=True)
@@ -313,7 +296,7 @@ def build_board_embed() -> discord.Embed:
         for t in trades:
             d = "L" if t["direction"] == "LONG" else "S"
             e = entry_display(t, marks=False)
-            lines.append(f"[{d}] **{t['pair'].upper()}** - {t['timeframe'].upper()} - entry `{e}` - {short_status(t)} - [view]({jump_url(t)})")
+            lines.append(f"[{d}] **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "") + f" - entry `{e}` - {short_status(t)} - [view]({jump_url(t)})")
         embed.add_field(name=f"{name} ({len(trades)})", value="\n".join(lines)[:1024], inline=False)
     return embed
 
@@ -497,14 +480,14 @@ async def setup_follow_panel(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="trade", description="Post a trade setup")
-@app_commands.describe(pair="e.g. BTC/USDT", direction="Long or Short", entry="Entry / first bid", stop_loss="SL", risk="Account risk (just a number = %, e.g. 1 shows as 1%)", rr="Risk:Reward", framework="Setup framework (optional)", framework2="Second framework (optional)", chart="Chart image (optional)", tp1="Take profit 1 (optional)", timeframe="e.g. 4H (optional)", entry_type="Limit or Market (optional)", entry2="Second bid - laddered (optional)", weight1="First bid % (optional)", weight2="Second bid % (optional)", setup_detail="Extra specifics (optional)", tp2="TP2 (optional)", tp3="TP3 (optional)", notes="Reasoning (optional)")
+@app_commands.describe(pair="e.g. BTC/USDT", direction="Long or Short", entry="Entry price (or a range for DCA, e.g. 64000 - 62000 (50/50))", stop_loss="SL", risk="Account risk (just a number = %, e.g. 1 shows as 1%)", rr="Risk:Reward", entry_type="Limit (pending) or Market (filled now)", framework="Setup framework (optional)", framework2="Second framework (optional)", chart="Chart image (optional)", tp1="Take profit 1 (optional)", timeframe="e.g. 4H (optional)", setup_detail="Extra specifics (optional)", tp2="TP2 (optional)", tp3="TP3 (optional)", notes="Reasoning (optional)")
 @app_commands.choices(
     direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")],
     framework=[app_commands.Choice(name=f, value=f) for f in FRAMEWORKS],
     framework2=[app_commands.Choice(name=f, value=f) for f in FRAMEWORKS],
     entry_type=[app_commands.Choice(name="Limit - pending fill", value="LIMIT"), app_commands.Choice(name="Market - filled now", value="MARKET")],
 )
-async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, rr: str, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, entry_type: app_commands.Choice[str] = None, entry2: str = None, weight1: int = None, weight2: int = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
+async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, rr: str, entry_type: app_commands.Choice[str], framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message(f"Only members with the **{ANALYST_ROLE_NAME}** role can post setups.", ephemeral=True)
         return
@@ -512,9 +495,6 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     channel = bot.get_channel(TRADES_CHANNEL_ID)
     if channel is None:
         await interaction.followup.send("Trades channel not found - check TRADES_CHANNEL_ID.", ephemeral=True)
-        return
-    if entry2 and weight1 and weight2 and (weight1 + weight2 != 100):
-        await interaction.followup.send(f"Weights should add up to 100% (you entered {weight1} + {weight2} = {weight1 + weight2}).", ephemeral=True)
         return
     is_market = entry_type and entry_type.value == "MARKET"
     akey, acfg = resolve_analyst(interaction.user)
@@ -525,10 +505,10 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
         "analyst_color": analyst_color_hex(interaction.user),
         "pair": pair, "direction": direction.value, "timeframe": timeframe,
         "framework": frameworks[0] if frameworks else None, "frameworks": frameworks, "setup_detail": setup_detail,
-        "entry": entry, "entry2": entry2, "weight1": weight1, "weight2": weight2, "sl": stop_loss,
+        "entry": entry, "sl": stop_loss,
         "tp1": tp1, "tp2": tp2, "tp3": tp3, "rr": rr, "risk": risk, "notes": notes,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "entry1_filled": bool(is_market), "entry2_filled": bool(is_market and entry2),
+        "entry1_filled": bool(is_market),
         "tp1_hit": False, "tp2_hit": False, "tp3_hit": False, "sl_hit": False, "be": False,
         "closed": False, "result": None, "result_r": None, "close_note": None,
     }
@@ -572,7 +552,7 @@ async def open_trades_ac(interaction: discord.Interaction, current: str):
             continue
         if not is_admin and t.get("analyst_id") != interaction.user.id:
             continue
-        label = f"{t['pair'].upper()} {t['direction']} {t['timeframe']} - {short_status(t)}"
+        label = f"{t['pair'].upper()} {t['direction']} {tf(t)} - {short_status(t)}"
         if current.lower() in label.lower():
             out.append(app_commands.Choice(name=label[:100], value=mid))
     return out[:25]
@@ -602,7 +582,7 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str)
     if ch is None:
         return
     e = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
-    e.description = f"**{t['pair'].upper()} {t['direction']} - {t['timeframe'].upper()}**\n{line}\n[View original call]({jump_url(t)})"
+    e.description = f"**{t['pair'].upper()} {t['direction']}" + (f" - {tf(t)}" if tf(t) else "") + f"**\n{line}\n[View original call]({jump_url(t)})"
     e.set_author(name=t["analyst_name"], icon_url=t.get("analyst_avatar") or None)
     e.set_footer(text="Scient Lounge - Trade Updates")
     await ch.send(embed=e)
@@ -611,9 +591,7 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str)
 @bot.tree.command(name="update", description="Update a running trade")
 @app_commands.describe(trade="Pick an open trade", event="What happened", note="Optional note")
 @app_commands.choices(event=[
-    app_commands.Choice(name="Entry Filled (single/full)", value="EF"),
-    app_commands.Choice(name="Entry 1 Filled (ladder)", value="E1"),
-    app_commands.Choice(name="Entry 2 Filled (ladder)", value="E2"),
+    app_commands.Choice(name="Entry Filled (activate trade)", value="EF"),
     app_commands.Choice(name="TP1 Hit", value="TP1"),
     app_commands.Choice(name="TP2 Hit", value="TP2"),
     app_commands.Choice(name="TP3 Hit", value="TP3"),
@@ -633,23 +611,15 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         return
     feed = {
         "EF": ("Entry Filled", BLUE, "Entry filled - position live."),
-        "E1": ("Entry 1 Filled", BLUE, "First bid filled - partial position."),
-        "E2": ("Entry 2 Filled", BLUE, "Second bid filled - full position."),
         "TP1": ("TP1 Hit", GREEN, "Take profit 1 reached."),
         "TP2": ("TP2 Hit", GREEN, "Take profit 2 reached."),
         "TP3": ("TP3 Hit", GREEN, "Take profit 3 reached."),
         "SL": ("Stopped Out", RED, "Stop loss hit - closed as loss."),
         "BE": ("Moved to Breakeven", GREY, "Stop moved to breakeven."),
     }
-    thread_map = {"EF": "Entry filled", "E1": "Entry 1 filled", "E2": "Entry 2 filled", "TP1": "TP1 hit", "TP2": "TP2 hit", "TP3": "TP3 hit", "SL": "Stopped out", "BE": "Moved to breakeven"}
+    thread_map = {"EF": "Entry filled", "TP1": "TP1 hit", "TP2": "TP2 hit", "TP3": "TP3 hit", "SL": "Stopped out", "BE": "Moved to breakeven"}
     if event.value == "EF":
         t["entry1_filled"] = True
-        if t.get("entry2"):
-            t["entry2_filled"] = True
-    elif event.value == "E1":
-        t["entry1_filled"] = True
-    elif event.value == "E2":
-        t["entry2_filled"] = True
     elif event.value == "TP1":
         t["tp1_hit"] = True; t["entry1_filled"] = True
     elif event.value == "TP2":
