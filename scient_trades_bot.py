@@ -153,8 +153,8 @@ def any_entry_filled(t: dict) -> bool:
 
 def entry_display(t: dict, marks: bool = True) -> str:
     s = str(t.get("entry"))
-    if marks:
-        s += " OK" if t.get("entry1_filled") else " ..."
+    if marks and not t.get("closed"):
+        s += " (filled)" if t.get("entry1_filled") else " (pending)"
     return s
 
 
@@ -251,15 +251,16 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     if t.get("setup_detail"):
         fw = f"{fw} - {t['setup_detail']}"
     embed.add_field(name="Setup", value=fw, inline=False)
+    type_label = "Market" if t.get("entry_type") == "MARKET" else "Limit"
+    embed.add_field(name="Type", value=type_label, inline=True)
     embed.add_field(name="Entry", value=entry_display(t), inline=True)
+    embed.add_field(name="\u200b", value="\u200b", inline=True)
     embed.add_field(name="Stop Loss", value=f"{t['sl']}{sl_mark}", inline=True)
     embed.add_field(name="Risk", value=fmt_risk(t.get("risk")) or "-", inline=True)
+    embed.add_field(name="R:R", value=t.get("rr") or "-", inline=True)
     embed.add_field(name="TP1", value=(f"{t['tp1']}{tp1_mark}" if t.get("tp1") else "-"), inline=True)
     embed.add_field(name="TP2", value=(f"{t['tp2']}{tp2_mark}" if t.get("tp2") else "-"), inline=True)
     embed.add_field(name="TP3", value=(f"{t['tp3']}{tp3_mark}" if t.get("tp3") else "-"), inline=True)
-    embed.add_field(name="R:R", value=t.get("rr") or "-", inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
     embed.add_field(name="Status", value=full_status(t), inline=False)
     if t.get("notes"):
         embed.add_field(name="Reasoning", value=t["notes"][:1024], inline=False)
@@ -505,7 +506,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
         "analyst_color": analyst_color_hex(interaction.user),
         "pair": pair, "direction": direction.value, "timeframe": timeframe,
         "framework": frameworks[0] if frameworks else None, "frameworks": frameworks, "setup_detail": setup_detail,
-        "entry": entry, "sl": stop_loss,
+        "entry": entry, "sl": stop_loss, "entry_type": entry_type.value,
         "tp1": tp1, "tp2": tp2, "tp3": tp3, "rr": rr, "risk": risk, "notes": notes,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "entry1_filled": bool(is_market),
