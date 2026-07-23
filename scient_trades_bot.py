@@ -26,6 +26,8 @@ ANALYST_ROLE_NAME = "Analyst"
 PING_ROLE_ID = 1525861312729452704
 X_PING_ROLE_ID = 1525861448088031462
 
+EDIT_WINDOW_MIN = 10  # minutes after posting during which /edit is allowed
+
 # ---- X auto-feed config ----
 X_AUTO_USERNAME = "Crypto_Scient"
 X_POLL_MINUTES = 30
@@ -216,6 +218,14 @@ def jump_url(t: dict) -> str:
     return f"https://discord.com/channels/{GUILD_ID}/{t['channel_id']}/{t['message_id']}"
 
 
+def within_edit_window(t: dict) -> bool:
+    try:
+        created = datetime.fromisoformat(t["created_at"])
+    except Exception:
+        return False
+    return (datetime.now(timezone.utc) - created).total_seconds() <= EDIT_WINDOW_MIN * 60
+
+
 def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     is_long = t["direction"] == "LONG"
     closed = t.get("closed")
@@ -264,7 +274,10 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     if t.get("close_note"):
         embed.add_field(name="Closing Note", value=t["close_note"][:1024], inline=False)
     embed.set_author(name=t["analyst_name"], icon_url=t.get("analyst_avatar") or None)
-    embed.set_footer(text="Scient Lounge - Trade Setups")
+    footer = "Scient Lounge - Trade Setups"
+    if t.get("edited"):
+        footer += " · edited"
+    embed.set_footer(text=footer)
     if image_url:
         embed.set_image(url=image_url)
     return embed
@@ -509,6 +522,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
         "entry1_filled": bool(is_market),
         "tp1_hit": False, "tp2_hit": False, "tp3_hit": False, "sl_hit": False, "be": False,
         "closed": False, "result": None, "result_r": None, "close_note": None,
+        "edited": False,
     }
     files = []
     embed = build_embed(t)
@@ -556,6 +570,23 @@ async def open_trades_ac(interaction: discord.Interaction, current: str):
     return out[:25]
 
 
+async def editable_trades_ac(interaction: discord.Interaction, current: str):
+    data = load_trades()
+    is_admin = interaction.user.guild_permissions.administrator
+    out = []
+    for mid, t in data.items():
+        if t.get("closed"):
+            continue
+        if not is_admin and t.get("analyst_id") != interaction.user.id:
+            continue
+        if not is_admin and not within_edit_window(t):
+            continue
+        label = f"{t['pair'].upper()} {t['direction']} {tf(t)} - {short_status(t)}"
+        if current.lower() in label.lower():
+            out.append(app_commands.Choice(name=label[:100], value=mid))
+    return out[:25]
+
+
 async def refresh_and_edit(t: dict):
     channel = bot.get_channel(t["channel_id"])
     msg = await channel.fetch_message(t["message_id"])
@@ -584,6 +615,115 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str)
     e.set_author(name=t["analyst_name"], icon_url=t.get("analyst_avatar") or None)
     e.set_footer(text="Scient Lounge - Trade Updates")
     await ch.send(embed=e)
+
+
+@bot.tree.command(name="edit", description="Fix a mistake in a recently posted trade (within the edit window)")
+@app_commands.describe(
+    trade="Pick your recent trade",
+    pair="Corrected pair (optional)",
+    direction="Corrected direction (optional)",
+    entry="Corrected entry (optional)",
+    stop_loss="Corrected SL (optional)",
+    risk="Corrected risk (optional)",
+    rr="Corrected R:R (optional)",
+    entry_type="Corrected entry type (optional)",
+    framework="Corrected framework (optional)",
+    framework2="Corrected second framework (optional)",
+    chart="Replacement chart image (optional)",
+    tp1="Corrected TP1 (optional)",
+    tp2="Corrected TP2 (optional)",
+    tp3="Corrected TP3 (optional)",
+    timeframe="Corrected timeframe (optional)",
+    setup_detail="Corrected setup detail (optional)",
+    notes="Corrected reasoning (optional)",
+)
+@app_commands.choices(
+    direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")],
+    framework=[app_commands.Choice(name=f, value=f) for f in FRAMEWORKS],
+    framework2=[app_commands.Choice(name=f, value=f) for f in FRAMEWORKS],
+    entry_type=[app_commands.Choice(name="Limit - pending fill", value="LIMIT"), app_commands.Choice(name="Market - filled now", value="MARKET")],
+)
+@app_commands.autocomplete(trade=editable_trades_ac)
+async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, stop_loss: str = None, risk: str = None, rr: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
+    if not is_analyst(interaction):
+        await interaction.response.send_message("Analysts only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    data = load_trades()
+    t = data.get(trade)
+    if not t:
+        await interaction.followup.send("Trade not found.", ephemeral=True)
+        return
+    is_admin = interaction.user.guild_permissions.administrator
+    if not is_admin and t.get("analyst_id") != interaction.user.id:
+        await interaction.followup.send("You can only edit your own trades.", ephemeral=True)
+        return
+    if not is_admin and not within_edit_window(t):
+        await interaction.followup.send(
+            f"Edit window ({EDIT_WINDOW_MIN} min) has expired for this trade. Use `/update` for status changes, or ask an admin.",
+            ephemeral=True,
+        )
+        return
+    changes = []
+    if pair is not None:
+        t["pair"] = pair; changes.append("pair")
+    if direction is not None:
+        t["direction"] = direction.value; changes.append("direction")
+    if entry is not None:
+        t["entry"] = entry; changes.append("entry")
+    if stop_loss is not None:
+        t["sl"] = stop_loss; changes.append("SL")
+    if risk is not None:
+        t["risk"] = risk; changes.append("risk")
+    if rr is not None:
+        t["rr"] = rr; changes.append("R:R")
+    if entry_type is not None:
+        t["entry_type"] = entry_type.value
+        t["entry1_filled"] = entry_type.value == "MARKET"
+        changes.append("entry type")
+    if framework is not None or framework2 is not None:
+        fws = [f.value for f in (framework, framework2) if f]
+        t["frameworks"] = fws
+        t["framework"] = fws[0] if fws else None
+        changes.append("framework")
+    if tp1 is not None:
+        t["tp1"] = tp1; changes.append("TP1")
+    if tp2 is not None:
+        t["tp2"] = tp2; changes.append("TP2")
+    if tp3 is not None:
+        t["tp3"] = tp3; changes.append("TP3")
+    if timeframe is not None:
+        t["timeframe"] = timeframe; changes.append("timeframe")
+    if setup_detail is not None:
+        t["setup_detail"] = setup_detail; changes.append("setup detail")
+    if notes is not None:
+        t["notes"] = notes; changes.append("notes")
+    if chart is not None:
+        changes.append("chart")
+    if not changes:
+        await interaction.followup.send("Nothing to change - fill at least one field.", ephemeral=True)
+        return
+    t["edited"] = True
+    data[trade] = t
+    save_trades(data)
+    channel = bot.get_channel(t["channel_id"])
+    try:
+        msg = await channel.fetch_message(t["message_id"])
+    except Exception:
+        await interaction.followup.send("Original message not found - it may have been deleted.", ephemeral=True)
+        return
+    if chart is not None:
+        f = await chart.to_file()
+        embed = build_embed(t)
+        embed.set_image(url=f"attachment://{chart.filename}")
+        await msg.edit(embed=embed, attachments=[f])
+    else:
+        image_url = msg.attachments[0].url if msg.attachments else None
+        await msg.edit(embed=build_embed(t, image_url=image_url))
+    await refresh_board()
+    changed_txt = ", ".join(changes)
+    await thread_note(t, f"**Setup edited** - corrected: {changed_txt}")
+    await interaction.followup.send(f"Trade updated ({changed_txt}). {jump_url(t)}", ephemeral=True)
 
 
 @bot.tree.command(name="update", description="Update a running trade")
