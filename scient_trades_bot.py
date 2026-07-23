@@ -6,7 +6,7 @@ from discord.ui import View, Button
 from discord.ext import tasks
 import os, json, re, hashlib, aiohttp
 from pathlib import Path
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
 _env_file = Path(__file__).with_name(".env")
 if _env_file.exists():
@@ -42,6 +42,7 @@ ANALYSTS = {
 JOURNAL_FILE = Path(__file__).with_name("trades.json")
 BOARD_FILE = Path(__file__).with_name("board.json")
 XSEEN_FILE = Path(__file__).with_name("x_posted.json")
+IST = timezone(timedelta(hours=5, minutes=30))
 NAVY = discord.Color.from_str("#1C4E80")
 GREEN = discord.Color.from_str("#2E7D32")
 RED = discord.Color.from_str("#C62828")
@@ -245,11 +246,6 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     if tftxt:
         title += f" | {tftxt}"
     embed = discord.Embed(title=title, color=color)
-    if t.get("created_at"):
-        try:
-            embed.timestamp = datetime.fromisoformat(t["created_at"])
-        except Exception:
-            pass
     sl_mark = " (hit)" if t.get("sl_hit") else ""
     tp1_mark = " OK" if t.get("tp1_hit") else ""
     tp2_mark = " OK" if t.get("tp2_hit") else ""
@@ -275,7 +271,13 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
         embed.add_field(name="Closing Note", value=t["close_note"][:1024], inline=False)
     embed.set_author(name=t["analyst_name"], icon_url=t.get("analyst_avatar") or None)
     footer = "Scient Lounge - Trade Setups"
-    if t.get("edited"):
+    if t.get("edited_at"):
+        try:
+            _ed = datetime.fromisoformat(t["edited_at"]).astimezone(IST)
+            footer += f" · edited {_ed.strftime('%d/%m %I:%M %p')}"
+        except Exception:
+            footer += " · edited"
+    elif t.get("edited"):
         footer += " · edited"
     embed.set_footer(text=footer)
     if image_url:
@@ -522,7 +524,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
         "entry1_filled": bool(is_market),
         "tp1_hit": False, "tp2_hit": False, "tp3_hit": False, "sl_hit": False, "be": False,
         "closed": False, "result": None, "result_r": None, "close_note": None,
-        "edited": False,
+        "edited": False, "edited_at": None,
     }
     files = []
     embed = build_embed(t)
@@ -704,6 +706,7 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
         await interaction.followup.send("Nothing to change - fill at least one field.", ephemeral=True)
         return
     t["edited"] = True
+    t["edited_at"] = datetime.now(timezone.utc).isoformat()
     data[trade] = t
     save_trades(data)
     channel = bot.get_channel(t["channel_id"])
