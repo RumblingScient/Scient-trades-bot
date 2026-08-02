@@ -235,7 +235,7 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
         color = discord.Color.from_str(t.get("analyst_color") or "#1C4E80")
     except Exception:
         color = NAVY
-    arrow = "LONG" if is_long else "SHORT"
+    arrow = "🟢 LONG" if is_long else "🔴 SHORT"
     prefix = ""
     if closed:
         prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "")
@@ -246,29 +246,39 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     if tftxt:
         title += f" | {tftxt}"
     embed = discord.Embed(title=title, color=color)
+
     sl_mark = " (hit)" if t.get("sl_hit") else ""
-    tp1_mark = " OK" if t.get("tp1_hit") else ""
-    tp2_mark = " OK" if t.get("tp2_hit") else ""
-    tp3_mark = " OK" if t.get("tp3_hit") else ""
+    type_label = "Market" if t.get("entry_type") == "MARKET" else "Limit"
+    line1 = (
+        f"**Entry ({type_label}):** {entry_display(t)}"
+        f" | **SL:** {t['sl']}{sl_mark}"
+        f" | **Risk:** {fmt_risk(t.get('risk')) or '-'}"
+        f" | **R:R:** {t.get('rr') or '-'}"
+    )
+
+    tps = []
+    for key, hit in (("tp1", "tp1_hit"), ("tp2", "tp2_hit"), ("tp3", "tp3_hit")):
+        if t.get(key):
+            tps.append(f"{t[key]}" + (" \u2705" if t.get(hit) else ""))
+    line2 = f"**TP:** {' / '.join(tps)}" if tps else None
+
     fw = fmt_frameworks(t)
     if t.get("setup_detail"):
         fw = f"{fw} - {t['setup_detail']}"
-    embed.add_field(name="Setup", value=fw, inline=False)
-    type_label = "Market" if t.get("entry_type") == "MARKET" else "Limit"
-    embed.add_field(name="Type", value=type_label, inline=True)
-    embed.add_field(name="Entry", value=entry_display(t), inline=True)
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
-    embed.add_field(name="Stop Loss", value=f"{t['sl']}{sl_mark}", inline=True)
-    embed.add_field(name="Risk", value=fmt_risk(t.get("risk")) or "-", inline=True)
-    embed.add_field(name="R:R", value=t.get("rr") or "-", inline=True)
-    embed.add_field(name="TP1", value=(f"{t['tp1']}{tp1_mark}" if t.get("tp1") else "-"), inline=True)
-    embed.add_field(name="TP2", value=(f"{t['tp2']}{tp2_mark}" if t.get("tp2") else "-"), inline=True)
-    embed.add_field(name="TP3", value=(f"{t['tp3']}{tp3_mark}" if t.get("tp3") else "-"), inline=True)
-    embed.add_field(name="Status", value=full_status(t), inline=False)
-    if t.get("notes"):
-        embed.add_field(name="Reasoning", value=t["notes"][:1024], inline=False)
-    if t.get("close_note"):
-        embed.add_field(name="Closing Note", value=t["close_note"][:1024], inline=False)
+    line3 = f"**Setup:** {fw}" if fw != "-" else None
+
+    line4 = f"**Status:** {full_status(t)}"
+
+    lines = [line1]
+    if line2:
+        lines.append(line2)
+    if line3:
+        lines.append(line3)
+    lines.append(line4)
+    if closed and t.get("close_note"):
+        lines.append(f"**Note:** {t['close_note'][:300]}")
+    embed.description = "\n".join(lines)
+
     embed.set_author(name=t["analyst_name"], icon_url=t.get("analyst_avatar") or None)
     footer = "Scient Lounge - Trade Setups"
     if t.get("edited_at"):
@@ -307,9 +317,9 @@ def build_board_embed() -> discord.Embed:
         name = trades[0].get("analyst_name", k.capitalize())
         lines = []
         for t in trades:
-            d = "L" if t["direction"] == "LONG" else "S"
+            d = "🟢 L" if t["direction"] == "LONG" else "🔴 S"
             e = entry_display(t, marks=False)
-            lines.append(f"[{d}] **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "") + f" - entry `{e}` - {short_status(t)} - [view]({jump_url(t)})")
+            lines.append(f"{d} **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "") + f" - entry `{e}` - {short_status(t)} - [view]({jump_url(t)})")
         embed.add_field(name=f"{name} ({len(trades)})", value="\n".join(lines)[:1024], inline=False)
     return embed
 
@@ -493,7 +503,7 @@ async def setup_follow_panel(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="trade", description="Post a trade setup")
-@app_commands.describe(pair="e.g. BTC/USDT", direction="Long or Short", entry="Entry price (or a range for DCA, e.g. 64000 - 62000 (50/50))", stop_loss="SL", risk="Account risk (just a number = %, e.g. 1 shows as 1%)", rr="Risk:Reward", entry_type="Limit (pending) or Market (filled now)", framework="Setup framework (optional)", framework2="Second framework (optional)", chart="Chart image (optional)", tp1="Take profit 1 (optional)", timeframe="e.g. 4H (optional)", setup_detail="Extra specifics (optional)", tp2="TP2 (optional)", tp3="TP3 (optional)", notes="Reasoning (optional)")
+@app_commands.describe(pair="e.g. BTC/USDT", direction="Long or Short", entry="Entry price (or a range for DCA, e.g. 64000 - 62000 (50/50))", stop_loss="SL", risk="Account risk (just a number = %, e.g. 1 shows as 1%)", rr="Risk:Reward", entry_type="Limit (pending) or Market (filled now)", framework="Setup framework (optional)", framework2="Second framework (optional)", chart="Chart image (optional)", tp1="Take profit 1 (optional)", timeframe="e.g. 4H (optional)", setup_detail="Extra specifics (optional)", tp2="TP2 (optional)", tp3="TP3 (optional)", notes="Reasoning (optional, posted in the trade thread)")
 @app_commands.choices(
     direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")],
     framework=[app_commands.Choice(name=f, value=f) for f in FRAMEWORKS],
@@ -548,6 +558,11 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     try:
         thread = await msg.create_thread(name=f"{pair.upper()} {direction.value} - {interaction.user.display_name}")
         t["thread_id"] = thread.id
+        if notes:
+            try:
+                await thread.send(f"**Reasoning:** {notes[:1900]}")
+            except Exception:
+                pass
     except discord.HTTPException:
         t["thread_id"] = None
     data = load_trades()
@@ -637,7 +652,7 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str)
     tp3="Corrected TP3 (optional)",
     timeframe="Corrected timeframe (optional)",
     setup_detail="Corrected setup detail (optional)",
-    notes="Corrected reasoning (optional)",
+    notes="Corrected reasoning (optional, posted in the trade thread)",
 )
 @app_commands.choices(
     direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")],
@@ -726,6 +741,8 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     await refresh_board()
     changed_txt = ", ".join(changes)
     await thread_note(t, f"**Setup edited** - corrected: {changed_txt}")
+    if notes is not None:
+        await thread_note(t, f"**Reasoning (updated):** {notes[:1900]}")
     await interaction.followup.send(f"Trade updated ({changed_txt}). {jump_url(t)}", ephemeral=True)
 
 
@@ -769,10 +786,10 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         t["tp3_hit"] = True; t["tp2_hit"] = True; t["tp1_hit"] = True; t["entry1_filled"] = True
     elif event.value == "SL":
         t["sl_hit"] = True; t["closed"] = True; t["result"] = "LOSS"; t["closed_at"] = datetime.now(timezone.utc).isoformat()
+        if note:
+            t["close_note"] = note
     elif event.value == "BE":
         t["be"] = True
-    if note:
-        t["close_note"] = note
     data[trade] = t
     save_trades(data)
     await refresh_and_edit(t)
