@@ -434,9 +434,9 @@ async def refresh_board():
 
 
 async def refresh_spot_board():
-    if not SPOT_CHANNEL_ID:
+    if not OPEN_BOARD_CHANNEL_ID:
         return
-    ch = bot.get_channel(SPOT_CHANNEL_ID)
+    ch = bot.get_channel(OPEN_BOARD_CHANNEL_ID)
     if ch is None:
         return
     embed = build_spot_board_embed()
@@ -1273,8 +1273,8 @@ async def spot_board_cmd(interaction: discord.Interaction):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    if not SPOT_CHANNEL_ID:
-        await interaction.followup.send("Set SPOT_CHANNEL_ID first.", ephemeral=True)
+    if not OPEN_BOARD_CHANNEL_ID:
+        await interaction.followup.send("Set OPEN_BOARD_CHANNEL_ID first.", ephemeral=True)
         return
     save_spot_board({})
     await refresh_spot_board()
