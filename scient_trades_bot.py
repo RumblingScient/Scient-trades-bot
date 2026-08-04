@@ -106,6 +106,16 @@ def parse_r(val):
         return None
 
 
+def parse_num(val):
+    if val is None:
+        return None
+    cleaned = "".join(c for c in str(val).replace(",", "") if c in "0123456789.")
+    try:
+        return float(cleaned)
+    except ValueError:
+        return None
+
+
 def tf(t: dict) -> str:
     v = t.get("timeframe")
     return v.upper() if v else ""
@@ -165,6 +175,9 @@ def full_status(t: dict) -> str:
         return "TP2 HIT - trailing"
     if t.get("tp1_hit"):
         return "TP1 HIT - in profit"
+    if t.get("partial_tp"):
+        p = t.get("partial_price")
+        return f"PARTIAL TP{f' @ {p}' if p else ''} - in profit"
     if t.get("be"):
         return "MOVED TO BREAKEVEN"
     if any_entry_filled(t):
@@ -179,6 +192,8 @@ def short_status(t: dict) -> str:
         return "TP2"
     if t.get("tp1_hit"):
         return "TP1"
+    if t.get("partial_tp"):
+        return "Partial TP"
     if t.get("be"):
         return "BE"
     if any_entry_filled(t):
@@ -643,6 +658,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
         "created_at": datetime.now(timezone.utc).isoformat(),
         "entry1_filled": bool(is_market),
         "tp1_hit": False, "tp2_hit": False, "tp3_hit": False, "sl_hit": False, "be": False,
+        "partial_tp": False, "partial_price": None,
         "closed": False, "result": None, "result_r": None, "close_note": None,
         "edited": False, "edited_at": None,
     }
@@ -1082,9 +1098,10 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
 
 
 @bot.tree.command(name="update", description="Update a running trade")
-@app_commands.describe(trade="Pick an open trade", event="What happened", note="Optional note")
+@app_commands.describe(trade="Pick an open trade", event="What happened", price="Price where it happened (optional, e.g. for partial TP)", note="Optional note (e.g. '30% off here')")
 @app_commands.choices(event=[
     app_commands.Choice(name="Entry Filled (activate trade)", value="EF"),
+    app_commands.Choice(name="Partial TP (manual profit taking)", value="PTP"),
     app_commands.Choice(name="TP1 Hit", value="TP1"),
     app_commands.Choice(name="TP2 Hit", value="TP2"),
     app_commands.Choice(name="TP3 Hit", value="TP3"),
@@ -1092,7 +1109,7 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     app_commands.Choice(name="Moved to Breakeven", value="BE"),
 ])
 @app_commands.autocomplete(trade=open_trades_ac)
-async def update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str], note: str = None):
+async def update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str], price: str = None, note: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -1102,16 +1119,23 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
     if not t:
         await interaction.followup.send("Trade not found.", ephemeral=True)
         return
+    ptxt = f" @ {price}" if price else ""
     feed = {
-        "EF": ("Entry Filled", BLUE, "Entry filled - position live."),
-        "TP1": ("TP1 Hit", GREEN, "Take profit 1 reached."),
-        "TP2": ("TP2 Hit", GREEN, "Take profit 2 reached."),
-        "TP3": ("TP3 Hit", GREEN, "Take profit 3 reached."),
-        "SL": ("Stopped Out", RED, "Stop loss hit - closed as loss."),
+        "EF": ("Entry Filled", BLUE, f"Entry filled{ptxt} - position live."),
+        "PTP": (f"Partial TP{ptxt}", GREEN, f"Profits booked{ptxt} - position still running."),
+        "TP1": ("TP1 Hit", GREEN, f"Take profit 1 reached{ptxt}."),
+        "TP2": ("TP2 Hit", GREEN, f"Take profit 2 reached{ptxt}."),
+        "TP3": ("TP3 Hit", GREEN, f"Take profit 3 reached{ptxt}."),
+        "SL": ("Stopped Out", RED, f"Stop loss hit{ptxt} - closed as loss."),
         "BE": ("Moved to Breakeven", GREY, "Stop moved to breakeven."),
     }
-    thread_map = {"EF": "Entry filled", "TP1": "TP1 hit", "TP2": "TP2 hit", "TP3": "TP3 hit", "SL": "Stopped out", "BE": "Moved to breakeven"}
+    thread_map = {"EF": "Entry filled", "PTP": f"Partial TP{ptxt}", "TP1": "TP1 hit", "TP2": "TP2 hit", "TP3": "TP3 hit", "SL": "Stopped out", "BE": "Moved to breakeven"}
     if event.value == "EF":
+        t["entry1_filled"] = True
+    elif event.value == "PTP":
+        t["partial_tp"] = True
+        if price:
+            t["partial_price"] = price
         t["entry1_filled"] = True
     elif event.value == "TP1":
         t["tp1_hit"] = True; t["entry1_filled"] = True
@@ -1179,6 +1203,156 @@ async def close(interaction: discord.Interaction, trade: str, result: app_comman
     await post_update_feed(t, title, color, line)
     await thread_note(t, f"**Closed - {result.value}{rtxt}**" + (f" - {note}" if note else ""))
     await interaction.followup.send(f"Closed: {result.value}{rtxt}", ephemeral=True)
+
+
+@bot.tree.command(name="open", description="See all live positions (futures + spot)")
+async def open_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    embeds = [build_board_embed(), build_spot_board_embed()]
+    await interaction.followup.send(embeds=embeds, ephemeral=True)
+
+
+@bot.tree.command(name="recent", description="Latest closed trades with results")
+@app_commands.describe(analyst="Filter by analyst (optional)")
+async def recent(interaction: discord.Interaction, analyst: discord.Member = None):
+    await interaction.response.defer(ephemeral=True)
+    data = load_trades()
+    closed = [t for t in data.values() if t.get("closed")]
+    if analyst:
+        closed = [t for t in closed if t.get("analyst_id") == analyst.id]
+    closed.sort(key=lambda t: t.get("closed_at", ""), reverse=True)
+    closed = closed[:7]
+    sdata = load_spot()
+    sclosed = [p for p in sdata.values() if p.get("closed")]
+    if analyst:
+        sclosed = [p for p in sclosed if p.get("analyst_id") == analyst.id]
+    sclosed.sort(key=lambda p: p.get("closed_at", ""), reverse=True)
+    sclosed = sclosed[:5]
+    title = "Recent Results"
+    if analyst:
+        title += f" - {analyst.display_name}"
+    embed = discord.Embed(title=title, color=NAVY, timestamp=datetime.now(timezone.utc))
+    if closed:
+        lines = []
+        for t in closed:
+            d = "🟢 L" if t["direction"] == "LONG" else "🔴 S"
+            res = t.get("result", "?")
+            r = t.get("result_r")
+            rtxt = f" ({r:+g}R)" if isinstance(r, (int, float)) else ""
+            emoji = {"WIN": "✅", "LOSS": "❌", "BE": "➖", "INVALID": "🚫"}.get(res, "")
+            lines.append(f"{emoji} {d} **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "") + f" - {res}{rtxt} - {t.get('analyst_name', '')} - [view]({jump_url(t)})")
+        embed.add_field(name="Futures", value="\n".join(lines)[:1024], inline=False)
+    if sclosed:
+        lines = []
+        for p in sclosed:
+            res = p.get("result", "?")
+            pct = f" ({p['result_pct']})" if p.get("result_pct") else ""
+            emoji = {"WIN": "✅", "LOSS": "❌", "BE": "➖", "INVALID": "🚫"}.get(res, "")
+            lines.append(f"{emoji} 🪙 **{p['pair'].upper()}** - {res}{pct} - {p.get('analyst_name', '')} - [view]({jump_url(p)})")
+        embed.add_field(name="Spot", value="\n".join(lines)[:1024], inline=False)
+    if not closed and not sclosed:
+        embed.description = "*No closed trades yet.*"
+    embed.set_footer(text="Scient Lounge - Journal")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="price", description="Live price for any coin")
+@app_commands.describe(coin="Coin symbol, e.g. BTC, SOL, ETH")
+async def price(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    if symbol.endswith("USDT"):
+        pair = symbol
+    else:
+        pair = f"{symbol}USDT"
+    url = "https://api.binance.com/api/v3/ticker/24hr"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params={"symbol": pair}, timeout=15) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send(f"Couldn't find **{symbol}** - check the symbol (e.g. BTC, SOL, ETH).")
+                    return
+                data = await resp.json()
+    except Exception:
+        await interaction.followup.send("Price feed unavailable right now - try again in a minute.")
+        return
+    try:
+        last = float(data["lastPrice"])
+        chg = float(data["priceChangePercent"])
+        high = float(data["highPrice"])
+        low = float(data["lowPrice"])
+    except Exception:
+        await interaction.followup.send(f"Couldn't parse price data for **{symbol}**.")
+        return
+    def fp(x):
+        if x >= 1000:
+            return f"{x:,.2f}"
+        if x >= 1:
+            return f"{x:,.4f}".rstrip("0").rstrip(".")
+        return f"{x:.8f}".rstrip("0")
+    arrow = "🟢" if chg >= 0 else "🔴"
+    color = GREEN if chg >= 0 else RED
+    embed = discord.Embed(title=f"{arrow} {symbol}/USDT", color=color, timestamp=datetime.now(timezone.utc))
+    embed.description = (
+        f"**Price:** ${fp(last)}\n"
+        f"**24h:** {chg:+.2f}%\n"
+        f"**24h High:** ${fp(high)} | **24h Low:** ${fp(low)}"
+    )
+    embed.set_footer(text="Scient Lounge - Binance spot")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="pnl", description="Position size calculator - know your size before you enter")
+@app_commands.describe(
+    account="Account size in $ (e.g. 5000)",
+    risk="Risk per trade in % (e.g. 1)",
+    entry="Entry price",
+    stop_loss="Stop loss price",
+    leverage="Leverage (optional, shows margin needed)",
+)
+async def pnl(interaction: discord.Interaction, account: str, risk: str, entry: str, stop_loss: str, leverage: str = None):
+    await interaction.response.defer(ephemeral=True)
+    acc = parse_num(account)
+    rk = parse_num(risk)
+    en = parse_num(entry)
+    sl = parse_num(stop_loss)
+    lev = parse_num(leverage) if leverage else None
+    if not all([acc, rk, en, sl]) or acc <= 0 or rk <= 0 or en <= 0 or sl <= 0:
+        await interaction.followup.send("Check your inputs - account, risk, entry, and SL must all be positive numbers.", ephemeral=True)
+        return
+    if en == sl:
+        await interaction.followup.send("Entry and SL can't be the same price.", ephemeral=True)
+        return
+    if lev is not None and lev <= 0:
+        await interaction.followup.send("Leverage must be a positive number.", ephemeral=True)
+        return
+    risk_amount = acc * rk / 100
+    sl_dist_pct = abs(en - sl) / en * 100
+    position_value = risk_amount / (sl_dist_pct / 100)
+    units = position_value / en
+    direction = "LONG" if sl < en else "SHORT"
+    def fp(x):
+        if x >= 1000:
+            return f"{x:,.2f}"
+        if x >= 1:
+            return f"{x:,.4f}".rstrip("0").rstrip(".")
+        return f"{x:.8f}".rstrip("0")
+    lines = [
+        f"**Direction:** {direction} (based on SL vs entry)",
+        f"**Risk:** ${fp(risk_amount)} ({rk:g}% of ${fp(acc)})",
+        f"**SL distance:** {sl_dist_pct:.2f}%",
+        f"**Position size:** {fp(units)} units (${fp(position_value)} notional)",
+    ]
+    if lev:
+        margin = position_value / lev
+        if margin > acc:
+            lines.append(f"**Margin @ {lev:g}x:** ${fp(margin)} ⚠️ exceeds your account size")
+        else:
+            lines.append(f"**Margin @ {lev:g}x:** ${fp(margin)} ({margin / acc * 100:.1f}% of account)")
+    embed = discord.Embed(title="Position Size Calculator", color=NAVY)
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Scient Lounge - risk first, always")
+    await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 @bot.tree.command(name="xpost", description="Share an X post into the X feed channel")
