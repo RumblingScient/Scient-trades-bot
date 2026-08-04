@@ -225,8 +225,8 @@ def entry_display(t: dict, marks: bool = True) -> str:
             s += " (filled)" if t.get("entry1_filled") else " (pending)"
         return s
     if marks and not closed:
-        m1 = " ✓" if t.get("entry1_filled") else ""
-        m2 = " ✓" if t.get("entry2_filled") else ""
+        m1 = " \u2713" if t.get("entry1_filled") else ""
+        m2 = " \u2713" if t.get("entry2_filled") else ""
         return f"{e1}{m1} / {e2}{m2} (DCA)"
     return f"{e1} / {e2} (DCA)"
 
@@ -329,11 +329,11 @@ def footer_with_edit(t: dict, base: str) -> str:
     if t.get("edited_at"):
         try:
             _ed = datetime.fromisoformat(t["edited_at"]).astimezone(IST)
-            return base + f" · edited {_ed.strftime('%d/%m %I:%M %p')}"
+            return base + f" \u00b7 edited {_ed.strftime('%d/%m %I:%M %p')}"
         except Exception:
-            return base + " · edited"
+            return base + " \u00b7 edited"
     if t.get("edited"):
-        return base + " · edited"
+        return base + " \u00b7 edited"
     return base
 
 
@@ -345,7 +345,7 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
         color = discord.Color.from_str(t.get("analyst_color") or "#1C4E80")
     except Exception:
         color = NAVY
-    arrow = "🟢 LONG" if is_long else "🔴 SHORT"
+    arrow = "\U0001F7E2 LONG" if is_long else "\U0001F534 SHORT"
     prefix = ""
     if closed:
         prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "")
@@ -410,7 +410,7 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
     prefix = ""
     if closed:
         prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "")
-    title = f"{prefix}🟢 SPOT | {p['pair'].upper()}"
+    title = f"{prefix}\U0001F7E2 SPOT | {p['pair'].upper()}"
     embed = discord.Embed(title=title, color=color)
 
     lines = []
@@ -471,7 +471,7 @@ def build_board_embed() -> discord.Embed:
         name = trades[0].get("analyst_name", k.capitalize())
         lines = []
         for t in trades:
-            d = "🟢 L" if t["direction"] == "LONG" else "🔴 S"
+            d = "\U0001F7E2 L" if t["direction"] == "LONG" else "\U0001F534 S"
             e = entry_display(t, marks=False)
             lines.append(f"{d} **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "") + f" - entry `{e}` - {short_status(t)} - [view]({jump_url(t)})")
         embed.add_field(name=f"{name} ({len(trades)})", value="\n".join(lines)[:1024], inline=False)
@@ -501,7 +501,7 @@ def build_spot_board_embed() -> discord.Embed:
         lines = []
         for p in plays:
             avg = f" - avg `{p['avg_entry']}`" if p.get("avg_entry") else ""
-            lines.append(f"🪙 **{p['pair'].upper()}** - zone `{p['dca_zone']}`{avg} - {spot_status_line(p)} - [view]({jump_url(p)})")
+            lines.append(f"\U0001FA99 **{p['pair'].upper()}** - zone `{p['dca_zone']}`{avg} - {spot_status_line(p)} - [view]({jump_url(p)})")
         embed.add_field(name=f"{name} ({len(plays)})", value="\n".join(lines)[:1024], inline=False)
     return embed
 
@@ -715,10 +715,10 @@ async def setup_follow_panel(interaction: discord.Interaction):
 @app_commands.describe(
     pair="e.g. BTC/USDT",
     direction="Long or Short",
+    entry_type="Market (filled now), Limit single, or Limit DCA (two entries)",
     entry="Entry price (Entry 1 if DCA)",
     stop_loss="SL price",
     risk="Account risk (just a number = %, e.g. 1 shows as 1%)",
-    entry_type="Market (filled now), Limit single, or Limit DCA (two entries)",
     entry2="Second DCA entry price (only for Limit DCA)",
     framework="Setup framework (optional)",
     framework2="Second framework (optional)",
@@ -1277,6 +1277,10 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         k = keymap[ev]
         t[f"{k}_hit"] = True
         t["entry1_filled"] = True
+        if ev == "TP2":
+            t["tp1_hit"] = True
+        if ev == "TP3":
+            t["tp1_hit"] = True; t["tp2_hit"] = True
         fill_price = px if px is not None else first_num(t.get(k))
         if fill_price is None:
             await interaction.followup.send(f"{ev} has no price set on the trade - pass `price` with this update.", ephemeral=True)
@@ -1392,11 +1396,11 @@ async def recent(interaction: discord.Interaction, analyst: discord.Member = Non
     if closed:
         lines = []
         for t in closed:
-            d = "🟢 L" if t["direction"] == "LONG" else "🔴 S"
+            d = "\U0001F7E2 L" if t["direction"] == "LONG" else "\U0001F534 S"
             res = t.get("result", "?")
             r = t.get("result_r")
             rtxt = f" ({r:+g}R)" if isinstance(r, (int, float)) else ""
-            emoji = {"WIN": "✅", "LOSS": "❌", "BE": "➖", "INVALID": "🚫"}.get(res, "")
+            emoji = {"WIN": "\u2705", "LOSS": "\u274C", "BE": "\u2796", "INVALID": "\U0001F6AB"}.get(res, "")
             lines.append(f"{emoji} {d} **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "") + f" - {res}{rtxt} - {t.get('analyst_name', '')} - [view]({jump_url(t)})")
         embed.add_field(name="Futures", value="\n".join(lines)[:1024], inline=False)
     if sclosed:
@@ -1404,8 +1408,8 @@ async def recent(interaction: discord.Interaction, analyst: discord.Member = Non
         for p in sclosed:
             res = p.get("result", "?")
             pct = f" ({p['result_pct']})" if p.get("result_pct") else ""
-            emoji = {"WIN": "✅", "LOSS": "❌", "BE": "➖", "INVALID": "🚫"}.get(res, "")
-            lines.append(f"{emoji} 🪙 **{p['pair'].upper()}** - {res}{pct} - {p.get('analyst_name', '')} - [view]({jump_url(p)})")
+            emoji = {"WIN": "\u2705", "LOSS": "\u274C", "BE": "\u2796", "INVALID": "\U0001F6AB"}.get(res, "")
+            lines.append(f"{emoji} \U0001FA99 **{p['pair'].upper()}** - {res}{pct} - {p.get('analyst_name', '')} - [view]({jump_url(p)})")
         embed.add_field(name="Spot", value="\n".join(lines)[:1024], inline=False)
     if not closed and not sclosed:
         embed.description = "*No closed trades yet.*"
@@ -1441,7 +1445,7 @@ async def price(interaction: discord.Interaction, coin: str):
     except Exception:
         await interaction.followup.send(f"Couldn't parse price data for **{symbol}**.")
         return
-    arrow = "🟢" if chg >= 0 else "🔴"
+    arrow = "\U0001F7E2" if chg >= 0 else "\U0001F534"
     color = GREEN if chg >= 0 else RED
     embed = discord.Embed(title=f"{arrow} {symbol}/USDT", color=color, timestamp=datetime.now(timezone.utc))
     embed.description = (
@@ -1491,7 +1495,7 @@ async def pnl(interaction: discord.Interaction, account: str, risk: str, entry: 
     if lev:
         margin = position_value / lev
         if margin > acc:
-            lines.append(f"**Margin @ {lev:g}x:** ${fnum(margin)} ⚠️ exceeds your account size")
+            lines.append(f"**Margin @ {lev:g}x:** ${fnum(margin)} \u26A0\uFE0F exceeds your account size")
         else:
             lines.append(f"**Margin @ {lev:g}x:** ${fnum(margin)} ({margin / acc * 100:.1f}% of account)")
     embed = discord.Embed(title="Position Size Calculator", color=NAVY)
