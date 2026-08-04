@@ -259,7 +259,7 @@ def full_status(t: dict) -> str:
     if t.get("tp1_hit"):
         return f"TP1 HIT{pct_txt}"
     if t.get("be"):
-        return "MOVED TO BREAKEVEN" + pct_txt
+        return "SL AT ENTRY - RISK-FREE" + pct_txt
     if t.get("entry2") and t.get("entry1_filled") and not t.get("entry2_filled"):
         return "ACTIVE - Entry 1 filled, DCA pending"
     if any_entry_filled(t):
@@ -1215,8 +1215,8 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
 @app_commands.describe(
     trade="Pick an open trade",
     event="What happened",
-    size_pct="% of position closed - REQUIRED for TP and Partial TP events (e.g. 25)",
-    price="Fill price - REQUIRED for Partial TP and Closed (remaining position)",
+    size_pct="TP/Partial TP only - % of position closed (e.g. 25). Skip for other events",
+    price="Partial TP and Closed only - fill/exit price. Skip for fills and BE",
     note="Optional note",
 )
 @app_commands.choices(event=[
@@ -1226,7 +1226,7 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     app_commands.Choice(name="TP2 Hit", value="TP2"),
     app_commands.Choice(name="TP3 Hit", value="TP3"),
     app_commands.Choice(name="Partial TP (custom price)", value="PTP"),
-    app_commands.Choice(name="Moved to Breakeven", value="BE"),
+    app_commands.Choice(name="SL Moved to Entry (Risk-Free)", value="BE"),
     app_commands.Choice(name="SL Hit (closes trade)", value="SL"),
     app_commands.Choice(name="Closed (bot calculates result)", value="CLOSE"),
     app_commands.Choice(name="Invalidated (never triggered)", value="CI"),
@@ -1299,7 +1299,7 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         desc = f"{label} hit @ {fnum(px)} ({pct:g}%)"
     elif ev == "BE":
         t["be"] = True
-        desc = "Moved to breakeven"
+        desc = "SL moved to entry - trade is risk-free"
     elif ev == "SL":
         exit_px = px if px is not None else (entry_num(t) if t.get("be") else sl_num(t))
         if exit_px is None:
