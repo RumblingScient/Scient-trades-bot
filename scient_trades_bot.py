@@ -1621,6 +1621,7 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     wr = (len(wins) / decided * 100) if decided else 0
     tp1_rate = (sum(1 for t in mine if t.get("tp1_hit")) / total * 100) if total else 0
     rs = [t["result_r"] for t in closed if isinstance(t.get("result_r"), (int, float))]
+    total_r = sum(rs) if rs else None
     avg_r = (sum(rs) / len(rs)) if rs else None
     best = max(rs) if rs else None
     worst = min(rs) if rs else None
@@ -1635,7 +1636,9 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     embed.add_field(name="Win rate", value=(f"{wr:.0f}% ({len(wins)}W/{len(losses)}L)" if decided else "-"), inline=True)
     embed.add_field(name="TP1 hit rate", value=(f"{tp1_rate:.0f}%" if total else "-"), inline=True)
     embed.add_field(name="BE / Invalid", value=f"{len(be)} / {len(invalid)}", inline=True)
+    embed.add_field(name="Total R", value=(f"{total_r:+.2f}R" if total_r is not None else "-"), inline=True)
     embed.add_field(name="Avg R", value=(f"{avg_r:+.2f}R" if avg_r is not None else "-"), inline=True)
+    embed.add_field(name="Graded on", value=(f"{len(rs)} closed" if rs else "-"), inline=True)
     embed.add_field(name="Best", value=(f"{best:+g}R" if best is not None else "-"), inline=True)
     embed.add_field(name="Worst", value=(f"{worst:+g}R" if worst is not None else "-"), inline=True)
     embed.set_footer(text="Scient Lounge - Journal")
