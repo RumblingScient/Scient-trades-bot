@@ -740,7 +740,7 @@ async def setup_follow_panel(interaction: discord.Interaction):
         app_commands.Choice(name="Limit - Range/DCA (two entries)", value="DCA"),
     ],
 )
-async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, entry_type: app_commands.Choice[str], entry2: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
+async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry_type: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, entry2: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message(f"Only members with the **{ANALYST_ROLE_NAME}** role can post setups.", ephemeral=True)
         return
