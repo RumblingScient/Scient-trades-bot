@@ -96,16 +96,6 @@ def is_analyst(interaction: discord.Interaction) -> bool:
     return any(r.name == ANALYST_ROLE_NAME for r in interaction.user.roles)
 
 
-def parse_r(val):
-    if val is None:
-        return None
-    cleaned = "".join(c for c in str(val) if c in "0123456789.-")
-    try:
-        return float(cleaned)
-    except ValueError:
-        return None
-
-
 def parse_num(val):
     if val is None:
         return None
@@ -125,15 +115,22 @@ def first_num(s):
 
 
 def entry_num(t):
-    if t.get("avg_entry_num") is not None:
-        return t["avg_entry_num"]
-    s = re.sub(r"\([^)]*\)", "", str(t.get("entry", "")))
-    nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", s.replace(",", ""))]
-    if not nums:
-        return None
-    if len(nums) >= 2:
-        return (nums[0] + nums[1]) / 2
-    return nums[0]
+    e1 = first_num(t.get("entry"))
+    e2 = first_num(t.get("entry2")) if t.get("entry2") else None
+    if e2 is None:
+        s = re.sub(r"\([^)]*\)", "", str(t.get("entry", "")))
+        nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", s.replace(",", ""))]
+        if len(nums) >= 2:
+            return (nums[0] + nums[1]) / 2
+        return e1
+    f1, f2 = t.get("entry1_filled"), t.get("entry2_filled")
+    if f1 and f2:
+        return (e1 + e2) / 2
+    if f1:
+        return e1
+    if f2:
+        return e2
+    return (e1 + e2) / 2
 
 
 def sl_num(t):
@@ -215,25 +212,32 @@ def fix_x_link(url: str) -> str:
 
 
 def any_entry_filled(t: dict) -> bool:
-    return bool(t.get("entry1_filled"))
+    return bool(t.get("entry1_filled") or t.get("entry2_filled"))
 
 
 def entry_display(t: dict, marks: bool = True) -> str:
-    s = str(t.get("entry"))
-    if marks and not t.get("closed"):
-        s += " (filled)" if t.get("entry1_filled") else " (pending)"
-    return s
+    e1 = str(t.get("entry"))
+    e2 = t.get("entry2")
+    closed = t.get("closed")
+    if not e2:
+        s = e1
+        if marks and not closed:
+            s += " (filled)" if t.get("entry1_filled") else " (pending)"
+        return s
+    if marks and not closed:
+        m1 = " ✓" if t.get("entry1_filled") else ""
+        m2 = " ✓" if t.get("entry2_filled") else ""
+        return f"{e1}{m1} / {e2}{m2} (DCA)"
+    return f"{e1} / {e2} (DCA)"
 
 
 def display_rr(t: dict):
-    if t.get("rr"):
-        return t["rr"]
     for key in ("tp3", "tp2", "tp1"):
         if t.get(key):
             r = signed_r(t, first_num(t[key]))
             if r is not None:
                 return f"{r:.1f}"
-    return None
+    return t.get("rr")
 
 
 def full_status(t: dict) -> str:
@@ -254,11 +258,10 @@ def full_status(t: dict) -> str:
         return f"TP2 HIT{pct_txt}"
     if t.get("tp1_hit"):
         return f"TP1 HIT{pct_txt}"
-    if t.get("partial_tp"):
-        p = t.get("partial_price")
-        return f"PARTIAL TP{f' @ {p}' if p else ''}{pct_txt}"
     if t.get("be"):
         return "MOVED TO BREAKEVEN" + pct_txt
+    if t.get("entry2") and t.get("entry1_filled") and not t.get("entry2_filled"):
+        return "ACTIVE - Entry 1 filled, DCA pending"
     if any_entry_filled(t):
         return "ACTIVE" + pct_txt
     return "PENDING - waiting for fill"
@@ -271,8 +274,6 @@ def short_status(t: dict) -> str:
         return "TP2"
     if t.get("tp1_hit"):
         return "TP1"
-    if t.get("partial_tp"):
-        return "Partial TP"
     if t.get("be"):
         return "BE"
     if any_entry_filled(t):
@@ -711,14 +712,35 @@ async def setup_follow_panel(interaction: discord.Interaction):
 
 
 @bot.tree.command(name="trade", description="Post a trade setup")
-@app_commands.describe(pair="e.g. BTC/USDT", direction="Long or Short", entry="Entry price (or a range for DCA, e.g. 64000 - 62000 (50/50))", stop_loss="SL", risk="Account risk (just a number = %, e.g. 1 shows as 1%)", entry_type="Limit (pending) or Market (filled now)", framework="Setup framework (optional)", framework2="Second framework (optional)", chart="Chart image (optional)", tp1="Take profit 1 (optional, R auto-calculated)", timeframe="e.g. 4H (optional)", setup_detail="Extra specifics (optional)", tp2="TP2 (optional)", tp3="TP3 (optional)", rr="Manual R:R override (optional - bot auto-calculates from TPs)", notes="Reasoning (optional, posted in the trade thread)")
+@app_commands.describe(
+    pair="e.g. BTC/USDT",
+    direction="Long or Short",
+    entry="Entry price (Entry 1 if DCA)",
+    stop_loss="SL price",
+    risk="Account risk (just a number = %, e.g. 1 shows as 1%)",
+    entry_type="Market (filled now), Limit single, or Limit DCA (two entries)",
+    entry2="Second DCA entry price (only for Limit DCA)",
+    framework="Setup framework (optional)",
+    framework2="Second framework (optional)",
+    chart="Chart image (optional)",
+    tp1="Take profit 1 (R auto-calculated)",
+    timeframe="e.g. 4H (optional)",
+    setup_detail="Extra specifics (optional)",
+    tp2="TP2 (optional)",
+    tp3="TP3 (optional)",
+    notes="Reasoning (optional, posted in the trade thread)",
+)
 @app_commands.choices(
     direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")],
     framework=[app_commands.Choice(name=f, value=f) for f in FRAMEWORKS],
     framework2=[app_commands.Choice(name=f, value=f) for f in FRAMEWORKS],
-    entry_type=[app_commands.Choice(name="Limit - pending fill", value="LIMIT"), app_commands.Choice(name="Market - filled now", value="MARKET")],
+    entry_type=[
+        app_commands.Choice(name="Market - filled now", value="MARKET"),
+        app_commands.Choice(name="Limit - single entry", value="LIMIT"),
+        app_commands.Choice(name="Limit - Range/DCA (two entries)", value="DCA"),
+    ],
 )
-async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, entry_type: app_commands.Choice[str], framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, rr: str = None, notes: str = None):
+async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, entry_type: app_commands.Choice[str], entry2: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message(f"Only members with the **{ANALYST_ROLE_NAME}** role can post setups.", ephemeral=True)
         return
@@ -727,7 +749,13 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     if channel is None:
         await interaction.followup.send("Trades channel not found - check TRADES_CHANNEL_ID.", ephemeral=True)
         return
-    is_market = entry_type and entry_type.value == "MARKET"
+    etype = entry_type.value
+    if etype == "DCA" and not entry2:
+        await interaction.followup.send("Limit - Range/DCA needs **entry2** (the second entry price).", ephemeral=True)
+        return
+    if etype != "DCA":
+        entry2 = None
+    is_market = etype == "MARKET"
     akey, acfg = resolve_analyst(interaction.user)
     frameworks = [f.value for f in (framework, framework2) if f]
     t = {
@@ -736,13 +764,12 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
         "analyst_color": analyst_color_hex(interaction.user),
         "pair": pair, "direction": direction.value, "timeframe": timeframe,
         "framework": frameworks[0] if frameworks else None, "frameworks": frameworks, "setup_detail": setup_detail,
-        "entry": entry, "sl": stop_loss, "entry_type": entry_type.value,
-        "tp1": tp1, "tp2": tp2, "tp3": tp3, "rr": rr, "risk": risk, "notes": notes,
+        "entry": entry, "entry2": entry2, "sl": stop_loss, "entry_type": "MARKET" if is_market else "LIMIT",
+        "tp1": tp1, "tp2": tp2, "tp3": tp3, "risk": risk, "notes": notes,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "entry1_filled": bool(is_market),
+        "entry1_filled": bool(is_market), "entry2_filled": False,
         "tp1_hit": False, "tp2_hit": False, "tp3_hit": False, "sl_hit": False, "be": False,
-        "partial_tp": False, "partial_price": None,
-        "fills": [], "avg_entry_num": None, "avg_exit": None,
+        "fills": [], "avg_exit": None,
         "closed": False, "result": None, "result_r": None, "close_note": None,
         "edited": False, "edited_at": None,
     }
@@ -1052,9 +1079,9 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     pair="Corrected pair (optional)",
     direction="Corrected direction - futures only (optional)",
     entry="Corrected entry / DCA zone (optional)",
+    entry2="Corrected second DCA entry - futures only (optional)",
     stop_loss="Corrected SL / invalidation (optional)",
     risk="Corrected risk / allocation (optional)",
-    rr="Corrected manual R:R - futures only (optional)",
     entry_type="Corrected entry type - futures only (optional)",
     framework="Corrected framework - futures only (optional)",
     framework2="Corrected second framework - futures only (optional)",
@@ -1070,10 +1097,13 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")],
     framework=[app_commands.Choice(name=f, value=f) for f in FRAMEWORKS],
     framework2=[app_commands.Choice(name=f, value=f) for f in FRAMEWORKS],
-    entry_type=[app_commands.Choice(name="Limit - pending fill", value="LIMIT"), app_commands.Choice(name="Market - filled now", value="MARKET")],
+    entry_type=[
+        app_commands.Choice(name="Market - filled now", value="MARKET"),
+        app_commands.Choice(name="Limit", value="LIMIT"),
+    ],
 )
 @app_commands.autocomplete(trade=editable_any_ac)
-async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, stop_loss: str = None, risk: str = None, rr: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
+async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, stop_loss: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -1118,12 +1148,12 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
             t["direction"] = direction.value; changes.append("direction")
         if entry is not None:
             t["entry"] = entry; changes.append("entry")
+        if entry2 is not None:
+            t["entry2"] = entry2; changes.append("entry 2")
         if stop_loss is not None:
             t["sl"] = stop_loss; changes.append("SL")
         if risk is not None:
             t["risk"] = risk; changes.append("risk")
-        if rr is not None:
-            t["rr"] = rr; changes.append("R:R")
         if entry_type is not None:
             t["entry_type"] = entry_type.value
             t["entry1_filled"] = entry_type.value == "MARKET"
@@ -1181,29 +1211,28 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     await interaction.followup.send(f"Updated ({changed_txt}). {jump_url(t)}", ephemeral=True)
 
 
-@bot.tree.command(name="update", description="Update a running trade (fills, TPs with size %, BE, or close it)")
+@bot.tree.command(name="update", description="Update or close a running trade")
 @app_commands.describe(
     trade="Pick an open trade",
     event="What happened",
-    size_pct="% of position closed at this event (e.g. 25)",
-    price="Price - overrides TP price for the fill, required for Partial TP and Close",
-    avg_entry="Actual average entry if filled in a range (improves R accuracy)",
-    result_r="Manual R override for close events (optional - bot auto-calculates)",
+    size_pct="% of position closed - REQUIRED for TP and Partial TP events (e.g. 25)",
+    price="Fill price - REQUIRED for Partial TP and Closed (remaining position)",
     note="Optional note",
 )
 @app_commands.choices(event=[
-    app_commands.Choice(name="Entry Filled (activate trade)", value="EF"),
-    app_commands.Choice(name="Partial TP (manual, needs price)", value="PTP"),
+    app_commands.Choice(name="Entry 1 Filled", value="EF1"),
+    app_commands.Choice(name="DCA Entry Filled (Entry 2)", value="EF2"),
     app_commands.Choice(name="TP1 Hit", value="TP1"),
     app_commands.Choice(name="TP2 Hit", value="TP2"),
     app_commands.Choice(name="TP3 Hit", value="TP3"),
+    app_commands.Choice(name="Partial TP (custom price)", value="PTP"),
     app_commands.Choice(name="Moved to Breakeven", value="BE"),
-    app_commands.Choice(name="SL Hit (closes remaining as per SL)", value="SL"),
+    app_commands.Choice(name="SL Hit (closes trade)", value="SL"),
     app_commands.Choice(name="Closed (bot calculates result)", value="CLOSE"),
-    app_commands.Choice(name="Closed - Invalidated (never triggered)", value="CI"),
+    app_commands.Choice(name="Invalidated (never triggered)", value="CI"),
 ])
 @app_commands.autocomplete(trade=open_trades_ac)
-async def update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str], size_pct: str = None, price: str = None, avg_entry: str = None, result_r: str = None, note: str = None):
+async def update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str], size_pct: str = None, price: str = None, note: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -1217,55 +1246,63 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
     ev = event.value
     pct = parse_num(size_pct)
     px = parse_num(price)
-    if avg_entry is not None:
-        ae = parse_num(avg_entry)
-        if ae:
-            t["avg_entry_num"] = ae
-    if pct is not None and (pct <= 0 or pct > 100):
-        await interaction.followup.send("size_pct must be between 0 and 100.", ephemeral=True)
-        return
-    if pct is not None and fills_pct(t) + pct > 100.01:
-        await interaction.followup.send(f"That would close {fills_pct(t) + pct:g}% total - only {100 - fills_pct(t):g}% of the position is left.", ephemeral=True)
-        return
-    ptxt = f" @ {price}" if price else ""
-    stxt = f" ({pct:g}%)" if pct else ""
-    desc = ""
-    if ev == "EF":
-        t["entry1_filled"] = True
-        desc = "Entry filled"
-    elif ev == "PTP":
-        if px is None:
-            await interaction.followup.send("Partial TP needs a `price`.", ephemeral=True)
+
+    if ev in ("TP1", "TP2", "TP3", "PTP"):
+        if pct is None:
+            await interaction.followup.send("**size_pct is required** - how much of the position was closed at this level? (e.g. 25)", ephemeral=True)
             return
-        t["partial_tp"] = True
-        t["partial_price"] = price
+        if pct <= 0 or pct > 100:
+            await interaction.followup.send("size_pct must be between 0 and 100.", ephemeral=True)
+            return
+        if fills_pct(t) + pct > 100.01:
+            await interaction.followup.send(f"That would close {fills_pct(t) + pct:g}% total - only {100 - fills_pct(t):g}% of the position is left.", ephemeral=True)
+            return
+    if ev == "PTP" and px is None:
+        await interaction.followup.send("**price is required** for Partial TP - where did you take profits?", ephemeral=True)
+        return
+
+    desc = ""
+    if ev == "EF1":
         t["entry1_filled"] = True
-        t["fills"].append({"price": px, "pct": pct or 0, "label": "Partial"})
-        desc = f"Partial TP{ptxt}{stxt}"
+        desc = "Entry 1 filled" if t.get("entry2") else "Entry filled"
+    elif ev == "EF2":
+        if not t.get("entry2"):
+            await interaction.followup.send("This trade has no DCA entry (entry2) - use Entry 1 Filled.", ephemeral=True)
+            return
+        t["entry2_filled"] = True
+        t["entry1_filled"] = True
+        desc = "DCA entry filled - full position live"
     elif ev in ("TP1", "TP2", "TP3"):
         keymap = {"TP1": "tp1", "TP2": "tp2", "TP3": "tp3"}
-        t[f"{keymap[ev]}_hit"] = True
+        k = keymap[ev]
+        t[f"{k}_hit"] = True
         t["entry1_filled"] = True
-        if ev == "TP2":
-            t["tp1_hit"] = True
-        if ev == "TP3":
-            t["tp1_hit"] = True; t["tp2_hit"] = True
-        fill_price = px if px is not None else first_num(t.get(keymap[ev]))
-        if pct and fill_price is not None:
-            t["fills"].append({"price": fill_price, "pct": pct, "label": ev})
-        desc = f"{ev} hit{ptxt}{stxt}"
+        fill_price = px if px is not None else first_num(t.get(k))
+        if fill_price is None:
+            await interaction.followup.send(f"{ev} has no price set on the trade - pass `price` with this update.", ephemeral=True)
+            return
+        t["fills"].append({"price": fill_price, "pct": pct, "label": ev})
+        desc = f"{ev} hit @ {fnum(fill_price)} ({pct:g}%)"
+    elif ev == "PTP":
+        slot = next((k for k in ("tp1", "tp2", "tp3") if t.get(k) and not t.get(f"{k}_hit")), None)
+        if slot:
+            t[f"{slot}_hit"] = True
+            label = slot.upper()
+        else:
+            label = "Partial TP"
+        t["entry1_filled"] = True
+        t["fills"].append({"price": px, "pct": pct, "label": label})
+        desc = f"{label} hit @ {fnum(px)} ({pct:g}%)"
     elif ev == "BE":
         t["be"] = True
         desc = "Moved to breakeven"
     elif ev == "SL":
-        exit_px = entry_num(t) if t.get("be") else sl_num(t)
-        if px is not None:
-            exit_px = px
+        exit_px = px if px is not None else (entry_num(t) if t.get("be") else sl_num(t))
+        if exit_px is None:
+            await interaction.followup.send("Couldn't read the SL price - pass `price` with this update.", ephemeral=True)
+            return
         t["sl_hit"] = not t.get("be")
         avg_exit, r = finalize_close(t, exit_px)
-        manual = parse_r(result_r)
-        if manual is not None:
-            r = manual
         t["closed"] = True
         t["avg_exit"] = avg_exit
         t["result_r"] = round(r, 2) if r is not None else None
@@ -1273,22 +1310,19 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         t["closed_at"] = datetime.now(timezone.utc).isoformat()
         if note:
             t["close_note"] = note
-        desc = f"Stopped out - closed"
+        desc = "Stopped out - closed"
     elif ev == "CLOSE":
         rem = 100 - fills_pct(t)
         if rem > 0.01 and px is None:
-            await interaction.followup.send(f"{rem:g}% of the position is still open - give the `price` it was closed at.", ephemeral=True)
+            await interaction.followup.send(f"**price is required** - {rem:g}% of the position is still open, at what price was it closed?", ephemeral=True)
             return
         avg_exit, r = finalize_close(t, px)
-        manual = parse_r(result_r)
-        if manual is not None:
-            r = manual
-        if r is None and manual is None:
-            await interaction.followup.send("Couldn't calculate R (entry/SL not parseable) - pass `result_r` manually.", ephemeral=True)
+        if r is None:
+            await interaction.followup.send("Couldn't calculate the result - check that entry and SL are numeric on this trade.", ephemeral=True)
             return
         t["closed"] = True
         t["avg_exit"] = avg_exit
-        t["result_r"] = round(r, 2) if r is not None else None
+        t["result_r"] = round(r, 2)
         t["result"] = "WIN" if r > 0.05 else "LOSS" if r < -0.05 else "BE"
         t["closed_at"] = datetime.now(timezone.utc).isoformat()
         if note:
@@ -1301,73 +1335,31 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         if note:
             t["close_note"] = note
         desc = "Invalidated"
+
     data[trade] = t
     save_trades(data)
     await refresh_and_edit(t)
     await refresh_board()
+
     rtxt = f" ({t['result_r']:+.2f}R)" if t.get("closed") and isinstance(t.get("result_r"), (int, float)) else ""
     aetxt = f" | Avg exit: {fnum(t['avg_exit'])}" if t.get("closed") and t.get("avg_exit") is not None else ""
     if t.get("closed") and t.get("result") != "INVALID":
         res = t["result"]
-        title = f"Closed - {res.capitalize() if res != 'BE' else 'Breakeven'}{rtxt}"
+        title = f"Closed - {'Win' if res == 'WIN' else 'Loss' if res == 'LOSS' else 'Breakeven'}{rtxt}"
         color = GREEN if res == "WIN" else RED if res == "LOSS" else GREY
         line = f"{desc}{rtxt}{aetxt}"
     elif ev == "CI":
         title, color, line = "Invalidated", DGREY, "Setup invalidated before trigger."
     else:
         title = desc
-        color = GREEN if ev in ("PTP", "TP1", "TP2", "TP3") else BLUE if ev == "EF" else GREY
+        color = GREEN if ev in ("PTP", "TP1", "TP2", "TP3") else BLUE if ev in ("EF1", "EF2") else GREY
         closed_pct = fills_pct(t)
-        line = desc + (f" - {closed_pct:g}% of position closed, {100 - closed_pct:g}% running" if closed_pct > 0 and not t.get("closed") else "")
+        line = desc + (f"\n{closed_pct:g}% of position closed, {100 - closed_pct:g}% running" if closed_pct > 0 and not t.get("closed") else "")
     if note:
         line += f"\n> {note}"
     await post_update_feed(t, title, color, line)
     await thread_note(t, f"**{desc}{rtxt}**" + (f" - {note}" if note else ""))
     await interaction.followup.send(f"Updated: {desc}{rtxt}{aetxt}", ephemeral=True)
-
-
-@bot.tree.command(name="close", description="Close a trade (manual result - /update Close auto-calculates)")
-@app_commands.describe(trade="Pick an open trade", result="Outcome", result_r="Realized R", note="Closing note")
-@app_commands.choices(result=[
-    app_commands.Choice(name="Win", value="WIN"),
-    app_commands.Choice(name="Loss", value="LOSS"),
-    app_commands.Choice(name="Breakeven", value="BE"),
-    app_commands.Choice(name="Invalidated", value="INVALID"),
-])
-@app_commands.autocomplete(trade=open_trades_ac)
-async def close(interaction: discord.Interaction, trade: str, result: app_commands.Choice[str], result_r: str = None, note: str = None):
-    if not is_analyst(interaction):
-        await interaction.response.send_message("Analysts only.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    data = load_trades()
-    t = data.get(trade)
-    if not t:
-        await interaction.followup.send("Trade not found.", ephemeral=True)
-        return
-    t["closed"] = True
-    t["result"] = result.value
-    t["result_r"] = parse_r(result_r)
-    t["closed_at"] = datetime.now(timezone.utc).isoformat()
-    if note:
-        t["close_note"] = note
-    data[trade] = t
-    save_trades(data)
-    await refresh_and_edit(t)
-    await refresh_board()
-    rtxt = f" ({t['result_r']:+g}R)" if isinstance(t["result_r"], (int, float)) else ""
-    feed = {
-        "WIN": (f"Closed - Win{rtxt}", GREEN, "Trade closed in profit."),
-        "LOSS": (f"Closed - Loss{rtxt}", RED, "Trade closed at a loss."),
-        "BE": ("Closed - Breakeven", GREY, "Trade closed flat."),
-        "INVALID": ("Invalidated", DGREY, "Setup invalidated before trigger."),
-    }
-    title, color, line = feed[result.value]
-    if note:
-        line += f"\n> {note}"
-    await post_update_feed(t, title, color, line)
-    await thread_note(t, f"**Closed - {result.value}{rtxt}**" + (f" - {note}" if note else ""))
-    await interaction.followup.send(f"Closed: {result.value}{rtxt}", ephemeral=True)
 
 
 @bot.tree.command(name="open", description="See all live positions (futures + spot)")
