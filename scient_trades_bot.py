@@ -1540,7 +1540,17 @@ def make_chart_image(symbol: str, interval: str, klines: list) -> io.BytesIO:
     for ax in axes:
         ax.yaxis.tick_right()
         ax.yaxis.set_label_position("right")
+    x0, x1 = axes[0].get_xlim()
+    axes[0].set_xlim(x0, x1 + (x1 - x0) * 0.06)
     axes[0].set_title(f"{symbol}  {interval}  |  {price_txt}", color="#EAECEF", fontsize=13, loc="left", pad=12)
+    up = df["Close"].iloc[-1] >= df["Open"].iloc[-1]
+    tag_color = "#0ECB81" if up else "#F6465D"
+    axes[0].annotate(
+        price_txt, xy=(1.0, float(last)), xycoords=("axes fraction", "data"),
+        xytext=(-2, 0), textcoords="offset points", ha="right", va="center",
+        color="#131722", fontsize=9, fontweight="bold",
+        bbox=dict(boxstyle="round,pad=0.25", facecolor=tag_color, edgecolor="none"),
+    )
     buf = io.BytesIO()
     fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
     import matplotlib.pyplot as plt
@@ -1827,6 +1837,70 @@ QUIZ_BANK = [
 ]
 
 
+def _quiz_pick():
+    import random as _r
+    return _r.choice(QUIZ_BANK)
+
+
+def _quiz_embed(q, score=None, answered=None):
+    desc = f"**{q['q']}**"
+    if score is not None:
+        desc += f"\n\n*Streak score: {score}/{answered} this session*"
+    embed = discord.Embed(title="\U0001F9E0 TA Quiz", description=desc, color=NAVY)
+    embed.set_footer(text="Scient Lounge - setups, not signals")
+    return embed
+
+
+def _result_embed(correct: bool, right_letter: str, score: int, answered: int):
+    if correct:
+        title = "\u2705 Correct! Nice read."
+        color = GREEN
+    else:
+        title = f"\u274C Not quite - the answer was {right_letter}."
+        color = RED
+    embed = discord.Embed(title=title, description=f"*Score: {score}/{answered} this session*", color=color)
+    embed.set_footer(text="Scient Lounge - keep going")
+    return embed
+
+
+class QuizNextView(View):
+    def __init__(self, score: int, answered: int):
+        super().__init__(timeout=600)
+        self.score = score
+        self.answered = answered
+        btn = Button(label="Next question \u25B6", style=discord.ButtonStyle.primary)
+        btn.callback = self.next_q
+        self.add_item(btn)
+
+    async def next_q(self, interaction: discord.Interaction):
+        q = _quiz_pick()
+        await interaction.response.edit_message(embed=_quiz_embed(q, self.score, self.answered), view=QuizSessionView(q, self.score, self.answered))
+
+
+class QuizSessionView(View):
+    def __init__(self, q: dict, score: int, answered: int):
+        super().__init__(timeout=600)
+        self.q = q
+        self.score = score
+        self.answered = answered
+        for i, opt in enumerate(q["opts"]):
+            self.add_item(QuizSessionButton(i, opt, self))
+
+
+class QuizSessionButton(Button):
+    def __init__(self, idx: int, label: str, sview: "QuizSessionView"):
+        super().__init__(label=f"{chr(65 + idx)}. {label}"[:80], style=discord.ButtonStyle.secondary)
+        self.idx = idx
+        self.sview = sview
+
+    async def callback(self, interaction: discord.Interaction):
+        correct = self.idx == self.sview.q["a"]
+        score = self.sview.score + (1 if correct else 0)
+        answered = self.sview.answered + 1
+        right = chr(65 + self.sview.q["a"])
+        await interaction.response.edit_message(embed=_result_embed(correct, right, score, answered), view=QuizNextView(score, answered))
+
+
 class QuizView(View):
     def __init__(self, correct: int, opts: list):
         super().__init__(timeout=600)
@@ -1844,22 +1918,20 @@ class QuizButton(Button):
 
     async def callback(self, interaction: discord.Interaction):
         if interaction.user.id in self.qview.answered:
-            await interaction.response.send_message("You already answered this one.", ephemeral=True)
+            await interaction.response.send_message("You already answered this one - hit Next question on your result to keep going.", ephemeral=True)
             return
         self.qview.answered.add(interaction.user.id)
-        if self.idx == self.qview.correct:
-            await interaction.response.send_message("\u2705 Correct! Nice read.", ephemeral=True)
-        else:
-            right = chr(65 + self.qview.correct)
-            await interaction.response.send_message(f"\u274C Not quite - the answer was **{right}**.", ephemeral=True)
+        correct = self.idx == self.qview.correct
+        score = 1 if correct else 0
+        right = chr(65 + self.qview.correct)
+        await interaction.response.send_message(embed=_result_embed(correct, right, score, 1), view=QuizNextView(score, 1), ephemeral=True)
 
 
 @bot.tree.command(name="quiz", description="Random TA quiz question - test yourself")
 async def quiz(interaction: discord.Interaction):
-    import random as _r
-    q = _r.choice(QUIZ_BANK)
-    embed = discord.Embed(title="\U0001F9E0 TA Quiz", description=f"**{q['q']}**\n\n*Answer is private - only you see if you got it right.*", color=NAVY)
-    embed.set_footer(text="Scient Lounge - setups, not signals")
+    q = _quiz_pick()
+    embed = _quiz_embed(q)
+    embed.description += "\n\n*Answer is private - only you see your result. Keep the streak going with Next question.*"
     await interaction.response.send_message(embed=embed, view=QuizView(q["a"], q["opts"]))
 
 
