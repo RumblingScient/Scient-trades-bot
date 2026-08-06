@@ -4,7 +4,7 @@ from discord import app_commands
 from discord.ext import commands
 from discord.ui import View, Button
 from discord.ext import tasks
-import os, json, re, hashlib, aiohttp
+import os, json, re, hashlib, aiohttp, io, asyncio
 from pathlib import Path
 from datetime import datetime, timezone, timedelta
 
@@ -23,6 +23,9 @@ TRADE_UPDATES_CHANNEL_ID = 1525863205174378617
 OPEN_BOARD_CHANNEL_ID = 1525863082256109690
 X_FEED_CHANNEL_ID = 1525862152076923020
 SPOT_CHANNEL_ID = 1533876035462889482
+QUANT_CHANNEL_ID = 0  # paste #quant-terminal channel ID here (0 = commands work everywhere)
+EMA_PERIODS = [20, 50, 100, 200]  # change to match Scient 4EMA periods
+EMA_COLORS = ["#E8590C", "#FAC775", "#378ADD", "#1C4E80"]
 ANALYST_ROLE_NAME = "Analyst"
 PING_ROLE_ID = 1525861312729452704
 X_PING_ROLE_ID = 1525861448088031462
@@ -1501,6 +1504,345 @@ async def pnl(interaction: discord.Interaction, account: str, risk: str, entry: 
     embed = discord.Embed(title="Position Size Calculator", color=NAVY)
     embed.description = "\n".join(lines)
     embed.set_footer(text="Scient Lounge - risk first, always")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+CHART_INTERVALS = {"15m": "15m", "1H": "1h", "4H": "4h", "1D": "1d", "1W": "1w"}
+
+
+def make_chart_image(symbol: str, interval: str, klines: list) -> io.BytesIO:
+    import pandas as pd
+    import mplfinance as mpf
+    df = pd.DataFrame(klines, columns=["t", "o", "h", "l", "c", "v", "ct", "qv", "n", "tb", "tq", "ig"])
+    df["Date"] = pd.to_datetime(df["t"], unit="ms")
+    df = df.set_index("Date")
+    for col, name in (("o", "Open"), ("h", "High"), ("l", "Low"), ("c", "Close"), ("v", "Volume")):
+        df[name] = df[col].astype(float)
+    df = df[["Open", "High", "Low", "Close", "Volume"]]
+    addplots = []
+    for period, color in zip(EMA_PERIODS, EMA_COLORS):
+        if len(df) >= period:
+            ema = df["Close"].ewm(span=period, adjust=False).mean()
+            addplots.append(mpf.make_addplot(ema, color=color, width=1.1))
+    mc = mpf.make_marketcolors(up="#2E7D32", down="#C62828", edge="inherit", wick="inherit", volume="in")
+    style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, facecolor="#16181C", edgecolor="#2B2D31", figcolor="#16181C", gridcolor="#2B2D31", gridstyle=":")
+    buf = io.BytesIO()
+    last = df["Close"].iloc[-1]
+    title = f"{symbol}  {interval}  |  {last:,.4f}".rstrip("0").rstrip(".") if last < 1000 else f"{symbol}  {interval}  |  {last:,.2f}"
+    mpf.plot(df, type="candle", style=style, volume=True, addplot=addplots if addplots else None,
+             title=dict(title=title, color="#DBDEE1", size=11),
+             figsize=(11, 6), tight_layout=True, savefig=dict(fname=buf, dpi=110, facecolor="#16181C"))
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="chart", description="Quick price chart with EMAs (Binance data)")
+@app_commands.describe(coin="Coin symbol, e.g. BTC, SOL", timeframe="Chart timeframe")
+@app_commands.choices(timeframe=[app_commands.Choice(name=k, value=k) for k in CHART_INTERVALS])
+async def chart_cmd(interaction: discord.Interaction, coin: str, timeframe: app_commands.Choice[str]):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    interval = CHART_INTERVALS[timeframe.value]
+    url = "https://api.binance.com/api/v3/klines"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params={"symbol": pair, "interval": interval, "limit": 220}, timeout=20) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send(f"Couldn't find **{symbol}** - check the symbol.")
+                    return
+                klines = await resp.json()
+    except Exception:
+        await interaction.followup.send("Chart data unavailable right now - try again in a minute.")
+        return
+    if not klines or len(klines) < 20:
+        await interaction.followup.send(f"Not enough data for **{symbol}** on {timeframe.value}.")
+        return
+    try:
+        buf = await asyncio.to_thread(make_chart_image, f"{symbol}/USDT", timeframe.value, klines)
+    except Exception as e:
+        await interaction.followup.send(f"Chart rendering failed: {e}")
+        return
+    f = discord.File(buf, filename=f"{symbol}_{timeframe.value}.png")
+    ema_txt = " / ".join(str(p) for p in EMA_PERIODS)
+    await interaction.followup.send(content=f"**{symbol}/USDT - {timeframe.value}** | EMAs: {ema_txt}", file=f)
+
+
+@bot.tree.command(name="liq", description="Liquidation price calculator")
+@app_commands.describe(entry="Entry price", leverage="Leverage, e.g. 10", direction="Long or Short")
+@app_commands.choices(direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")])
+async def liq(interaction: discord.Interaction, entry: str, leverage: str, direction: app_commands.Choice[str]):
+    await interaction.response.defer(ephemeral=True)
+    en = parse_num(entry)
+    lev = parse_num(leverage)
+    if not en or not lev or en <= 0 or lev <= 1:
+        await interaction.followup.send("Check inputs - entry must be positive and leverage above 1.", ephemeral=True)
+        return
+    mmr = 0.005
+    if direction.value == "LONG":
+        liq_price = en * (1 - 1 / lev + mmr)
+        dist = (en - liq_price) / en * 100
+    else:
+        liq_price = en * (1 + 1 / lev - mmr)
+        dist = (liq_price - en) / en * 100
+    embed = discord.Embed(title="Liquidation Calculator", color=NAVY)
+    embed.description = (
+        f"**Direction:** {direction.value} @ {fnum(en)} | **Leverage:** {lev:g}x\n"
+        f"**Est. liquidation:** {fnum(liq_price)}\n"
+        f"**Distance:** {dist:.2f}% against you\n\n"
+        f"*Estimate with 0.5% maintenance margin - exact level varies by exchange, position size, and margin mode. Always check your exchange.*"
+    )
+    embed.set_footer(text="Scient Lounge - risk first, always")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="funding", description="Current funding rate (Binance perps)")
+@app_commands.describe(coin="Coin symbol, e.g. BTC, SOL")
+async def funding(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    url = "https://fapi.binance.com/fapi/v1/premiumIndex"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params={"symbol": pair}, timeout=15) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send(f"No perp market found for **{symbol}**.")
+                    return
+                data = await resp.json()
+    except Exception:
+        await interaction.followup.send("Funding data unavailable right now.")
+        return
+    try:
+        rate = float(data["lastFundingRate"]) * 100
+        mark = float(data["markPrice"])
+        nxt = int(data["nextFundingTime"]) // 1000
+    except Exception:
+        await interaction.followup.send(f"Couldn't parse funding data for **{symbol}**.")
+        return
+    lean = "Longs paying shorts (crowded long)" if rate > 0 else "Shorts paying longs (crowded short)" if rate < 0 else "Neutral"
+    color = RED if abs(rate) > 0.05 else GREEN if abs(rate) < 0.01 else GOLD
+    embed = discord.Embed(title=f"Funding - {symbol} Perp", color=color, timestamp=datetime.now(timezone.utc))
+    embed.description = (
+        f"**Rate:** {rate:+.4f}% per 8h ({rate * 3 * 365:+.1f}% annualized)\n"
+        f"**Lean:** {lean}\n"
+        f"**Mark:** ${fnum(mark)} | **Next funding:** <t:{nxt}:R>"
+    )
+    embed.set_footer(text="Scient Lounge - Binance perps")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="fear", description="Crypto Fear & Greed index")
+async def fear(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.alternative.me/fng/?limit=2", timeout=15) as resp:
+                data = await resp.json()
+    except Exception:
+        await interaction.followup.send("Fear & Greed data unavailable right now.")
+        return
+    try:
+        today = data["data"][0]
+        val = int(today["value"])
+        label = today["value_classification"]
+        prev = int(data["data"][1]["value"]) if len(data["data"]) > 1 else None
+    except Exception:
+        await interaction.followup.send("Couldn't parse Fear & Greed data.")
+        return
+    if val <= 25:
+        color, emoji = RED, "\U0001F628"
+    elif val <= 45:
+        color, emoji = GOLD, "\U0001F61F"
+    elif val <= 55:
+        color, emoji = GREY, "\U0001F610"
+    elif val <= 75:
+        color, emoji = GREEN, "\U0001F642"
+    else:
+        color, emoji = GREEN, "\U0001F911"
+    bar_filled = round(val / 10)
+    bar = "\u2588" * bar_filled + "\u2591" * (10 - bar_filled)
+    chg = f" ({val - prev:+d} vs yesterday)" if prev is not None else ""
+    embed = discord.Embed(title=f"{emoji} Fear & Greed: {val} - {label}", color=color, timestamp=datetime.now(timezone.utc))
+    embed.description = f"`{bar}` {val}/100{chg}\n\n*Extreme fear = others panicking. Extreme greed = time to be careful.*"
+    embed.set_footer(text="Scient Lounge - alternative.me")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="oi", description="Open interest for a perp market")
+@app_commands.describe(coin="Coin symbol, e.g. BTC, SOL")
+async def oi(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://fapi.binance.com/fapi/v1/openInterest", params={"symbol": pair}, timeout=15) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send(f"No perp market found for **{symbol}**.")
+                    return
+                now_data = await resp.json()
+            async with session.get("https://fapi.binance.com/futures/data/openInterestHist", params={"symbol": pair, "period": "1h", "limit": 25}, timeout=15) as resp2:
+                hist = await resp2.json() if resp2.status == 200 else []
+            async with session.get("https://fapi.binance.com/fapi/v1/premiumIndex", params={"symbol": pair}, timeout=15) as resp3:
+                px = await resp3.json() if resp3.status == 200 else {}
+    except Exception:
+        await interaction.followup.send("OI data unavailable right now.")
+        return
+    try:
+        oi_now = float(now_data["openInterest"])
+        mark = float(px.get("markPrice", 0))
+        oi_usd = oi_now * mark if mark else None
+    except Exception:
+        await interaction.followup.send(f"Couldn't parse OI data for **{symbol}**.")
+        return
+    chg_txt = ""
+    color = NAVY
+    if isinstance(hist, list) and len(hist) >= 24:
+        try:
+            oi_then = float(hist[0]["sumOpenInterest"])
+            chg = (oi_now - oi_then) / oi_then * 100
+            arrow = "\U0001F4C8" if chg >= 0 else "\U0001F4C9"
+            chg_txt = f"\n**24h change:** {arrow} {chg:+.2f}%"
+            color = GREEN if chg > 2 else RED if chg < -2 else NAVY
+        except Exception:
+            pass
+    usd_txt = f" (${oi_usd / 1e9:.2f}B)" if oi_usd and oi_usd >= 1e9 else (f" (${oi_usd / 1e6:.1f}M)" if oi_usd else "")
+    embed = discord.Embed(title=f"Open Interest - {symbol} Perp", color=color, timestamp=datetime.now(timezone.utc))
+    embed.description = f"**OI:** {fnum(oi_now)} {symbol}{usd_txt}{chg_txt}"
+    embed.set_footer(text="Scient Lounge - Binance perps")
+    await interaction.followup.send(embed=embed)
+
+
+async def _movers(interaction: discord.Interaction, top: bool):
+    await interaction.response.defer()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=20) as resp:
+                data = await resp.json()
+    except Exception:
+        await interaction.followup.send("Market data unavailable right now.")
+        return
+    rows = []
+    for d in data:
+        s = d.get("symbol", "")
+        if not s.endswith("USDT") or any(x in s for x in ("UP", "DOWN", "BULL", "BEAR")):
+            continue
+        try:
+            qv = float(d["quoteVolume"])
+            chg = float(d["priceChangePercent"])
+            last = float(d["lastPrice"])
+        except Exception:
+            continue
+        if qv < 10_000_000:
+            continue
+        rows.append((s[:-4], chg, last, qv))
+    rows.sort(key=lambda r: r[1], reverse=top)
+    rows = rows[:5]
+    if not rows:
+        await interaction.followup.send("No data right now.")
+        return
+    title = "\U0001F4C8 Top Gainers (24h)" if top else "\U0001F4C9 Top Losers (24h)"
+    color = GREEN if top else RED
+    lines = []
+    for i, (sym, chg, last, qv) in enumerate(rows, 1):
+        vol = f"${qv / 1e9:.1f}B" if qv >= 1e9 else f"${qv / 1e6:.0f}M"
+        lines.append(f"**{i}. {sym}** {chg:+.2f}% - ${fnum(last)} - vol {vol}")
+    embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines) + "\n\n*USDT pairs, min $10M volume*"
+    embed.set_footer(text="Scient Lounge - Binance spot")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="gainers", description="Top 5 gainers of the day")
+async def gainers(interaction: discord.Interaction):
+    await _movers(interaction, top=True)
+
+
+@bot.tree.command(name="losers", description="Top 5 losers of the day")
+async def losers(interaction: discord.Interaction):
+    await _movers(interaction, top=False)
+
+
+@bot.tree.command(name="convert", description="Convert coin amount to USD (or USD to coin)")
+@app_commands.describe(amount="Amount, e.g. 0.5 or 1500", coin="Coin symbol, e.g. BTC", to_coin="Convert USD amount INTO this coin instead")
+@app_commands.choices(to_coin=[app_commands.Choice(name="Yes - amount is USD, show me coin quantity", value="yes")])
+async def convert(interaction: discord.Interaction, amount: str, coin: str, to_coin: app_commands.Choice[str] = None):
+    await interaction.response.defer()
+    amt = parse_num(amount)
+    if not amt or amt <= 0:
+        await interaction.followup.send("Amount must be a positive number.")
+        return
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": pair}, timeout=15) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send(f"Couldn't find **{symbol}**.")
+                    return
+                data = await resp.json()
+    except Exception:
+        await interaction.followup.send("Price feed unavailable right now.")
+        return
+    price = float(data["price"])
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    if to_coin:
+        qty = amt / price
+        line = f"**${amt:,.2f}** = **{fnum(qty)} {base}** @ ${fnum(price)}"
+    else:
+        usd = amt * price
+        line = f"**{fnum(amt)} {base}** = **${usd:,.2f}** @ ${fnum(price)}"
+    embed = discord.Embed(title="Converter", color=NAVY, description=line)
+    embed.set_footer(text="Scient Lounge - Binance spot")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="help", description="See all commands you can use")
+async def help_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    embed = discord.Embed(title="Quant - Command Guide", color=NAVY)
+    embed.description = "Everything you can do with the bot. All replies marked *private* are visible only to you."
+    embed.add_field(
+        name="\U0001F4CA Market Tools",
+        value=(
+            "`/price` - live price, 24h change, high/low\n"
+            "`/chart` - candlestick chart with EMAs (15m to 1W)\n"
+            "`/funding` - perp funding rate + market lean\n"
+            "`/oi` - open interest + 24h change\n"
+            "`/gainers` / `/losers` - top 5 movers of the day\n"
+            "`/convert` - coin to USD (or USD to coin)\n"
+            "`/fear` - Fear & Greed index"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F9EE Calculators *(private)*",
+        value=(
+            "`/pnl` - position size from account, risk %, entry, SL\n"
+            "`/liq` - estimated liquidation price for any leverage"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F4C8 Trades & Results *(private)*",
+        value=(
+            "`/open` - all live positions (futures + spot)\n"
+            "`/recent` - latest closed trades with results\n"
+            "`/stats` - any analyst's futures scorecard\n"
+            "`/spot_stats` - any analyst's spot scorecard"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F514 Alerts",
+        value=(
+            "`/follow` / `/unfollow` - get pinged when an analyst posts\n"
+            "Or use the buttons in #follow-analysts-roles"
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Scient Lounge - Quant")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
