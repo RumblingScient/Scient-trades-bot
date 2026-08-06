@@ -24,6 +24,20 @@ OPEN_BOARD_CHANNEL_ID = 1525863082256109690
 X_FEED_CHANNEL_ID = 1525862152076923020
 SPOT_CHANNEL_ID = 1533876035462889482
 QUANT_CHANNEL_ID = 0  # paste #quant-terminal channel ID here (0 = commands work everywhere)
+
+# ---- News wire config (TreeNews) ----
+NEWS_CHANNEL_ID = 1535048677406539797
+NEWS_PING_ROLE_ID = 1535053641378037760  # pinged on URGENT news only
+NEWS_ENABLED = True
+NEWS_WS_URL = "wss://news.treeofalpha.com/ws"
+NEWS_COINS = {"BTC", "ETH", "SOL", "BITCOIN", "ETHEREUM", "SOLANA"}
+NEWS_KEYWORDS = {
+    "sec", "etf", "fed", "fomc", "rate cut", "rate hike", "cpi", "inflation",
+    "hack", "hacked", "exploit", "exploited", "breach", "stolen",
+    "listing", "lists", "delist", "delisting", "bankrupt", "bankruptcy",
+    "liquidat", "halt", "halted", "approval", "approved", "lawsuit", "sues", "settle",
+    "binance", "coinbase", "tether", "usdt", "blackrock", "grayscale", "microstrategy", "strategy",
+}
 EMA_PERIODS = [20, 50, 100, 200]  # change to match Scient 4EMA periods
 EMA_COLORS = ["#E8590C", "#FAC775", "#378ADD", "#1C4E80"]
 ANALYST_ROLE_NAME = "Analyst"
@@ -561,6 +575,103 @@ async def refresh_spot_board():
     save_spot_board({"message_id": msg.id, "channel_id": ch.id})
 
 
+_news_seen = []
+_news_last_msg = {"time": None, "posted": 0}
+
+
+def _news_relevant(text: str, coins: list) -> bool:
+    up = {c.upper() for c in coins if c}
+    if up & NEWS_COINS:
+        return True
+    low = text.lower()
+    return any(k in low for k in NEWS_KEYWORDS)
+
+
+def _news_urgent(text: str) -> bool:
+    low = text.lower()
+    return any(k in low for k in ("hack", "exploit", "breach", "stolen", "bankrupt", "halt", "delist"))
+
+
+async def _post_news(item: dict):
+    ch = bot.get_channel(NEWS_CHANNEL_ID)
+    if ch is None:
+        return
+    title = str(item.get("title") or "")
+    body = str(item.get("body") or item.get("en") or "")
+    link = item.get("url") or item.get("link") or ""
+    source = str(item.get("source") or "").strip()
+    coins = []
+    for s in item.get("symbols", []) or []:
+        coins.append(str(s).replace("USDT", "").replace("_", ""))
+    for sug in item.get("suggestions", []) or []:
+        if isinstance(sug, dict) and sug.get("coin"):
+            coins.append(str(sug["coin"]))
+    text = f"{title} {body}".strip()
+    if not text or not _news_relevant(text, coins):
+        return
+    key = hashlib.md5(text[:200].encode()).hexdigest()
+    if key in _news_seen:
+        return
+    _news_seen.append(key)
+    del _news_seen[:-300]
+    urgent = _news_urgent(text)
+    color = RED if urgent else NAVY
+    embed = discord.Embed(color=color, timestamp=datetime.now(timezone.utc))
+    headline = title if title else body[:250]
+    embed.title = ("\U0001F6A8 " if urgent else "\U0001F4F0 ") + headline[:250]
+    desc = ""
+    if body and body != headline:
+        desc = body[:400]
+    if coins:
+        tags = " ".join(f"`{c.upper()}`" for c in dict.fromkeys(coins[:6]))
+        desc = (desc + "\n\n" if desc else "") + tags
+    if desc:
+        embed.description = desc
+    if link:
+        embed.url = link
+    embed.set_footer(text=f"News Wire - {source or 'TreeNews'}")
+    content = None
+    allowed = discord.AllowedMentions.none()
+    if urgent and NEWS_PING_ROLE_ID:
+        content = f"<@&{NEWS_PING_ROLE_ID}>"
+        allowed = discord.AllowedMentions(roles=True)
+    try:
+        await ch.send(content=content, embed=embed, allowed_mentions=allowed)
+        _news_last_msg["posted"] += 1
+    except Exception as e:
+        print(f"[news] post error: {e}")
+
+
+async def news_ws_loop():
+    await bot.wait_until_ready()
+    backoff = 5
+    while not bot.is_closed():
+        if not (NEWS_ENABLED and NEWS_CHANNEL_ID):
+            await asyncio.sleep(60)
+            continue
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(NEWS_WS_URL, heartbeat=30, timeout=30) as ws:
+                    print("[news] connected to TreeNews")
+                    backoff = 5
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            _news_last_msg["time"] = datetime.now(timezone.utc)
+                            try:
+                                item = json.loads(msg.data)
+                            except Exception:
+                                continue
+                            if isinstance(item, dict):
+                                await _post_news(item)
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+        except Exception as e:
+            print(f"[news] ws error: {e}")
+        print(f"[news] disconnected - retrying in {backoff}s")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300)
+
+
 @tasks.loop(minutes=X_POLL_MINUTES)
 async def x_poll_loop():
     if not (X_AUTO_ENABLED and TWITTERAPIS_KEY and X_FEED_CHANNEL_ID and X_AUTO_USERNAME):
@@ -652,6 +763,7 @@ class FollowPanel(View):
             self.add_item(FollowButton(key.capitalize(), cfg.get("ping_role_id"), f"follow_{key}"))
         self.add_item(FollowAllButton())
         self.add_item(FollowXButton())
+        self.add_item(FollowNewsButton())
 
 
 class FollowButton(Button):
@@ -680,6 +792,14 @@ class FollowXButton(Button):
         await toggle_role(interaction, X_PING_ROLE_ID, "X Updates")
 
 
+class FollowNewsButton(Button):
+    def __init__(self):
+        super().__init__(label="\U0001F6A8 Breaking News", style=discord.ButtonStyle.danger, custom_id="follow_news")
+
+    async def callback(self, interaction: discord.Interaction):
+        await toggle_role(interaction, NEWS_PING_ROLE_ID, "Breaking News")
+
+
 @bot.event
 async def on_ready():
     guild = discord.Object(id=GUILD_ID)
@@ -690,7 +810,28 @@ async def on_ready():
     await refresh_spot_board()
     if X_AUTO_ENABLED and not x_poll_loop.is_running():
         x_poll_loop.start()
+    if NEWS_ENABLED and NEWS_CHANNEL_ID and not getattr(bot, "_news_task", None):
+        bot._news_task = asyncio.create_task(news_ws_loop())
     print(f"Logged in as {bot.user} - commands synced.")
+
+
+@bot.tree.command(name="news_status", description="(Admin) Check the news wire connection")
+async def news_status(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    if not NEWS_CHANNEL_ID:
+        await interaction.response.send_message("News wire disabled - set NEWS_CHANNEL_ID in the code.", ephemeral=True)
+        return
+    running = bool(getattr(bot, "_news_task", None)) and not bot._news_task.done()
+    last = _news_last_msg["time"]
+    last_txt = f"<t:{int(last.timestamp())}:R>" if last else "never (no messages yet this session)"
+    await interaction.response.send_message(
+        f"**News wire:** {'\U0001F7E2 running' if running else '\U0001F534 not running'}\n"
+        f"**Last message received:** {last_txt}\n"
+        f"**Posted this session:** {_news_last_msg['posted']}",
+        ephemeral=True,
+    )
 
 
 @bot.tree.command(name="setup_follow_panel", description="(Admin) Post the analyst follow panel in this channel")
@@ -705,7 +846,8 @@ async def setup_follow_panel(interaction: discord.Interaction):
             "Tap again to stop.\n\n"
             "**Analysts:** Scient, Owais, 94, Michael, Delta, Gaijin\n"
             "**Follow All** - get pinged on every new trade\n"
-            "**X Updates** - get pinged when new X posts are shared"
+            "**X Updates** - get pinged when new X posts are shared\n"
+            "**\U0001F6A8 Breaking News** - get pinged on urgent market news only (hacks, halts, delistings)"
         ),
         color=NAVY,
     )
