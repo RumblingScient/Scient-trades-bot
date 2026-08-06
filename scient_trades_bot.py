@@ -1523,15 +1523,28 @@ def make_chart_image(symbol: str, interval: str, klines: list) -> io.BytesIO:
     for period, color in zip(EMA_PERIODS, EMA_COLORS):
         if len(df) >= period:
             ema = df["Close"].ewm(span=period, adjust=False).mean()
-            addplots.append(mpf.make_addplot(ema, color=color, width=1.1))
-    mc = mpf.make_marketcolors(up="#2E7D32", down="#C62828", edge="inherit", wick="inherit", volume="in")
-    style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, facecolor="#16181C", edgecolor="#2B2D31", figcolor="#16181C", gridcolor="#2B2D31", gridstyle=":")
-    buf = io.BytesIO()
+            addplots.append(mpf.make_addplot(ema, color=color, width=1.3))
+    mc = mpf.make_marketcolors(up="#0ECB81", down="#F6465D", edge="inherit", wick="inherit", volume={"up": "#0ECB8155", "down": "#F6465D55"})
+    style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, facecolor="#131722", edgecolor="#2A2E39", figcolor="#131722", gridcolor="#1E222D", gridstyle="-", rc={"axes.labelcolor": "#B2B5BE", "xtick.color": "#B2B5BE", "ytick.color": "#B2B5BE", "font.size": 9})
     last = df["Close"].iloc[-1]
-    title = f"{symbol}  {interval}  |  {last:,.4f}".rstrip("0").rstrip(".") if last < 1000 else f"{symbol}  {interval}  |  {last:,.2f}"
-    mpf.plot(df, type="candle", style=style, volume=True, addplot=addplots if addplots else None,
-             title=dict(title=title, color="#DBDEE1", size=11),
-             figsize=(11, 6), tight_layout=True, savefig=dict(fname=buf, dpi=110, facecolor="#16181C"))
+    price_txt = f"{last:,.2f}" if last >= 1000 else f"{last:,.4f}".rstrip("0").rstrip(".")
+    fig, axes = mpf.plot(
+        df, type="candle", style=style, volume=True,
+        addplot=addplots if addplots else None,
+        panel_ratios=(5, 1), figsize=(13, 7.5),
+        scale_width_adjustment=dict(candle=1.5, volume=0.9),
+        tight_layout=True, returnfig=True,
+        hlines=dict(hlines=[float(last)], colors=["#B2B5BE"], linestyle="--", linewidths=0.8, alpha=0.6),
+        ylabel="", ylabel_lower="",
+    )
+    for ax in axes:
+        ax.yaxis.tick_right()
+        ax.yaxis.set_label_position("right")
+    axes[0].set_title(f"{symbol}  {interval}  |  {price_txt}", color="#EAECEF", fontsize=13, loc="left", pad=12)
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    import matplotlib.pyplot as plt
+    plt.close(fig)
     buf.seek(0)
     return buf
 
@@ -1798,9 +1811,350 @@ async def convert(interaction: discord.Interaction, amount: str, coin: str, to_c
     await interaction.followup.send(embed=embed)
 
 
-@bot.tree.command(name="help", description="See all commands you can use")
-async def help_cmd(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
+QUIZ_BANK = [
+    {"q": "In the AMD cycle, what phase comes right after Accumulation?", "opts": ["Distribution", "Manipulation", "Markup", "Re-accumulation"], "a": 1},
+    {"q": "On a Fixed Range Volume Profile, the POC is...", "opts": ["The highest price in the range", "The price with the most traded volume", "The midpoint of the range", "The lowest volume node"], "a": 1},
+    {"q": "A sweep of the range low followed by a fast reclaim usually sets up...", "opts": ["A short", "A long", "Nothing - it's random", "A breakout short"], "a": 1},
+    {"q": "BOS (Break of Structure) in an uptrend signals...", "opts": ["Trend reversal", "Trend continuation", "Ranging market", "Low liquidity"], "a": 1},
+    {"q": "Bearish RSI divergence means...", "opts": ["Price makes higher high, RSI makes lower high", "Price and RSI both make higher highs", "Price makes lower low, RSI makes higher low", "RSI crosses above 70"], "a": 0},
+    {"q": "A Wyckoff spring typically appears in which phase?", "opts": ["Distribution", "Markup", "Accumulation", "Markdown"], "a": 2},
+    {"q": "Your position size should be calculated from...", "opts": ["Gut feeling and leverage", "Account risk % and SL distance", "How confident you are", "The max your margin allows"], "a": 1},
+    {"q": "A three drives pattern into a level with RSI divergence usually signals...", "opts": ["Continuation", "Exhaustion / potential reversal", "Increased volatility only", "Nothing tradeable"], "a": 1},
+    {"q": "Positive funding rate means...", "opts": ["Shorts pay longs", "Longs pay shorts", "Exchange pays traders", "Volume is increasing"], "a": 1},
+    {"q": "Moving your SL to entry makes the trade...", "opts": ["More profitable", "Risk-free", "Higher R:R", "Invalid"], "a": 1},
+    {"q": "VAH and VAL are the boundaries of...", "opts": ["The full range", "The value area (~70% of volume)", "The weekly candle", "The liquidation zone"], "a": 1},
+    {"q": "Equal highs (EQH) on a chart usually sit right below...", "opts": ["Support", "Resting liquidity", "The POC", "A fair value gap"], "a": 1},
+]
+
+
+class QuizView(View):
+    def __init__(self, correct: int, opts: list):
+        super().__init__(timeout=600)
+        self.correct = correct
+        self.answered = set()
+        for i, opt in enumerate(opts):
+            self.add_item(QuizButton(i, opt, self))
+
+
+class QuizButton(Button):
+    def __init__(self, idx: int, label: str, qview: "QuizView"):
+        super().__init__(label=f"{chr(65 + idx)}. {label}"[:80], style=discord.ButtonStyle.secondary)
+        self.idx = idx
+        self.qview = qview
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id in self.qview.answered:
+            await interaction.response.send_message("You already answered this one.", ephemeral=True)
+            return
+        self.qview.answered.add(interaction.user.id)
+        if self.idx == self.qview.correct:
+            await interaction.response.send_message("\u2705 Correct! Nice read.", ephemeral=True)
+        else:
+            right = chr(65 + self.qview.correct)
+            await interaction.response.send_message(f"\u274C Not quite - the answer was **{right}**.", ephemeral=True)
+
+
+@bot.tree.command(name="quiz", description="Random TA quiz question - test yourself")
+async def quiz(interaction: discord.Interaction):
+    import random as _r
+    q = _r.choice(QUIZ_BANK)
+    embed = discord.Embed(title="\U0001F9E0 TA Quiz", description=f"**{q['q']}**\n\n*Answer is private - only you see if you got it right.*", color=NAVY)
+    embed.set_footer(text="Scient Lounge - setups, not signals")
+    await interaction.response.send_message(embed=embed, view=QuizView(q["a"], q["opts"]))
+
+
+@bot.tree.command(name="coinflip", description="Flip a coin (results may teach you about 50% win rates)")
+async def coinflip(interaction: discord.Interaction):
+    import random as _r
+    result = _r.choice(["HEADS", "TAILS"])
+    emoji = "\U0001FA99"
+    lessons = [
+        "50% win rate + 2R average winner = profitable system. It's never about one flip.",
+        "Even a coin gets 5 heads in a row sometimes. Losing streaks don't mean your edge is gone.",
+        "You can't predict one flip. You can manage what you risk on it.",
+        "The flip is random. Your position size shouldn't be.",
+    ]
+    embed = discord.Embed(title=f"{emoji} {result}", description=_r.choice(lessons), color=GOLD if result == "HEADS" else NAVY)
+    embed.set_footer(text="Scient Lounge - Quant")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="dominance", description="BTC dominance + total market cap")
+async def dominance(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.coingecko.com/api/v3/global", timeout=15) as resp:
+                data = await resp.json()
+    except Exception:
+        await interaction.followup.send("Market data unavailable right now.")
+        return
+    try:
+        d = data["data"]
+        btc_d = d["market_cap_percentage"]["btc"]
+        eth_d = d["market_cap_percentage"].get("eth", 0)
+        mcap = d["total_market_cap"]["usd"]
+        mcap_chg = d.get("market_cap_change_percentage_24h_usd", 0)
+    except Exception:
+        await interaction.followup.send("Couldn't parse dominance data.")
+        return
+    others = 100 - btc_d - eth_d
+    arrow = "\U0001F4C8" if mcap_chg >= 0 else "\U0001F4C9"
+    embed = discord.Embed(title="Market Dominance", color=GOLD, timestamp=datetime.now(timezone.utc))
+    embed.description = (
+        f"**BTC:** {btc_d:.1f}% | **ETH:** {eth_d:.1f}% | **Others:** {others:.1f}%\n"
+        f"**Total market cap:** ${mcap / 1e12:.2f}T {arrow} {mcap_chg:+.2f}% (24h)\n\n"
+        f"*BTC dominance rising = money rotating to BTC. Falling = alts catching bids.*"
+    )
+    embed.set_footer(text="Scient Lounge - CoinGecko")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="vol", description="Volatility snapshot - how much does this coin move?")
+@app_commands.describe(coin="Coin symbol, e.g. BTC, SOL")
+async def vol(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": "4h", "limit": 60}, timeout=15) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send(f"Couldn't find **{symbol}**.")
+                    return
+                klines = await resp.json()
+    except Exception:
+        await interaction.followup.send("Data unavailable right now.")
+        return
+    if len(klines) < 20:
+        await interaction.followup.send(f"Not enough data for **{symbol}**.")
+        return
+    closes = [float(k[4]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    last = closes[-1]
+    trs = []
+    for i in range(1, len(klines)):
+        tr = max(highs[i] - lows[i], abs(highs[i] - closes[i - 1]), abs(lows[i] - closes[i - 1]))
+        trs.append(tr)
+    atr14 = sum(trs[-14:]) / 14
+    atr_pct = atr14 / last * 100
+    day_ranges = []
+    for i in range(0, len(klines) - 6, 6):
+        chunk_h = max(highs[i:i + 6])
+        chunk_l = min(lows[i:i + 6])
+        day_ranges.append((chunk_h - chunk_l) / chunk_l * 100)
+    avg_day = sum(day_ranges) / len(day_ranges) if day_ranges else 0
+    rating = "\U0001F525 High" if atr_pct > 2.5 else "\U0001F321\uFE0F Moderate" if atr_pct > 1.2 else "\U0001F9CA Low"
+    embed = discord.Embed(title=f"Volatility - {symbol}", color=NAVY, timestamp=datetime.now(timezone.utc))
+    embed.description = (
+        f"**ATR (14, 4H):** {fnum(atr14)} ({atr_pct:.2f}% of price)\n"
+        f"**Avg daily range (10d):** {avg_day:.2f}%\n"
+        f"**Volatility:** {rating}\n\n"
+        f"*Rule of thumb: your SL should live outside the noise - tighter than ATR usually means getting wicked out.*"
+    )
+    embed.set_footer(text="Scient Lounge - Binance")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="levels", description="Auto-detected support & resistance levels")
+@app_commands.describe(coin="Coin symbol, e.g. BTC, SOL", timeframe="Timeframe for structure")
+@app_commands.choices(timeframe=[app_commands.Choice(name=k, value=k) for k in ("1H", "4H", "1D")])
+async def levels(interaction: discord.Interaction, coin: str, timeframe: app_commands.Choice[str] = None):
+    await interaction.response.defer()
+    tfv = timeframe.value if timeframe else "4H"
+    interval = {"1H": "1h", "4H": "4h", "1D": "1d"}[tfv]
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": interval, "limit": 300}, timeout=15) as resp:
+                if resp.status != 200:
+                    await interaction.followup.send(f"Couldn't find **{symbol}**.")
+                    return
+                klines = await resp.json()
+    except Exception:
+        await interaction.followup.send("Data unavailable right now.")
+        return
+    if len(klines) < 50:
+        await interaction.followup.send(f"Not enough data for **{symbol}** on {tfv}.")
+        return
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    last = float(klines[-1][4])
+    piv = 5
+    raw = []
+    for i in range(piv, len(klines) - piv):
+        if highs[i] == max(highs[i - piv:i + piv + 1]):
+            raw.append(highs[i])
+        if lows[i] == min(lows[i - piv:i + piv + 1]):
+            raw.append(lows[i])
+    raw.sort()
+    clusters = []
+    tol = last * 0.006
+    for lv in raw:
+        if clusters and lv - clusters[-1][-1] <= tol:
+            clusters[-1].append(lv)
+        else:
+            clusters.append([lv])
+    scored = [(sum(c) / len(c), len(c)) for c in clusters]
+    res = sorted([s for s in scored if s[0] > last], key=lambda x: x[0])[:4]
+    sup = sorted([s for s in scored if s[0] <= last], key=lambda x: -x[0])[:4]
+    def fmt_lv(s):
+        price, touches = s
+        strength = "\u2B50" * min(touches, 3)
+        dist = abs(price - last) / last * 100
+        return f"`{fnum(price)}` {strength} ({dist:.1f}% away)"
+    lines = [f"**Current price:** {fnum(last)}\n"]
+    if res:
+        lines.append("**Resistance above:**")
+        lines += [fmt_lv(s) for s in res]
+    if sup:
+        lines.append("\n**Support below:**")
+        lines += [fmt_lv(s) for s in sup]
+    lines.append("\n*\u2B50 = number of touches (max 3 shown). Auto-detected from swing pivots - always confirm with your own chart.*")
+    embed = discord.Embed(title=f"Key Levels - {symbol} ({tfv})", color=NAVY, timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Scient Lounge - swing pivot clusters")
+    await interaction.followup.send(embed=embed)
+
+
+def make_heatmap_image(rows: list) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    cols = 5
+    nrows = (len(rows) + cols - 1) // cols
+    fig, ax = plt.subplots(figsize=(11, nrows * 1.5), facecolor="#131722")
+    ax.set_facecolor("#131722")
+    ax.set_xlim(0, cols)
+    ax.set_ylim(0, nrows)
+    ax.axis("off")
+    for idx, (sym, chg, vol_usd) in enumerate(rows):
+        r_i = nrows - 1 - idx // cols
+        c_i = idx % cols
+        mag = min(abs(chg) / 8, 1.0)
+        if chg >= 0:
+            color = (0.05, 0.35 + 0.35 * mag, 0.25 + 0.2 * mag)
+        else:
+            color = (0.45 + 0.35 * mag, 0.13, 0.2)
+        rect = mpatches.FancyBboxPatch((c_i + 0.03, r_i + 0.04), 0.94, 0.92, boxstyle="round,pad=0.01,rounding_size=0.03", facecolor=color, edgecolor="#131722", linewidth=2)
+        ax.add_patch(rect)
+        ax.text(c_i + 0.5, r_i + 0.62, sym, ha="center", va="center", color="#EAECEF", fontsize=13, fontweight="bold")
+        ax.text(c_i + 0.5, r_i + 0.33, f"{chg:+.2f}%", ha="center", va="center", color="#EAECEF", fontsize=11)
+    fig.suptitle("24h Market Heatmap - top volume", color="#EAECEF", fontsize=13, y=0.995)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="heatmap", description="24h market heatmap - top 20 coins by volume")
+async def heatmap(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=20) as resp:
+                data = await resp.json()
+    except Exception:
+        await interaction.followup.send("Market data unavailable right now.")
+        return
+    rows = []
+    for d in data:
+        s = d.get("symbol", "")
+        if not s.endswith("USDT") or any(x in s for x in ("UP", "DOWN", "BULL", "BEAR", "USDC", "FDUSD", "TUSD", "DAI", "EUR")):
+            continue
+        try:
+            rows.append((s[:-4], float(d["priceChangePercent"]), float(d["quoteVolume"])))
+        except Exception:
+            continue
+    rows.sort(key=lambda r: r[2], reverse=True)
+    rows = rows[:20]
+    if not rows:
+        await interaction.followup.send("No data right now.")
+        return
+    try:
+        buf = await asyncio.to_thread(make_heatmap_image, rows)
+    except Exception as e:
+        await interaction.followup.send(f"Heatmap rendering failed: {e}")
+        return
+    f = discord.File(buf, filename="heatmap.png")
+    green = sum(1 for r in rows if r[1] >= 0)
+    await interaction.followup.send(content=f"**Market Heatmap** - {green}/20 green (24h)", file=f)
+
+
+def make_compare_image(sym1: str, sym2: str, closes1: list, closes2: list, dates: list) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    n1 = [c / closes1[0] * 100 - 100 for c in closes1]
+    n2 = [c / closes2[0] * 100 - 100 for c in closes2]
+    fig, ax = plt.subplots(figsize=(11, 5.5), facecolor="#131722")
+    ax.set_facecolor("#131722")
+    ax.plot(dates, n1, color="#E8590C", linewidth=2, label=sym1)
+    ax.plot(dates, n2, color="#378ADD", linewidth=2, label=sym2)
+    ax.axhline(0, color="#B2B5BE", linewidth=0.6, linestyle="--", alpha=0.5)
+    ax.grid(color="#1E222D", linewidth=0.5)
+    for spine in ax.spines.values():
+        spine.set_color("#2A2E39")
+    ax.tick_params(colors="#B2B5BE", labelsize=8)
+    ax.yaxis.tick_right()
+    leg = ax.legend(facecolor="#131722", edgecolor="#2A2E39", labelcolor="#EAECEF", fontsize=10)
+    ax.set_title(f"{sym1} vs {sym2} - 30d performance (%)", color="#EAECEF", fontsize=12, loc="left", pad=10)
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="compare", description="Compare 30-day performance of two coins")
+@app_commands.describe(coin1="First coin, e.g. BTC", coin2="Second coin, e.g. ETH")
+async def compare(interaction: discord.Interaction, coin1: str, coin2: str):
+    await interaction.response.defer()
+    syms = []
+    for c in (coin1, coin2):
+        s = re.sub(r"[^A-Za-z0-9]", "", c).upper()
+        syms.append(s if s.endswith("USDT") else f"{s}USDT")
+    results = []
+    try:
+        async with aiohttp.ClientSession() as session:
+            for pair in syms:
+                async with session.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": "1d", "limit": 30}, timeout=15) as resp:
+                    if resp.status != 200:
+                        await interaction.followup.send(f"Couldn't find **{pair[:-4]}**.")
+                        return
+                    results.append(await resp.json())
+    except Exception:
+        await interaction.followup.send("Data unavailable right now.")
+        return
+    n = min(len(results[0]), len(results[1]))
+    if n < 5:
+        await interaction.followup.send("Not enough data to compare.")
+        return
+    k1, k2 = results[0][-n:], results[1][-n:]
+    closes1 = [float(k[4]) for k in k1]
+    closes2 = [float(k[4]) for k in k2]
+    from datetime import datetime as _dt
+    dates = [_dt.fromtimestamp(k[0] / 1000) for k in k1]
+    s1, s2 = syms[0][:-4], syms[1][:-4]
+    try:
+        buf = await asyncio.to_thread(make_compare_image, s1, s2, closes1, closes2, dates)
+    except Exception as e:
+        await interaction.followup.send(f"Chart rendering failed: {e}")
+        return
+    p1 = (closes1[-1] / closes1[0] - 1) * 100
+    p2 = (closes2[-1] / closes2[0] - 1) * 100
+    winner = s1 if p1 > p2 else s2
+    f = discord.File(buf, filename=f"{s1}_vs_{s2}.png")
+    await interaction.followup.send(content=f"**{s1}** {p1:+.1f}% vs **{s2}** {p2:+.1f}% (30d) - **{winner}** leading", file=f)
+
+
+def build_help_embed() -> discord.Embed:
     embed = discord.Embed(title="Quant - Command Guide", color=NAVY)
     embed.description = "Everything you can do with the bot. All replies marked *private* are visible only to you."
     embed.add_field(
@@ -1811,6 +2165,11 @@ async def help_cmd(interaction: discord.Interaction):
             "`/funding` - perp funding rate + market lean\n"
             "`/oi` - open interest + 24h change\n"
             "`/gainers` / `/losers` - top 5 movers of the day\n"
+            "`/heatmap` - 24h market heatmap image\n"
+            "`/levels` - auto support & resistance levels\n"
+            "`/vol` - volatility snapshot (ATR, daily range)\n"
+            "`/dominance` - BTC dominance + market cap\n"
+            "`/compare` - 30d performance, coin vs coin\n"
             "`/convert` - coin to USD (or USD to coin)\n"
             "`/fear` - Fear & Greed index"
         ),
@@ -1835,6 +2194,14 @@ async def help_cmd(interaction: discord.Interaction):
         inline=False,
     )
     embed.add_field(
+        name="\U0001F3B2 Fun & Learning",
+        value=(
+            "`/quiz` - random TA question, test yourself\n"
+            "`/coinflip` - flip a coin, learn about win rates"
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="\U0001F514 Alerts",
         value=(
             "`/follow` / `/unfollow` - get pinged when an analyst posts\n"
@@ -1843,7 +2210,28 @@ async def help_cmd(interaction: discord.Interaction):
         inline=False,
     )
     embed.set_footer(text="Scient Lounge - Quant")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    return embed
+
+
+@bot.tree.command(name="setup_help_panel", description="(Admin) Post the public command guide in this channel and pin it")
+async def setup_help_panel(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    msg = await interaction.channel.send(embed=build_help_embed())
+    try:
+        await msg.pin()
+        note = "posted and pinned"
+    except discord.HTTPException:
+        note = "posted (couldn't pin - check my Manage Messages permission)"
+    await interaction.followup.send(f"Command guide {note}.", ephemeral=True)
+
+
+@bot.tree.command(name="help", description="See all commands you can use")
+async def help_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    await interaction.followup.send(embed=build_help_embed(), ephemeral=True)
 
 
 @bot.tree.command(name="xpost", description="Share an X post into the X feed channel")
