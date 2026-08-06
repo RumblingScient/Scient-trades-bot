@@ -6,7 +6,7 @@ from discord.ui import View, Button
 from discord.ext import tasks
 import os, json, re, hashlib, aiohttp, io, asyncio
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, time as dt_time
 
 _env_file = Path(__file__).with_name(".env")
 if _env_file.exists():
@@ -38,6 +38,15 @@ NEWS_KEYWORDS = {
     "liquidat", "halt", "halted", "approval", "approved", "lawsuit", "sues", "settle",
     "binance", "coinbase", "tether", "usdt", "blackrock", "grayscale", "microstrategy", "strategy",
 }
+
+# ---- Telegram (Scient Club) config ----
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TG_CHANNEL = "@scientclub"
+TG_ENABLED = True
+DISCORD_INVITE = "https://discord.gg/scientlounge"
+TG_BRIEF_UTC_HOUR = 6   # 12:00 PM IST = 06:30 UTC
+TG_BRIEF_UTC_MIN = 30
+TG_MACRO_CORE = ("sec", "etf", "fed", "fomc", "cpi", "rate cut", "rate hike")
 EMA_PERIODS = [20, 50, 100, 200]  # change to match Scient 4EMA periods
 EMA_COLORS = ["#E8590C", "#FAC775", "#378ADD", "#1C4E80"]
 ANALYST_ROLE_NAME = "Analyst"
@@ -575,6 +584,139 @@ async def refresh_spot_board():
     save_spot_board({"message_id": msg.id, "channel_id": ch.id})
 
 
+async def tg_send(text: str, disable_preview: bool = True) -> bool:
+    if not (TG_ENABLED and TELEGRAM_BOT_TOKEN and TG_CHANNEL):
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TG_CHANNEL,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": disable_preview,
+        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "Join Scient Lounge \u2192", "url": DISCORD_INVITE}]]}),
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=payload, timeout=20) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f"[tg] send failed {resp.status}: {body[:200]}")
+                    return False
+                return True
+    except Exception as e:
+        print(f"[tg] send error: {e}")
+        return False
+
+
+def _tg_escape(s: str) -> str:
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+async def build_daily_brief() -> str:
+    prices = {}
+    fear_txt = dom_txt = fund_txt = movers_txt = ""
+    try:
+        async with aiohttp.ClientSession() as session:
+            for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
+                try:
+                    async with session.get("https://api.binance.com/api/v3/ticker/24hr", params={"symbol": sym}, timeout=15) as r:
+                        d = await r.json()
+                        prices[sym[:-4]] = (float(d["lastPrice"]), float(d["priceChangePercent"]))
+                except Exception:
+                    pass
+            try:
+                async with session.get("https://api.alternative.me/fng/?limit=1", timeout=15) as r:
+                    d = await r.json()
+                    fg = d["data"][0]
+                    fear_txt = f'{fg["value"]}/100 ({fg["value_classification"]})'
+            except Exception:
+                pass
+            try:
+                async with session.get("https://api.coingecko.com/api/v3/global", timeout=15) as r:
+                    d = (await r.json())["data"]
+                    dom_txt = f'{d["market_cap_percentage"]["btc"]:.1f}%'
+            except Exception:
+                pass
+            try:
+                async with session.get("https://fapi.binance.com/fapi/v1/premiumIndex", params={"symbol": "BTCUSDT"}, timeout=15) as r:
+                    d = await r.json()
+                    rate = float(d["lastFundingRate"]) * 100
+                    lean = "longs paying (crowded long)" if rate > 0 else "shorts paying (crowded short)" if rate < 0 else "neutral"
+                    fund_txt = f"{rate:+.4f}% - {lean}"
+            except Exception:
+                pass
+            try:
+                async with session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=20) as r:
+                    data = await r.json()
+                rows = []
+                for d in data:
+                    s = d.get("symbol", "")
+                    if not s.endswith("USDT") or any(x in s for x in ("UP", "DOWN", "BULL", "BEAR", "USDC", "FDUSD", "TUSD", "DAI", "EUR")):
+                        continue
+                    try:
+                        if float(d["quoteVolume"]) < 10_000_000:
+                            continue
+                        rows.append((s[:-4], float(d["priceChangePercent"])))
+                    except Exception:
+                        continue
+                if rows:
+                    top = max(rows, key=lambda r: r[1])
+                    bot_ = min(rows, key=lambda r: r[1])
+                    movers_txt = f"{top[0]} {top[1]:+.1f}% / {bot_[0]} {bot_[1]:+.1f}%"
+            except Exception:
+                pass
+    except Exception as e:
+        print(f"[tg] brief data error: {e}")
+    def pline(sym, emoji):
+        if sym not in prices:
+            return None
+        p, c = prices[sym]
+        arrow = "\U0001F7E2" if c >= 0 else "\U0001F534"
+        ptxt = f"{p:,.0f}" if p >= 1000 else f"{p:,.2f}"
+        return f"{emoji} <b>{sym}</b> ${ptxt} {arrow} {c:+.2f}%"
+    lines = ["\U0001F4CA <b>Daily Market Brief</b>", ""]
+    for sym, emoji in (("BTC", "\u20BF"), ("ETH", "\u27E0"), ("SOL", "\u25CE")):
+        pl = pline(sym, emoji)
+        if pl:
+            lines.append(pl)
+    lines.append("")
+    if fear_txt:
+        lines.append(f"\U0001F628 <b>Fear &amp; Greed:</b> {fear_txt}")
+    if dom_txt:
+        lines.append(f"\U0001F451 <b>BTC Dominance:</b> {dom_txt}")
+    if fund_txt:
+        lines.append(f"\U0001F4B8 <b>BTC Funding:</b> {fund_txt}")
+    if movers_txt:
+        lines.append(f"\U0001F3C6 <b>Top mover / loser:</b> {movers_txt}")
+    lines.append("")
+    lines.append("<i>Setups, not signals - full analysis inside Scient Lounge</i>")
+    return "\n".join(lines)
+
+
+@tasks.loop(time=dt_time(hour=TG_BRIEF_UTC_HOUR, minute=TG_BRIEF_UTC_MIN, tzinfo=timezone.utc))
+async def tg_brief_loop():
+    if not (TG_ENABLED and TELEGRAM_BOT_TOKEN):
+        return
+    text = await build_daily_brief()
+    ok = await tg_send(text)
+    print(f"[tg] daily brief {'sent' if ok else 'FAILED'}")
+
+
+@tg_brief_loop.before_loop
+async def before_tg_brief():
+    await bot.wait_until_ready()
+
+
+def _tg_news_worthy(text: str, coins: list, urgent: bool) -> bool:
+    if urgent:
+        return True
+    up = {c.upper() for c in coins if c}
+    if up & {"BTC", "ETH", "SOL", "BITCOIN", "ETHEREUM", "SOLANA"}:
+        return True
+    low = text.lower()
+    return any(k in low for k in TG_MACRO_CORE)
+
+
 _news_seen = []
 _news_last_msg = {"time": None, "posted": 0}
 
@@ -640,6 +782,15 @@ async def _post_news(item: dict):
         _news_last_msg["posted"] += 1
     except Exception as e:
         print(f"[news] post error: {e}")
+        return
+    if TG_ENABLED and TELEGRAM_BOT_TOKEN and _tg_news_worthy(text, coins, urgent):
+        prefix = "\U0001F6A8" if urgent else "\U0001F4F0"
+        tg_text = f"{prefix} <b>{_tg_escape(headline[:250])}</b>"
+        if body and body != headline:
+            tg_text += f"\n\n{_tg_escape(body[:350])}"
+        if link:
+            tg_text += f"\n\n<a href=\"{link}\">Source</a>"
+        await tg_send(tg_text)
 
 
 async def news_ws_loop():
@@ -812,7 +963,36 @@ async def on_ready():
         x_poll_loop.start()
     if NEWS_ENABLED and NEWS_CHANNEL_ID and not getattr(bot, "_news_task", None):
         bot._news_task = asyncio.create_task(news_ws_loop())
+    if TG_ENABLED and TELEGRAM_BOT_TOKEN and not tg_brief_loop.is_running():
+        tg_brief_loop.start()
     print(f"Logged in as {bot.user} - commands synced.")
+
+
+@bot.tree.command(name="tg_test", description="(Admin) Send a test message to the Scient Club Telegram")
+async def tg_test(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if not TELEGRAM_BOT_TOKEN:
+        await interaction.followup.send("TELEGRAM_BOT_TOKEN not set in .env on the VPS.", ephemeral=True)
+        return
+    ok = await tg_send("\u2705 <b>Quant connected.</b> Scient Club wire is live.")
+    await interaction.followup.send("Test sent to Telegram - check @scientclub." if ok else "Send failed - check bot is admin of the channel and token is correct (see journalctl for [tg] errors).", ephemeral=True)
+
+
+@bot.tree.command(name="tg_brief", description="(Admin) Send the daily market brief to Telegram now")
+async def tg_brief_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if not TELEGRAM_BOT_TOKEN:
+        await interaction.followup.send("TELEGRAM_BOT_TOKEN not set in .env on the VPS.", ephemeral=True)
+        return
+    text = await build_daily_brief()
+    ok = await tg_send(text)
+    await interaction.followup.send("Brief sent to @scientclub." if ok else "Send failed - check [tg] errors in journalctl.", ephemeral=True)
 
 
 @bot.tree.command(name="news_status", description="(Admin) Check the news wire connection")
