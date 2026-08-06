@@ -1689,8 +1689,9 @@ def make_chart_image(symbol: str, interval: str, klines: list) -> io.BytesIO:
     tag_color = "#0ECB81" if up else "#F6465D"
     axes[0].annotate(
         price_txt, xy=(1.0, float(last)), xycoords=("axes fraction", "data"),
-        xytext=(-2, 0), textcoords="offset points", ha="right", va="center",
-        color="#131722", fontsize=9, fontweight="bold",
+        xytext=(4, 0), textcoords="offset points", ha="left", va="center",
+        color="#131722", fontsize=9, fontweight="bold", clip_on=False,
+        annotation_clip=False, zorder=10,
         bbox=dict(boxstyle="round,pad=0.25", facecolor=tag_color, edgecolor="none"),
     )
     buf = io.BytesIO()
@@ -2077,7 +2078,7 @@ def _result_embed(correct: bool, right_letter: str, score: int, answered: int):
 
 class QuizNextView(View):
     def __init__(self, score: int, answered: int, used: set = None):
-        super().__init__(timeout=600)
+        super().__init__(timeout=3600)
         self.score = score
         self.answered = answered
         self.used = used if used is not None else set()
@@ -2092,7 +2093,7 @@ class QuizNextView(View):
 
 class QuizSessionView(View):
     def __init__(self, q: dict, score: int, answered: int, used: set = None):
-        super().__init__(timeout=600)
+        super().__init__(timeout=3600)
         self.q = q
         self.score = score
         self.answered = answered
@@ -2116,13 +2117,23 @@ class QuizSessionButton(Button):
 
 
 class QuizView(View):
-    def __init__(self, q: dict):
-        super().__init__(timeout=600)
+    def __init__(self, q: dict, message=None):
+        super().__init__(timeout=3600)
         self.q = q
         self.correct = q["a"]
         self.answered = set()
+        self.message = message
         for i, opt in enumerate(q["opts"]):
             self.add_item(QuizButton(i, opt, self))
+
+    async def on_timeout(self):
+        for item in self.children:
+            item.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
 
 
 class QuizButton(Button):
@@ -2147,7 +2158,12 @@ async def quiz(interaction: discord.Interaction):
     q, _ = _quiz_pick()
     embed = _quiz_embed(q)
     embed.description += "\n\n*Answer is private - only you see your result. Keep the streak going with Next question.*"
-    await interaction.response.send_message(embed=embed, view=QuizView(q))
+    view = QuizView(q)
+    await interaction.response.send_message(embed=embed, view=view)
+    try:
+        view.message = await interaction.original_response()
+    except Exception:
+        pass
 
 
 @bot.tree.command(name="coinflip", description="Flip a coin (results may teach you about 50% win rates)")
