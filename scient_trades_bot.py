@@ -47,6 +47,9 @@ DISCORD_INVITE = "https://discord.gg/scientlounge"
 TG_BRIEF_UTC_HOUR = 6   # 12:00 PM IST = 06:30 UTC
 TG_BRIEF_UTC_MIN = 30
 TG_MACRO_CORE = ("sec", "etf", "fed", "fomc", "cpi", "rate cut", "rate hike")
+TG_MOVE_SYMBOLS = ("BTC", "ETH")
+TG_MOVE_THRESHOLD = 1.5      # % rolling 1h move (live) that triggers a chart post
+TG_MOVE_COOLDOWN_MIN = 90    # min minutes between move alerts per symbol
 EMA_PERIODS = [20, 50, 100, 200]  # change to match Scient 4EMA periods
 EMA_COLORS = ["#E8590C", "#FAC775", "#378ADD", "#1C4E80"]
 ANALYST_ROLE_NAME = "Analyst"
@@ -608,6 +611,89 @@ async def tg_send(text: str, disable_preview: bool = True) -> bool:
         return False
 
 
+async def tg_send_photo(photo: io.BytesIO, caption: str) -> bool:
+    if not (TG_ENABLED and TELEGRAM_BOT_TOKEN and TG_CHANNEL):
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    form = aiohttp.FormData()
+    form.add_field("chat_id", TG_CHANNEL)
+    form.add_field("caption", caption)
+    form.add_field("parse_mode", "HTML")
+    form.add_field("reply_markup", json.dumps({"inline_keyboard": [[{"text": "Join Scient Lounge \u2192", "url": DISCORD_INVITE}]]}))
+    form.add_field("photo", photo, filename="chart.png", content_type="image/png")
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=form, timeout=30) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f"[tg] photo failed {resp.status}: {body[:200]}")
+                    return False
+                return True
+    except Exception as e:
+        print(f"[tg] photo error: {e}")
+        return False
+
+
+_tg_move_state = {}
+
+
+@tasks.loop(minutes=10)
+async def tg_move_loop():
+    if not (TG_ENABLED and TELEGRAM_BOT_TOKEN):
+        return
+    now = datetime.now(timezone.utc)
+    for sym in TG_MOVE_SYMBOLS:
+        pair = f"{sym}USDT"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": "1h", "limit": 2}, timeout=15) as resp:
+                    if resp.status != 200:
+                        continue
+                    klines = await resp.json()
+        except Exception:
+            continue
+        if len(klines) < 2:
+            continue
+        # rolling 1h: current price vs price ~60 min ago (open of previous 1h candle's close side)
+        prev_close = float(klines[-2][4])
+        c = float(klines[-1][4])
+        if prev_close <= 0:
+            continue
+        chg = (c - prev_close) / prev_close * 100
+        if abs(chg) < TG_MOVE_THRESHOLD:
+            continue
+        state = _tg_move_state.get(sym, {})
+        last_alert = state.get("last_alert")
+        if last_alert and (now - last_alert).total_seconds() < TG_MOVE_COOLDOWN_MIN * 60:
+            continue
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": "1h", "limit": 220}, timeout=20) as resp:
+                    chart_klines = await resp.json()
+            buf = await asyncio.to_thread(make_chart_image, f"{sym}/USDT", "1H", chart_klines)
+        except Exception as e:
+            print(f"[tg] move chart error: {e}")
+            continue
+        up = chg > 0
+        emoji = "\U0001F680" if up else "\U0001F4C9"
+        word = "up" if up else "down"
+        ptxt = f"{c:,.0f}" if c >= 1000 else f"{c:,.2f}"
+        caption = (
+            f"{emoji} <b>{sym} {word} {chg:+.2f}% in the last hour</b>\n"
+            f"Now trading at ${ptxt}\n\n"
+            f"<i>Setups, not signals - full analysis inside Scient Lounge</i>"
+        )
+        ok = await tg_send_photo(buf, caption)
+        if ok:
+            _tg_move_state[sym] = {"last_alert": now}
+            print(f"[tg] move alert sent: {sym} {chg:+.2f}%")
+
+
+@tg_move_loop.before_loop
+async def before_tg_move():
+    await bot.wait_until_ready()
+
+
 def _tg_escape(s: str) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -674,7 +760,8 @@ async def build_daily_brief() -> str:
         arrow = "\U0001F7E2" if c >= 0 else "\U0001F534"
         ptxt = f"{p:,.0f}" if p >= 1000 else f"{p:,.2f}"
         return f"{emoji} <b>{sym}</b> ${ptxt} {arrow} {c:+.2f}%"
-    lines = ["\U0001F4CA <b>Daily Market Brief</b>", ""]
+    today = datetime.now(IST).strftime("%-d %b %Y")
+    lines = [f"\U0001F4CA <b>Daily Market Brief</b> \u2014 {today}", ""]
     for sym, emoji in (("BTC", "\u20BF"), ("ETH", "\u27E0"), ("SOL", "\u25CE")):
         pl = pline(sym, emoji)
         if pl:
@@ -783,7 +870,7 @@ async def _post_news(item: dict):
     except Exception as e:
         print(f"[news] post error: {e}")
         return
-    if TG_ENABLED and TELEGRAM_BOT_TOKEN and _tg_news_worthy(text, coins, urgent):
+    if TG_ENABLED and TELEGRAM_BOT_TOKEN:
         prefix = "\U0001F6A8" if urgent else "\U0001F4F0"
         tg_text = f"{prefix} <b>{_tg_escape(headline[:250])}</b>"
         if body and body != headline:
@@ -965,6 +1052,8 @@ async def on_ready():
         bot._news_task = asyncio.create_task(news_ws_loop())
     if TG_ENABLED and TELEGRAM_BOT_TOKEN and not tg_brief_loop.is_running():
         tg_brief_loop.start()
+    if TG_ENABLED and TELEGRAM_BOT_TOKEN and not tg_move_loop.is_running():
+        tg_move_loop.start()
     print(f"Logged in as {bot.user} - commands synced.")
 
 
