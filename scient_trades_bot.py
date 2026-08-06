@@ -1834,12 +1834,82 @@ QUIZ_BANK = [
     {"q": "Moving your SL to entry makes the trade...", "opts": ["More profitable", "Risk-free", "Higher R:R", "Invalid"], "a": 1},
     {"q": "VAH and VAL are the boundaries of...", "opts": ["The full range", "The value area (~70% of volume)", "The weekly candle", "The liquidation zone"], "a": 1},
     {"q": "Equal highs (EQH) on a chart usually sit right below...", "opts": ["Support", "Resting liquidity", "The POC", "A fair value gap"], "a": 1},
+    {"q": "MSS (Market Structure Shift) differs from BOS because it signals...", "opts": ["Continuation", "A potential reversal", "Higher volume", "A new range"], "a": 1},
+    {"q": "A Fair Value Gap (FVG) is...", "opts": ["A gap between exchanges", "An imbalance where price moved too fast to fill orders", "The spread between bid and ask", "A weekend CME gap only"], "a": 1},
+    {"q": "In Wyckoff, a UTAD (Upthrust After Distribution) is...", "opts": ["A bullish breakout", "A failed push above the range before markdown", "An accumulation event", "A volume spike at support"], "a": 1},
+    {"q": "If your risk is 1% and your SL is 4% away, your position size is...", "opts": ["4x your account", "25% of your account", "1% of your account", "You can't calculate it"], "a": 1},
+    {"q": "A trade with 40% win rate and 3R average winner is...", "opts": ["A losing system", "Breakeven at best", "A profitable system", "Impossible to judge"], "a": 2},
+    {"q": "A deviation below the range low that closes back inside is often...", "opts": ["Confirmation of breakdown", "A long trigger (sweep + reclaim)", "A short trigger", "Meaningless noise"], "a": 1},
+    {"q": "The 'M' in AMD stands for...", "opts": ["Markup", "Momentum", "Manipulation", "Margin"], "a": 2},
+    {"q": "High Volume Nodes (HVN) on a volume profile act as...", "opts": ["Magnets that repel price", "Areas price moves through quickly", "Areas of acceptance where price tends to slow down", "Guaranteed reversal zones"], "a": 2},
+    {"q": "Low Volume Nodes (LVN) tend to...", "opts": ["Hold price for weeks", "Let price move through quickly", "Mark the POC", "Only appear on weekly charts"], "a": 1},
+    {"q": "A CHoCH (Change of Character) is...", "opts": ["The first sign structure may be reversing", "A confirmed trend continuation", "A type of candlestick", "An exchange listing event"], "a": 0},
+    {"q": "An order block in ICT terms is...", "opts": ["A large limit order on the book", "The last opposing candle before a strong impulsive move", "A blocked exchange account", "The daily open"], "a": 1},
+    {"q": "Liquidity in trading usually rests...", "opts": ["At round numbers only", "Above equal highs and below equal lows", "At the POC", "In low volume nodes"], "a": 1},
+    {"q": "Revenge trading after a loss usually leads to...", "opts": ["Faster recovery", "Bigger losses from emotional decisions", "Better focus", "Higher win rate"], "a": 1},
+    {"q": "If price breaks the range high and immediately reverses back inside, it's called...", "opts": ["A clean breakout", "A deviation / fakeout", "A BOS", "An FVG"], "a": 1},
+    {"q": "The safest general place for a stop loss is...", "opts": ["A fixed 2% from entry always", "Beyond the level that invalidates your idea", "At the round number", "As tight as possible"], "a": 1},
+    {"q": "OI rising while price rises usually means...", "opts": ["Shorts covering", "New money entering the trend", "The trend is ending", "Low liquidity"], "a": 1},
+    {"q": "OI falling while price rises usually means...", "opts": ["New longs opening", "Short covering driving the move", "Distribution", "Nothing"], "a": 1},
+    {"q": "Wyckoff's 'Sign of Strength' (SOS) appears...", "opts": ["During markdown", "After the spring, breaking out of accumulation", "At the UTAD", "Only on weekly charts"], "a": 1},
+    {"q": "Trading a smaller size after a losing streak is an example of...", "opts": ["Fear-based trading", "Sound risk management", "Revenge trading", "Overtrading"], "a": 1},
+    {"q": "A 'premium' zone in ICT terms is...", "opts": ["Below the 50% of the range - discount", "Above the 50% of the range - where shorts are favored", "The POC", "The weekly open"], "a": 1},
+    {"q": "Buying in the 'discount' zone of a range means buying...", "opts": ["Above the midpoint", "Below the midpoint (equilibrium)", "At resistance", "At the high"], "a": 1},
+    {"q": "The main purpose of a trading journal is...", "opts": ["Bragging rights", "Finding and fixing patterns in your own behavior", "Tax reporting", "Copying other traders"], "a": 1},
+    {"q": "If BTC dominance is rising during a market dip, alts usually...", "opts": ["Outperform BTC", "Bleed harder than BTC", "Stay flat", "Pump"], "a": 1},
+    {"q": "A doji candle at a key level after a long trend suggests...", "opts": ["Strong continuation", "Indecision - possible exhaustion", "Guaranteed reversal", "Low volume only"], "a": 1},
+    {"q": "Risk:Reward of 1:3 means...", "opts": ["You risk 3 to make 1", "You risk 1 to make 3", "You need 3 wins to break even", "3% account risk"], "a": 1},
+    {"q": "The 'spring' in Wyckoff accumulation is designed to...", "opts": ["Confirm the breakdown", "Grab liquidity below support before markup", "Mark the top", "Fill the FVG"], "a": 1},
+    {"q": "Averaging into a loser WITHOUT a plan is called...", "opts": ["DCA strategy", "Martingale / hope trading", "Scaling in", "Hedging"], "a": 1},
+    {"q": "The best time to size up your risk per trade is...", "opts": ["During a losing streak to recover", "After proving consistency over many trades", "When you feel confident", "When leverage is cheap"], "a": 1},
+    {"q": "A green (bullish) candle means...", "opts": ["Price closed below its open", "Price closed above its open", "Volume was high", "Buyers are guaranteed to win next candle"], "a": 1},
+    {"q": "The wick (shadow) of a candle shows...", "opts": ["The open and close", "The highest and lowest prices reached", "The volume traded", "The funding rate"], "a": 1},
+    {"q": "Support is a zone where...", "opts": ["Price tends to find sellers", "Price tends to find buyers", "Volume is always low", "The trend must reverse"], "a": 1},
+    {"q": "Resistance is a zone where...", "opts": ["Price tends to find buyers", "Price tends to find sellers", "Liquidations happen", "The chart ends"], "a": 1},
+    {"q": "When strong support finally breaks, it often...", "opts": ["Becomes resistance", "Disappears forever", "Becomes the new POC", "Doubles in strength"], "a": 0},
+    {"q": "An uptrend is defined by...", "opts": ["Higher highs and higher lows", "Lower highs and lower lows", "Equal highs", "High volume only"], "a": 0},
+    {"q": "A market order...", "opts": ["Waits at your chosen price", "Executes immediately at the best available price", "Never pays fees", "Can't be filled in a fast market"], "a": 1},
+    {"q": "A limit order...", "opts": ["Executes immediately", "Rests at your chosen price until filled", "Guarantees a fill", "Only works on spot"], "a": 1},
+    {"q": "10x leverage on a position means...", "opts": ["Profits only are multiplied by 10", "Both profits AND losses move 10x faster", "Your risk stays the same", "You can't get liquidated"], "a": 1},
+    {"q": "Liquidation happens when...", "opts": ["You close a trade in profit", "Your margin can no longer cover the position's loss", "The exchange goes offline", "Funding turns negative"], "a": 1},
+    {"q": "The main difference between spot and futures is...", "opts": ["Spot has more leverage", "In spot you own the asset; futures are contracts", "Futures can't be shorted", "Spot has funding fees"], "a": 1},
+    {"q": "'Shorting' means...", "opts": ["Buying and holding", "Profiting when price goes down", "Trading small size", "Selling only at a loss"], "a": 1},
+    {"q": "Market cap of a coin is...", "opts": ["Its price", "Price multiplied by circulating supply", "Total volume traded", "The exchange's valuation"], "a": 1},
+    {"q": "A coin at $0.10 is cheaper than a coin at $100...", "opts": ["Always true", "Not necessarily - market cap matters, not unit price", "True if volume is high", "True only for memecoins"], "a": 1},
+    {"q": "High trading volume on a breakout usually means...", "opts": ["The breakout is more likely to be real", "The breakout will fail", "Nothing", "Fees will be higher"], "a": 0},
+    {"q": "A higher timeframe (like 1D or 1W) generally gives...", "opts": ["More noise", "More reliable levels than lower timeframes", "Faster signals", "Worse data"], "a": 1},
+    {"q": "FOMO (fear of missing out) usually makes traders...", "opts": ["Enter early with a plan", "Buy late into extended moves without a plan", "Reduce their size", "Wait for confirmation"], "a": 1},
+    {"q": "A stablecoin like USDT is designed to...", "opts": ["Grow 10% a year", "Stay pegged to $1", "Track Bitcoin's price", "Pay staking rewards always"], "a": 1},
+    {"q": "If you risk $100 to potentially make $300, your R:R is...", "opts": ["1:3", "3:1", "1:1", "0.3"], "a": 0},
+    {"q": "'DYOR' stands for...", "opts": ["Daily yield on returns", "Do your own research", "Don't yield on resistance", "Dollar yearly output rate"], "a": 1},
+    {"q": "A moving average smooths out...", "opts": ["Volume", "Price data over a set number of candles", "Funding rates", "Order book depth"], "a": 1},
+    {"q": "Price trading above a rising 200 EMA generally suggests...", "opts": ["A downtrend", "A long-term uptrend context", "A range", "Nothing at all"], "a": 1},
+    {"q": "'Buy the rumor, sell the news' refers to...", "opts": ["Buying after news drops", "Price often running up before an event and dumping on it", "Only trading news coins", "Avoiding all news"], "a": 1},
+    {"q": "Slippage is...", "opts": ["A type of chart pattern", "The difference between expected and actual fill price", "An exchange fee", "A stop loss error"], "a": 1},
+    {"q": "The order book shows...", "opts": ["Past trades only", "Resting buy and sell limit orders", "Liquidation levels", "Whale wallets"], "a": 1},
+    {"q": "Dollar-cost averaging (DCA) means...", "opts": ["Going all-in at one price", "Buying in planned portions over time or a price zone", "Doubling down on losers randomly", "Only buying dips"], "a": 1},
+    {"q": "Keeping most long-term holdings in self-custody protects you from...", "opts": ["Price drops", "Exchange failures and hacks", "Taxes", "Funding fees"], "a": 1},
+    {"q": "Overtrading usually results in...", "opts": ["More profit from more chances", "Fees and emotional mistakes eating your edge", "Better discipline", "Faster learning only"], "a": 1},
+    {"q": "A trading plan should be written...", "opts": ["After the trade closes", "Before entering the trade", "Only for big positions", "Never - stay flexible"], "a": 1},
+    {"q": "If a trade setup invalidates before entry, the correct move is...", "opts": ["Enter anyway at a worse price", "Skip it - no setup, no trade", "Double the size", "Flip direction randomly"], "a": 1},
+    {"q": "Paper trading is...", "opts": ["Trading with fake money to practice", "Trading paper industry stocks", "A scam", "Only for beginners with no value"], "a": 0},
+    {"q": "Portfolio diversification helps because...", "opts": ["Every coin pumps together", "It reduces the damage any single asset can do", "It guarantees profit", "Exchanges require it"], "a": 1},
+    {"q": "ATH stands for...", "opts": ["Average trading hours", "All-time high", "Automated trade handler", "Above the high"], "a": 1},
+    {"q": "A 50% loss on your account requires what gain to recover?", "opts": ["50%", "75%", "100%", "25%"], "a": 2},
 ]
 
 
-def _quiz_pick():
+def _quiz_pick(used: set = None):
     import random as _r
-    return _r.choice(QUIZ_BANK)
+    if used is None:
+        used = set()
+    pool = [i for i in range(len(QUIZ_BANK)) if i not in used]
+    if not pool:
+        used.clear()
+        pool = list(range(len(QUIZ_BANK)))
+    idx = _r.choice(pool)
+    used.add(idx)
+    return QUIZ_BANK[idx], used
 
 
 def _quiz_embed(q, score=None, answered=None):
@@ -1864,25 +1934,27 @@ def _result_embed(correct: bool, right_letter: str, score: int, answered: int):
 
 
 class QuizNextView(View):
-    def __init__(self, score: int, answered: int):
+    def __init__(self, score: int, answered: int, used: set = None):
         super().__init__(timeout=600)
         self.score = score
         self.answered = answered
+        self.used = used if used is not None else set()
         btn = Button(label="Next question \u25B6", style=discord.ButtonStyle.primary)
         btn.callback = self.next_q
         self.add_item(btn)
 
     async def next_q(self, interaction: discord.Interaction):
-        q = _quiz_pick()
-        await interaction.response.edit_message(embed=_quiz_embed(q, self.score, self.answered), view=QuizSessionView(q, self.score, self.answered))
+        q, used = _quiz_pick(self.used)
+        await interaction.response.edit_message(embed=_quiz_embed(q, self.score, self.answered), view=QuizSessionView(q, self.score, self.answered, used))
 
 
 class QuizSessionView(View):
-    def __init__(self, q: dict, score: int, answered: int):
+    def __init__(self, q: dict, score: int, answered: int, used: set = None):
         super().__init__(timeout=600)
         self.q = q
         self.score = score
         self.answered = answered
+        self.used = used if used is not None else set()
         for i, opt in enumerate(q["opts"]):
             self.add_item(QuizSessionButton(i, opt, self))
 
@@ -1898,15 +1970,16 @@ class QuizSessionButton(Button):
         score = self.sview.score + (1 if correct else 0)
         answered = self.sview.answered + 1
         right = chr(65 + self.sview.q["a"])
-        await interaction.response.edit_message(embed=_result_embed(correct, right, score, answered), view=QuizNextView(score, answered))
+        await interaction.response.edit_message(embed=_result_embed(correct, right, score, answered), view=QuizNextView(score, answered, self.sview.used))
 
 
 class QuizView(View):
-    def __init__(self, correct: int, opts: list):
+    def __init__(self, q: dict):
         super().__init__(timeout=600)
-        self.correct = correct
+        self.q = q
+        self.correct = q["a"]
         self.answered = set()
-        for i, opt in enumerate(opts):
+        for i, opt in enumerate(q["opts"]):
             self.add_item(QuizButton(i, opt, self))
 
 
@@ -1924,15 +1997,15 @@ class QuizButton(Button):
         correct = self.idx == self.qview.correct
         score = 1 if correct else 0
         right = chr(65 + self.qview.correct)
-        await interaction.response.send_message(embed=_result_embed(correct, right, score, 1), view=QuizNextView(score, 1), ephemeral=True)
+        await interaction.response.send_message(embed=_result_embed(correct, right, score, 1), view=QuizNextView(score, 1, {QUIZ_BANK.index(self.qview.q)} if self.qview.q in QUIZ_BANK else set()), ephemeral=True)
 
 
 @bot.tree.command(name="quiz", description="Random TA quiz question - test yourself")
 async def quiz(interaction: discord.Interaction):
-    q = _quiz_pick()
+    q, _ = _quiz_pick()
     embed = _quiz_embed(q)
     embed.description += "\n\n*Answer is private - only you see your result. Keep the streak going with Next question.*"
-    await interaction.response.send_message(embed=embed, view=QuizView(q["a"], q["opts"]))
+    await interaction.response.send_message(embed=embed, view=QuizView(q))
 
 
 @bot.tree.command(name="coinflip", description="Flip a coin (results may teach you about 50% win rates)")
