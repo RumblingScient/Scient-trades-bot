@@ -28,8 +28,12 @@ QUANT_CHANNEL_ID = 0  # paste #quant-terminal channel ID here (0 = commands work
 # ---- News wire config (TreeNews) ----
 NEWS_CHANNEL_ID = 1535048677406539797
 NEWS_PING_ROLE_ID = 1535053641378037760  # pinged on URGENT news only
-NEWS_ENABLED = True
+NEWS_ENABLED = False  # TreeNews realtime wire OFF - news now flows via the daily digest only
 NEWS_WS_URL = "wss://news.treeofalpha.com/ws"
+# Curated TG channels polled for the daily digest (web preview, no API needed)
+TG_NEWS_CHANNELS = ("dbnewsdelayed", "ZoomerfiedNews", "unfolded")
+TG_NEWS_POLL_MIN = 20
+DIGEST_SPONSOR_WORDS = ("sponsor", "sponsored", "#ad", "promo code", "use code", "partnered with", "in partnership")
 NEWS_COINS = {"BTC", "ETH", "SOL", "BITCOIN", "ETHEREUM", "SOLANA"}
 NEWS_KEYWORDS = {
     "sec ", "etf", "fed ", "fomc", "rate cut", "rate hike", "cpi", "interest rate",
@@ -806,6 +810,91 @@ async def before_tg_brief():
     await bot.wait_until_ready()
 
 
+SOURCES_FILE = Path(__file__).with_name("tg_sources.json")
+def load_sources() -> dict: return _load(SOURCES_FILE)
+def save_sources(d: dict): _save(SOURCES_FILE, d)
+
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _parse_tg_preview(html_text: str):
+    import html as _html
+    out = []
+    for m in re.finditer(r'data-post="([^"]+)"', html_text):
+        post_id = m.group(1)
+        seg = html_text[m.end():m.end() + 20000]
+        tm = re.search(r'tgme_widget_message_text[^>]*>(.*?)</div>', seg, re.S)
+        if not tm:
+            continue
+        raw = tm.group(1)
+        raw = re.sub(r"<br\s*/?>", "\n", raw)
+        txt = _html.unescape(_TAG_RE.sub("", raw)).strip()
+        if txt:
+            out.append((post_id, txt))
+    return out
+
+
+@tasks.loop(minutes=TG_NEWS_POLL_MIN)
+async def tg_sources_loop():
+    if not TG_NEWS_CHANNELS:
+        return
+    state = load_sources()
+    dg = load_digest()
+    items = dg.get("items", [])
+    added = 0
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
+    for ch in TG_NEWS_CHANNELS:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"https://t.me/s/{ch}", headers=headers, timeout=20) as resp:
+                    if resp.status != 200:
+                        print(f"[digest] {ch}: HTTP {resp.status}")
+                        continue
+                    html_text = await resp.text()
+        except Exception as e:
+            print(f"[digest] {ch}: fetch error {e}")
+            continue
+        posts = _parse_tg_preview(html_text)
+        if not posts:
+            print(f"[digest] {ch}: no posts parsed")
+            continue
+        seen = set(state.get(ch, []))
+        first_run = ch not in state
+        new_ids = []
+        for post_id, txt in posts:
+            new_ids.append(post_id)
+            if first_run or post_id in seen:
+                continue
+            low = txt.lower()
+            if len(txt) < 25:
+                continue
+            if any(w in low for w in DIGEST_SPONSOR_WORDS):
+                continue
+            headline = txt.split("\n")[0][:250]
+            if len(headline) < 20 and len(txt) > len(headline):
+                headline = txt.replace("\n", " ")[:250]
+            items.append({
+                "headline": headline,
+                "urgent": _news_urgent(txt),
+                "coins": [],
+                "link": f"https://t.me/{post_id}",
+                "source": ch,
+                "ts": datetime.now(timezone.utc).isoformat(),
+            })
+            added += 1
+        state[ch] = list(dict.fromkeys(list(seen) + new_ids))[-200:]
+    dg["items"] = items[-100:]
+    save_digest(dg)
+    save_sources(state)
+    if added:
+        print(f"[digest] buffered {added} new item(s)")
+
+
+@tg_sources_loop.before_loop
+async def before_tg_sources():
+    await bot.wait_until_ready()
+
+
 def build_digest_text() -> str:
     dg = load_digest()
     items = dg.get("items", [])
@@ -820,27 +909,58 @@ def build_digest_text() -> str:
     for i, it in enumerate(items, 1):
         h = _tg_escape(it["headline"])
         prefix = "\U0001F6A8 " if it.get("urgent") else ""
+        srcname = f" <i>- {it.get('source')}</i>" if it.get("source") else ""
         if it.get("link"):
-            lines.append(f"{i}. {prefix}<a href=\"{it['link']}\">{h}</a>")
+            lines.append(f"{i}. {prefix}<a href=\"{it['link']}\">{h}</a>{srcname}")
         else:
-            lines.append(f"{i}. {prefix}{h}")
+            lines.append(f"{i}. {prefix}{h}{srcname}")
     lines.append("")
     lines.append("<i>Setups, not signals - full analysis inside Scient Lounge</i>")
     return "\n".join(lines)
 
 
+async def post_digest_discord():
+    ch = bot.get_channel(NEWS_CHANNEL_ID)
+    if ch is None:
+        return False
+    dg = load_digest()
+    items = dg.get("items", [])
+    if not items:
+        return False
+    majors_rank = lambda it: (0 if it.get("urgent") else 1,)
+    items = sorted(items, key=majors_rank)[:TG_DIGEST_MAX]
+    today = datetime.now(IST).strftime("%d %b %Y")
+    lines = []
+    for i, it in enumerate(items, 1):
+        prefix = "\U0001F6A8 " if it.get("urgent") else ""
+        srcname = f" - *{it.get('source')}*" if it.get("source") else ""
+        if it.get("link"):
+            lines.append(f"{i}. {prefix}[{it['headline'][:200]}]({it['link']}){srcname}")
+        else:
+            lines.append(f"{i}. {prefix}{it['headline'][:200]}{srcname}")
+    embed = discord.Embed(title=f"\U0001F4F0 Daily News Digest - {today}", description="\n".join(lines)[:3900], color=NAVY, timestamp=datetime.now(timezone.utc))
+    embed.set_footer(text="News Wire - curated daily digest")
+    try:
+        await ch.send(embed=embed)
+        return True
+    except Exception as e:
+        print(f"[digest] discord post error: {e}")
+        return False
+
+
 @tasks.loop(time=dt_time(hour=TG_DIGEST_UTC_HOUR, minute=TG_DIGEST_UTC_MIN, tzinfo=timezone.utc))
 async def tg_digest_loop():
-    if not (TG_ENABLED and TELEGRAM_BOT_TOKEN):
-        return
     text = build_digest_text()
     if not text:
         print("[tg] digest skipped - no items today")
         return
-    ok = await tg_send(text)
-    if ok:
+    d_ok = await post_digest_discord()
+    t_ok = False
+    if TG_ENABLED and TELEGRAM_BOT_TOKEN:
+        t_ok = await tg_send(text)
+    if d_ok or t_ok:
         save_digest({"items": []})
-    print(f"[tg] digest {'sent' if ok else 'FAILED'}")
+    print(f"[tg] digest discord={'ok' if d_ok else 'fail'} tg={'ok' if t_ok else 'fail'}")
 
 
 @tg_digest_loop.before_loop
@@ -863,14 +983,15 @@ _news_last_msg = {"time": None, "posted": 0}
 
 
 def _news_relevant(text: str, coins: list) -> bool:
-    up = {c.upper() for c in coins if c}
-    if up & NEWS_COINS:
-        return True
     low = " " + text.lower()
+    # majors must be mentioned in the TEXT itself - coin TAGS are not trusted
+    # (TreeNews over-tags majors on ecosystem news)
+    if re.search(r"\b(btc|bitcoin|eth|ethereum|sol|solana)\b", low):
+        return True
     if not any(k in low for k in NEWS_KEYWORDS):
         return False
     # keyword matched: reject if it's clearly about a random small project
-    # (has coin tags but none of them are majors and no macro weight)
+    up = {c.upper() for c in coins if c}
     if up and not (up & NEWS_COINS):
         heavy = ("sec ", "fed ", "fomc", "etf", "cpi", "rate cut", "rate hike",
                  "hack", "exploit", "bankrupt", "binance", "coinbase", "blackrock", "tether")
@@ -905,6 +1026,11 @@ async def _post_news(item: dict):
     if any(b in src_sig for b in NEWS_SOURCE_BLACKLIST):
         return
     trusted = any(w in src_sig for w in NEWS_SOURCE_WHITELIST)
+    # Twitter items are whitelist-only: project promo tweets never pass,
+    # regardless of what coins they mention
+    is_twitter = ("twitter.com" in src_sig or "x.com/" in src_sig or re.search(r"\(@\w+\)", title or ""))
+    if is_twitter and not trusted:
+        return
     if not trusted and not _news_relevant(text, coins):
         return
     key = hashlib.md5(text[:200].encode()).hexdigest()
@@ -1130,8 +1256,10 @@ async def on_ready():
         tg_brief_loop.start()
     if TG_ENABLED and TELEGRAM_BOT_TOKEN and not tg_move_loop.is_running():
         tg_move_loop.start()
-    if TG_ENABLED and TELEGRAM_BOT_TOKEN and not tg_digest_loop.is_running():
+    if not tg_digest_loop.is_running():
         tg_digest_loop.start()
+    if TG_NEWS_CHANNELS and not tg_sources_loop.is_running():
+        tg_sources_loop.start()
     print(f"Logged in as {bot.user} - commands synced.")
 
 
@@ -1158,10 +1286,11 @@ async def tg_digest_cmd(interaction: discord.Interaction):
     if not text:
         await interaction.followup.send("No news buffered yet today.", ephemeral=True)
         return
-    ok = await tg_send(text)
-    if ok:
+    d_ok = await post_digest_discord()
+    t_ok = await tg_send(text) if TELEGRAM_BOT_TOKEN else False
+    if d_ok or t_ok:
         save_digest({"items": []})
-    await interaction.followup.send("Digest sent to @scientclub." if ok else "Send failed - check [tg] logs.", ephemeral=True)
+    await interaction.followup.send(f"Digest: Discord {'\u2705' if d_ok else '\u274C'} | Telegram {'\u2705' if t_ok else '\u274C'}", ephemeral=True)
 
 
 @bot.tree.command(name="tg_brief", description="(Admin) Send the daily market brief to Telegram now")
