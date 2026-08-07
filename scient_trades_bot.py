@@ -32,12 +32,18 @@ NEWS_ENABLED = True
 NEWS_WS_URL = "wss://news.treeofalpha.com/ws"
 NEWS_COINS = {"BTC", "ETH", "SOL", "BITCOIN", "ETHEREUM", "SOLANA"}
 NEWS_KEYWORDS = {
-    "sec", "etf", "fed", "fomc", "rate cut", "rate hike", "cpi", "inflation",
+    "sec ", "etf", "fed ", "fomc", "rate cut", "rate hike", "cpi", "interest rate",
     "hack", "hacked", "exploit", "exploited", "breach", "stolen",
-    "listing", "lists", "delist", "delisting", "bankrupt", "bankruptcy",
-    "liquidat", "halt", "halted", "approval", "approved", "lawsuit", "sues", "settle",
-    "binance", "coinbase", "tether", "usdt", "blackrock", "grayscale", "microstrategy", "strategy",
+    "delist", "bankrupt", "bankruptcy", "halted",
+    "binance", "coinbase", "tether", "blackrock", "microstrategy",
+    "white house", "trump", "congress", "treasury",
 }
+# word-boundary sensitive terms are written with a trailing space above ("sec ", "fed ")
+NEWS_MIN_COIN_ONLY = True  # if a headline only matched via coin tags, require a MAJOR coin (already enforced)
+# Trusted sources: their headlines ALWAYS pass (bypass keyword filter)
+NEWS_SOURCE_WHITELIST = ("tier10k", "news_of_alpha", "tree of alpha", "treeofalpha", "zoomerfied", "unfolded")
+# Low-quality sources: their items are ALWAYS dropped
+NEWS_SOURCE_BLACKLIST = ("cointelegraph", "wu blockchain", "wublockchain")
 
 # ---- Telegram (Scient Club) config ----
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -47,6 +53,9 @@ DISCORD_INVITE = "https://discord.gg/scientlounge"
 TG_BRIEF_UTC_HOUR = 6   # 12:00 PM IST = 06:30 UTC
 TG_BRIEF_UTC_MIN = 30
 TG_MACRO_CORE = ("sec", "etf", "fed", "fomc", "cpi", "rate cut", "rate hike")
+TG_DIGEST_UTC_HOUR = 14   # 8:00 PM IST = 14:30 UTC
+TG_DIGEST_UTC_MIN = 30
+TG_DIGEST_MAX = 10
 TG_MOVE_SYMBOLS = ("BTC", "ETH")
 TG_MOVE_THRESHOLD = 1.5      # % rolling 1h move (live) that triggers a chart post
 TG_MOVE_COOLDOWN_MIN = 90    # min minutes between move alerts per symbol
@@ -117,6 +126,9 @@ def load_spot_board() -> dict: return _load(SPOT_BOARD_FILE)
 def save_spot_board(d: dict): _save(SPOT_BOARD_FILE, d)
 def load_xseen() -> dict: return _load(XSEEN_FILE)
 def save_xseen(d: dict): _save(XSEEN_FILE, d)
+DIGEST_FILE = Path(__file__).with_name("news_digest.json")
+def load_digest() -> dict: return _load(DIGEST_FILE)
+def save_digest(d: dict): _save(DIGEST_FILE, d)
 
 
 def is_analyst(interaction: discord.Interaction) -> bool:
@@ -794,6 +806,48 @@ async def before_tg_brief():
     await bot.wait_until_ready()
 
 
+def build_digest_text() -> str:
+    dg = load_digest()
+    items = dg.get("items", [])
+    if not items:
+        return ""
+    majors = {"BTC", "ETH", "SOL", "BITCOIN", "ETHEREUM", "SOLANA"}
+    def rank(it):
+        return (0 if it.get("urgent") else 1, 0 if set(it.get("coins", [])) & majors else 1)
+    items = sorted(items, key=rank)[:TG_DIGEST_MAX]
+    today = datetime.now(IST).strftime("%-d %b %Y")
+    lines = [f"\U0001F4F0 <b>Daily News Digest</b> \u2014 {today}", ""]
+    for i, it in enumerate(items, 1):
+        h = _tg_escape(it["headline"])
+        prefix = "\U0001F6A8 " if it.get("urgent") else ""
+        if it.get("link"):
+            lines.append(f"{i}. {prefix}<a href=\"{it['link']}\">{h}</a>")
+        else:
+            lines.append(f"{i}. {prefix}{h}")
+    lines.append("")
+    lines.append("<i>Setups, not signals - full analysis inside Scient Lounge</i>")
+    return "\n".join(lines)
+
+
+@tasks.loop(time=dt_time(hour=TG_DIGEST_UTC_HOUR, minute=TG_DIGEST_UTC_MIN, tzinfo=timezone.utc))
+async def tg_digest_loop():
+    if not (TG_ENABLED and TELEGRAM_BOT_TOKEN):
+        return
+    text = build_digest_text()
+    if not text:
+        print("[tg] digest skipped - no items today")
+        return
+    ok = await tg_send(text)
+    if ok:
+        save_digest({"items": []})
+    print(f"[tg] digest {'sent' if ok else 'FAILED'}")
+
+
+@tg_digest_loop.before_loop
+async def before_tg_digest():
+    await bot.wait_until_ready()
+
+
 def _tg_news_worthy(text: str, coins: list, urgent: bool) -> bool:
     if urgent:
         return True
@@ -812,8 +866,17 @@ def _news_relevant(text: str, coins: list) -> bool:
     up = {c.upper() for c in coins if c}
     if up & NEWS_COINS:
         return True
-    low = text.lower()
-    return any(k in low for k in NEWS_KEYWORDS)
+    low = " " + text.lower()
+    if not any(k in low for k in NEWS_KEYWORDS):
+        return False
+    # keyword matched: reject if it's clearly about a random small project
+    # (has coin tags but none of them are majors and no macro weight)
+    if up and not (up & NEWS_COINS):
+        heavy = ("sec ", "fed ", "fomc", "etf", "cpi", "rate cut", "rate hike",
+                 "hack", "exploit", "bankrupt", "binance", "coinbase", "blackrock", "tether")
+        if not any(k in low for k in heavy):
+            return False
+    return True
 
 
 def _news_urgent(text: str) -> bool:
@@ -836,7 +899,13 @@ async def _post_news(item: dict):
         if isinstance(sug, dict) and sug.get("coin"):
             coins.append(str(sug["coin"]))
     text = f"{title} {body}".strip()
-    if not text or not _news_relevant(text, coins):
+    if not text:
+        return
+    src_sig = f"{title} {source} {link}".lower()
+    if any(b in src_sig for b in NEWS_SOURCE_BLACKLIST):
+        return
+    trusted = any(w in src_sig for w in NEWS_SOURCE_WHITELIST)
+    if not trusted and not _news_relevant(text, coins):
         return
     key = hashlib.md5(text[:200].encode()).hexdigest()
     if key in _news_seen:
@@ -870,14 +939,21 @@ async def _post_news(item: dict):
     except Exception as e:
         print(f"[news] post error: {e}")
         return
-    if TG_ENABLED and TELEGRAM_BOT_TOKEN:
-        prefix = "\U0001F6A8" if urgent else "\U0001F4F0"
-        tg_text = f"{prefix} <b>{_tg_escape(headline[:250])}</b>"
-        if body and body != headline:
-            tg_text += f"\n\n{_tg_escape(body[:350])}"
-        if link:
-            tg_text += f"\n\n<a href=\"{link}\">Source</a>"
-        await tg_send(tg_text)
+    # buffer for the daily TG digest (no real-time mirror - one post per day)
+    try:
+        dg = load_digest()
+        items = dg.get("items", [])
+        items.append({
+            "headline": headline[:250],
+            "urgent": bool(urgent),
+            "coins": [c.upper() for c in coins][:6],
+            "link": link or "",
+            "ts": datetime.now(timezone.utc).isoformat(),
+        })
+        dg["items"] = items[-100:]
+        save_digest(dg)
+    except Exception as e:
+        print(f"[tg] digest buffer error: {e}")
 
 
 async def news_ws_loop():
@@ -1054,6 +1130,8 @@ async def on_ready():
         tg_brief_loop.start()
     if TG_ENABLED and TELEGRAM_BOT_TOKEN and not tg_move_loop.is_running():
         tg_move_loop.start()
+    if TG_ENABLED and TELEGRAM_BOT_TOKEN and not tg_digest_loop.is_running():
+        tg_digest_loop.start()
     print(f"Logged in as {bot.user} - commands synced.")
 
 
@@ -1068,6 +1146,22 @@ async def tg_test(interaction: discord.Interaction):
         return
     ok = await tg_send("\u2705 <b>Quant connected.</b> Scient Club wire is live.")
     await interaction.followup.send("Test sent to Telegram - check @scientclub." if ok else "Send failed - check bot is admin of the channel and token is correct (see journalctl for [tg] errors).", ephemeral=True)
+
+
+@bot.tree.command(name="tg_digest", description="(Admin) Send the daily news digest to Telegram now")
+async def tg_digest_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    text = build_digest_text()
+    if not text:
+        await interaction.followup.send("No news buffered yet today.", ephemeral=True)
+        return
+    ok = await tg_send(text)
+    if ok:
+        save_digest({"items": []})
+    await interaction.followup.send("Digest sent to @scientclub." if ok else "Send failed - check [tg] logs.", ephemeral=True)
 
 
 @bot.tree.command(name="tg_brief", description="(Admin) Send the daily market brief to Telegram now")
