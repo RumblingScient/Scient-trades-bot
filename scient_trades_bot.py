@@ -136,7 +136,9 @@ def _load(path: Path) -> dict:
 
 
 def _save(path: Path, data: dict):
-    path.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    os.replace(tmp, path)  # atomic on POSIX - never leaves a half-written file
 
 
 def load_trades() -> dict: return _load(JOURNAL_FILE)
@@ -1054,7 +1056,7 @@ async def alert_check_loop():
                 continue
             changed = True
             try:
-                user = await bot.fetch_user(int(uid))
+                user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
                 arrow = "\U0001F7E2" if a["direction"] == "above" else "\U0001F534"
                 embed = discord.Embed(
                     title=f"{arrow} Price Alert: {a['symbol']}",
@@ -2505,6 +2507,9 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
     await interaction.response.defer(ephemeral=True)
     data = load_trades()
     t = data.get(trade)
+    if t and not interaction.user.guild_permissions.administrator and t.get("analyst_id") != interaction.user.id:
+        await interaction.followup.send("You can only update your own trades.", ephemeral=True)
+        return
     if not t:
         await interaction.followup.send("Trade not found.", ephemeral=True)
         return
@@ -3613,7 +3618,7 @@ async def xpost(interaction: discord.Interaction, link: str, comment: str = None
     if channel is None:
         await interaction.followup.send("X feed channel not found.", ephemeral=True)
         return
-    if not re.search(r"(twitter|x|fxtwitter|vxtwitter)\.com/", link, flags=re.I):
+    if not re.match(r"https?://(www\.|mobile\.|m\.)?(twitter|x|fxtwitter|vxtwitter|nitter)\.com/", link.strip(), flags=re.I):
         await interaction.followup.send("That doesn't look like an X/Twitter post link.", ephemeral=True)
         return
     fixed = fix_x_link(link)
