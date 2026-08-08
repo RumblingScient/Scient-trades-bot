@@ -25,6 +25,10 @@ X_FEED_CHANNEL_ID = 1525862152076923020
 SPOT_CHANNEL_ID = 1533876035462889482
 # Pro roles that unlock full access (either one triggers the Pro welcome DM)
 PRO_ROLE_IDS = {1500476858477576374, 1484576832362905630}  # Scient Pass (referral), Scient Pro (payment)
+FREE_ALERT_LIMIT = 5      # max active alerts for non-pro members
+ALERT_CHECK_MIN = 3       # how often (minutes) to check alert prices
+LIQ_CHANNEL_ID = 1535755722678341733  # #liquidations feed
+LIQ_MIN_USD = 1_000_000   # only post liquidations at or above this notional
 QUANT_CHANNEL_ID = 0  # paste #quant-terminal channel ID here (0 = commands work everywhere)
 
 # ---- News wire config (TreeNews) ----
@@ -136,6 +140,19 @@ def save_xseen(d: dict): _save(XSEEN_FILE, d)
 DIGEST_FILE = Path(__file__).with_name("news_digest.json")
 def load_digest() -> dict: return _load(DIGEST_FILE)
 def save_digest(d: dict): _save(DIGEST_FILE, d)
+ALERTS_FILE = Path(__file__).with_name("alerts.json")
+def load_alerts() -> dict: return _load(ALERTS_FILE)
+def save_alerts(d: dict): _save(ALERTS_FILE, d)
+WATCHLIST_FILE = Path(__file__).with_name("watchlists.json")
+def load_watchlists() -> dict: return _load(WATCHLIST_FILE)
+def save_watchlists(d: dict): _save(WATCHLIST_FILE, d)
+
+
+def member_is_pro(member) -> bool:
+    try:
+        return bool({r.id for r in member.roles} & PRO_ROLE_IDS) or member.guild_permissions.administrator
+    except Exception:
+        return False
 
 
 def is_analyst(interaction: discord.Interaction) -> bool:
@@ -774,6 +791,249 @@ async def tg_send_photo(photo: io.BytesIO, caption: str) -> bool:
 _tg_move_state = {}
 
 
+@bot.tree.command(name="alert", description="Set a price alert - DM when a coin crosses your target")
+@app_commands.describe(coin="Coin symbol, e.g. BTC, SOL", price="Target price to alert at")
+async def alert_cmd(interaction: discord.Interaction, coin: str, price: str):
+    await interaction.response.defer(ephemeral=True)
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    target = parse_num(price)
+    if not target or target <= 0:
+        await interaction.followup.send("Target price must be a positive number.", ephemeral=True)
+        return
+    cur = await md_price(pair)
+    if cur is None:
+        await interaction.followup.send(f"Couldn't find **{symbol}** on Binance or Bybit - check the symbol.", ephemeral=True)
+        return
+    alerts = load_alerts()
+    uid = str(interaction.user.id)
+    user_alerts = alerts.get(uid, [])
+    is_pro = member_is_pro(interaction.user)
+    if not is_pro and len(user_alerts) >= FREE_ALERT_LIMIT:
+        await interaction.followup.send(
+            f"You've hit the free limit of **{FREE_ALERT_LIMIT} active alerts**. "
+            f"Delete one with `/alerts` or upgrade for unlimited alerts.",
+            ephemeral=True,
+        )
+        return
+    direction = "above" if target > cur else "below"
+    user_alerts.append({
+        "pair": pair, "symbol": symbol, "target": target,
+        "direction": direction, "set_price": cur,
+        "created": datetime.now(timezone.utc).isoformat(),
+    })
+    alerts[uid] = user_alerts
+    save_alerts(alerts)
+    left = "unlimited" if is_pro else f"{FREE_ALERT_LIMIT - len(user_alerts)} left"
+    await interaction.followup.send(
+        f"\u2705 Alert set: **{symbol}** {direction} **{fnum(target)}** (now {fnum(cur)}).\n"
+        f"I'll DM you when it triggers. Active alerts: {len(user_alerts)} ({left}).",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="alerts", description="View and manage your active price alerts")
+async def alerts_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    alerts = load_alerts()
+    uid = str(interaction.user.id)
+    user_alerts = alerts.get(uid, [])
+    if not user_alerts:
+        await interaction.followup.send("You have no active alerts. Set one with `/alert BTC 70000`.", ephemeral=True)
+        return
+    embed = discord.Embed(title="Your Price Alerts", color=NAVY)
+    lines = []
+    for idx, a in enumerate(user_alerts, 1):
+        lines.append(f"**{idx}.** {a['symbol']} {a['direction']} {fnum(a['target'])}")
+    is_pro = member_is_pro(interaction.user)
+    cap = "unlimited" if is_pro else f"{len(user_alerts)}/{FREE_ALERT_LIMIT}"
+    embed.description = "\n".join(lines) + f"\n\n*Active: {cap}. Use the buttons below to remove.*"
+    view = AlertManageView(uid, user_alerts)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+class AlertManageView(View):
+    def __init__(self, uid: str, user_alerts: list):
+        super().__init__(timeout=300)
+        for idx, a in enumerate(user_alerts):
+            if idx >= 20:
+                break
+            self.add_item(AlertDeleteButton(uid, idx, a))
+
+
+class AlertDeleteButton(Button):
+    def __init__(self, uid: str, idx: int, a: dict):
+        super().__init__(label=f"\u2716 {a['symbol']} {fnum(a['target'])}"[:80], style=discord.ButtonStyle.secondary)
+        self.uid = uid
+        self.target = a["target"]
+        self.pair = a["pair"]
+
+    async def callback(self, interaction: discord.Interaction):
+        if str(interaction.user.id) != self.uid:
+            await interaction.response.send_message("Not your alert.", ephemeral=True)
+            return
+        alerts = load_alerts()
+        arr = alerts.get(self.uid, [])
+        arr = [x for x in arr if not (x["pair"] == self.pair and x["target"] == self.target)]
+        alerts[self.uid] = arr
+        save_alerts(alerts)
+        self.disabled = True
+        await interaction.response.edit_message(content="Alert removed.", view=None)
+
+
+@bot.tree.command(name="watch", description="Your personal coin watchlist with live prices")
+@app_commands.describe(action="add / remove / clear (leave empty to view)", coins="Coin symbols, space or comma separated, e.g. BTC ETH SOL")
+@app_commands.choices(action=[
+    app_commands.Choice(name="view", value="view"),
+    app_commands.Choice(name="add", value="add"),
+    app_commands.Choice(name="remove", value="remove"),
+    app_commands.Choice(name="clear", value="clear"),
+])
+async def watch_cmd(interaction: discord.Interaction, action: app_commands.Choice[str] = None, coins: str = None):
+    await interaction.response.defer(ephemeral=True)
+    act = action.value if action else "view"
+    wl = load_watchlists()
+    uid = str(interaction.user.id)
+    current = wl.get(uid, [])
+
+    if act == "clear":
+        wl.pop(uid, None)
+        save_watchlists(wl)
+        await interaction.followup.send("Watchlist cleared.", ephemeral=True)
+        return
+
+    if act in ("add", "remove"):
+        if not coins:
+            await interaction.followup.send(f"Give me coins to {act}, e.g. `/watch {act} coins:BTC ETH SOL`", ephemeral=True)
+            return
+        syms = [re.sub(r"[^A-Za-z0-9]", "", c).upper() for c in re.split(r"[ ,]+", coins) if c.strip()]
+        if act == "add":
+            added = []
+            for s in syms:
+                if s and s not in current:
+                    pair = s if s.endswith("USDT") else f"{s}USDT"
+                    if await md_price(pair) is not None:
+                        current.append(s)
+                        added.append(s)
+            current = current[:25]
+            wl[uid] = current
+            save_watchlists(wl)
+            msg = f"Added: {', '.join(added)}" if added else "Nothing added (already listed or not found)."
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            current = [s for s in current if s not in syms]
+            wl[uid] = current
+            save_watchlists(wl)
+            await interaction.followup.send(f"Removed: {', '.join(syms)}", ephemeral=True)
+        return
+
+    # view
+    if not current:
+        await interaction.followup.send("Your watchlist is empty. Add coins with `/watch add coins:BTC ETH SOL`.", ephemeral=True)
+        return
+    lines = []
+    for s in current:
+        pair = s if s.endswith("USDT") else f"{s}USDT"
+        t = await md_ticker24(pair)
+        if not t:
+            continue
+        arrow = "\U0001F7E2" if t["priceChangePercent"] >= 0 else "\U0001F534"
+        lines.append(f"{arrow} **{s}** ${fnum(t['lastPrice'])} ({t['priceChangePercent']:+.2f}%)")
+    embed = discord.Embed(title="Your Watchlist", color=NAVY, timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines) if lines else "*Couldn't fetch prices right now.*"
+    embed.set_footer(text="Scient Lounge - 24h change")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+ECON_EVENTS = [
+    ("2026-08-13", "US CPI (July)"),
+    ("2026-08-21", "Jackson Hole Symposium begins"),
+    ("2026-09-11", "US CPI (August)"),
+    ("2026-09-17", "FOMC Rate Decision"),
+    ("2026-10-15", "US CPI (September)"),
+    ("2026-10-29", "FOMC Rate Decision"),
+    ("2026-11-13", "US CPI (October)"),
+    ("2026-12-10", "US CPI (November)"),
+    ("2026-12-17", "FOMC Rate Decision"),
+]
+
+
+@bot.tree.command(name="calendar", description="Upcoming market-moving economic events")
+async def calendar_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    today = datetime.now(timezone.utc).date()
+    upcoming = []
+    for ds, name in ECON_EVENTS:
+        try:
+            d = datetime.strptime(ds, "%Y-%m-%d").date()
+        except Exception:
+            continue
+        if d >= today:
+            days_away = (d - today).days
+            when = "today" if days_away == 0 else "tomorrow" if days_away == 1 else f"in {days_away} days"
+            upcoming.append(f"**{d.strftime('%d %b')}** ({when}) - {name}")
+    embed = discord.Embed(title="\U0001F4C5 Economic Calendar", color=NAVY, timestamp=datetime.now(timezone.utc))
+    if upcoming:
+        embed.description = "\n".join(upcoming[:10]) + "\n\n*CPI and FOMC dates move crypto. Manage risk around them.*"
+    else:
+        embed.description = "No upcoming events on file. Ping an admin to refresh the calendar."
+    embed.set_footer(text="Scient Lounge - macro schedule")
+    await interaction.followup.send(embed=embed)
+
+
+@tasks.loop(minutes=ALERT_CHECK_MIN)
+async def alert_check_loop():
+    alerts = load_alerts()
+    if not alerts:
+        return
+    # gather unique pairs to price once
+    pairs = {a["pair"] for arr in alerts.values() for a in arr}
+    prices = {}
+    for p in pairs:
+        px = await md_price(p)
+        if px is not None:
+            prices[p] = px
+    changed = False
+    for uid, arr in list(alerts.items()):
+        remaining = []
+        for a in arr:
+            cur = prices.get(a["pair"])
+            if cur is None:
+                remaining.append(a)
+                continue
+            hit = (a["direction"] == "above" and cur >= a["target"]) or (a["direction"] == "below" and cur <= a["target"])
+            if not hit:
+                remaining.append(a)
+                continue
+            changed = True
+            try:
+                user = await bot.fetch_user(int(uid))
+                arrow = "\U0001F7E2" if a["direction"] == "above" else "\U0001F534"
+                embed = discord.Embed(
+                    title=f"{arrow} Price Alert: {a['symbol']}",
+                    description=f"**{a['symbol']}** has crossed **{a['direction']} {fnum(a['target'])}**\nCurrent price: **{fnum(cur)}**",
+                    color=GREEN if a["direction"] == "above" else RED,
+                    timestamp=datetime.now(timezone.utc),
+                )
+                embed.set_footer(text="Scient Lounge - Quant alerts")
+                await user.send(embed=embed)
+            except discord.Forbidden:
+                print(f"[alert] DM blocked for {uid}")
+            except Exception as e:
+                print(f"[alert] DM error {uid}: {e}")
+        if remaining:
+            alerts[uid] = remaining
+        else:
+            alerts.pop(uid, None)
+    if changed:
+        save_alerts(alerts)
+
+
+@alert_check_loop.before_loop
+async def before_alert_check():
+    await bot.wait_until_ready()
+
+
 @tasks.loop(minutes=10)
 async def tg_move_loop():
     if not (TG_ENABLED and TELEGRAM_BOT_TOKEN):
@@ -1208,6 +1468,67 @@ async def _post_news(item: dict):
         print(f"[tg] digest buffer error: {e}")
 
 
+async def liq_ws_loop():
+    await bot.wait_until_ready()
+    if not LIQ_CHANNEL_ID:
+        return
+    backoff = 5
+    url = "wss://fstream.binance.com/ws/!forceOrder@arr"
+    while not bot.is_closed():
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.ws_connect(url, heartbeat=30, timeout=30) as ws:
+                    print("[liq] connected to Binance liquidation stream")
+                    backoff = 5
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            try:
+                                data = json.loads(msg.data)
+                                o = data.get("o", {})
+                                sym = o.get("s", "")
+                                side = o.get("S", "")
+                                qty = float(o.get("q", 0))
+                                price = float(o.get("p", 0))
+                                notional = qty * price
+                            except Exception:
+                                continue
+                            if notional < LIQ_MIN_USD:
+                                continue
+                            ch = bot.get_channel(LIQ_CHANNEL_ID)
+                            if ch is None:
+                                continue
+                            base = sym[:-4] if sym.endswith("USDT") else sym
+                            # a SELL forceOrder = long got liquidated; BUY = short got liquidated
+                            liq_type = "Long" if side == "SELL" else "Short"
+                            if notional >= 10_000_000:
+                                size_emoji = "\U0001F4A5\U0001F4A5"
+                            elif notional >= 5_000_000:
+                                size_emoji = "\U0001F4A5"
+                            else:
+                                size_emoji = "\U0001F534" if liq_type == "Long" else "\U0001F7E2"
+                            if notional >= 1_000_000:
+                                amt = f"${notional / 1e6:.2f}M"
+                            else:
+                                amt = f"${notional / 1e3:.0f}K"
+                            embed = discord.Embed(
+                                color=RED if liq_type == "Long" else GREEN,
+                                timestamp=datetime.now(timezone.utc),
+                                description=f"{size_emoji} **{base}** {liq_type} liquidated - **{amt}** @ ${fnum(price)}",
+                            )
+                            embed.set_footer(text="Liquidations - Binance futures")
+                            try:
+                                await ch.send(embed=embed)
+                            except Exception as e:
+                                print(f"[liq] post error: {e}")
+                        elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            break
+        except Exception as e:
+            print(f"[liq] ws error: {e}")
+        print(f"[liq] disconnected - retry in {backoff}s")
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300)
+
+
 async def news_ws_loop():
     await bot.wait_until_ready()
     backoff = 5
@@ -1509,10 +1830,14 @@ async def on_ready():
         x_poll_loop.start()
     if NEWS_ENABLED and NEWS_CHANNEL_ID and not getattr(bot, "_news_task", None):
         bot._news_task = asyncio.create_task(news_ws_loop())
+    if LIQ_CHANNEL_ID and not getattr(bot, "_liq_task", None):
+        bot._liq_task = asyncio.create_task(liq_ws_loop())
     if TG_ENABLED and TELEGRAM_BOT_TOKEN and not tg_brief_loop.is_running():
         tg_brief_loop.start()
     if TG_ENABLED and TELEGRAM_BOT_TOKEN and not tg_move_loop.is_running():
         tg_move_loop.start()
+    if not alert_check_loop.is_running():
+        alert_check_loop.start()
     if not tg_digest_loop.is_running():
         tg_digest_loop.start()
     if TG_NEWS_CHANNELS and not tg_sources_loop.is_running():
@@ -2866,22 +3191,6 @@ async def quiz(interaction: discord.Interaction):
         pass
 
 
-@bot.tree.command(name="coinflip", description="Flip a coin (results may teach you about 50% win rates)")
-async def coinflip(interaction: discord.Interaction):
-    import random as _r
-    result = _r.choice(["HEADS", "TAILS"])
-    emoji = "\U0001FA99"
-    lessons = [
-        "50% win rate + 2R average winner = profitable system. It's never about one flip.",
-        "Even a coin gets 5 heads in a row sometimes. Losing streaks don't mean your edge is gone.",
-        "You can't predict one flip. You can manage what you risk on it.",
-        "The flip is random. Your position size shouldn't be.",
-    ]
-    embed = discord.Embed(title=f"{emoji} {result}", description=_r.choice(lessons), color=GOLD if result == "HEADS" else NAVY)
-    embed.set_footer(text="Scient Lounge - Quant")
-    await interaction.response.send_message(embed=embed)
-
-
 @bot.tree.command(name="dominance", description="BTC dominance + total market cap")
 async def dominance(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -3157,7 +3466,8 @@ def build_help_embed() -> discord.Embed:
             "`/dominance` - BTC dominance + market cap\n"
             "`/compare` - 30d performance, coin vs coin\n"
             "`/convert` - coin to USD (or USD to coin)\n"
-            "`/fear` - Fear & Greed index"
+            "`/fear` - Fear & Greed index\n"
+            "`/calendar` - upcoming CPI / FOMC events"
         ),
         inline=False,
     )
@@ -3166,6 +3476,14 @@ def build_help_embed() -> discord.Embed:
         value=(
             "`/pnl` - position size from account, risk %, entry, SL\n"
             "`/liq` - estimated liquidation price for any leverage"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F4BC Tracking *(private)*",
+        value=(
+            "`/watch` - your personal coin watchlist with live prices\n"
+            "`/alert` `/alerts` - price alerts, DM'd when they trigger"
         ),
         inline=False,
     )
@@ -3190,6 +3508,8 @@ def build_help_embed() -> discord.Embed:
     embed.add_field(
         name="\U0001F514 Alerts",
         value=(
+            "`/alert` - set a price alert, DM when it triggers\n"
+            "`/alerts` - view and manage your alerts\n"
             "`/follow` / `/unfollow` - get pinged when an analyst posts\n"
             "Or use the buttons in #follow-analysts-roles"
         ),
