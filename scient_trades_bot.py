@@ -29,6 +29,18 @@ FREE_ALERT_LIMIT = 5      # max active alerts for non-pro members
 ALERT_CHECK_MIN = 3       # how often (minutes) to check alert prices
 LIQ_CHANNEL_ID = 1535755722678341733  # #liquidations feed
 LIQ_MIN_USD = 1_000_000   # only post liquidations at or above this notional
+
+# Traditional markets (Yahoo Finance) - map friendly names to Yahoo symbols
+TRADFI_SYMBOLS = {
+    "SPX": "^GSPC", "SPX500": "^GSPC", "SP500": "^GSPC", "ES": "^GSPC",
+    "NASDAQ": "^IXIC", "NDX": "^IXIC", "NQ": "^IXIC",
+    "DOW": "^DJI", "DJI": "^DJI",
+    "DXY": "DX-Y.NYB", "DOLLAR": "DX-Y.NYB",
+    "GOLD": "GC=F", "XAU": "GC=F", "GC": "GC=F",
+    "SILVER": "SI=F", "XAG": "SI=F",
+    "OIL": "CL=F", "USOIL": "CL=F", "WTI": "CL=F", "CL": "CL=F",
+    "VIX": "^VIX",
+}
 QUANT_CHANNEL_ID = 0  # paste #quant-terminal channel ID here (0 = commands work everywhere)
 
 # ---- News wire config (TreeNews) ----
@@ -236,6 +248,29 @@ async def md_price(pair: str):
             return float(bd["result"]["list"][0]["lastPrice"])
         except Exception:
             return None
+
+
+async def md_tradfi(name: str):
+    """Fetch a traditional-market quote from Yahoo Finance. name is a friendly key (SPX, GOLD, DXY...)."""
+    ysym = TRADFI_SYMBOLS.get(name.upper())
+    if not ysym:
+        return None
+    url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with aiohttp.ClientSession(headers=headers) as s:
+        d = await _get_json(s, url, {"interval": "1d", "range": "5d"}, 15)
+    try:
+        meta = d["chart"]["result"][0]["meta"]
+        price = float(meta["regularMarketPrice"])
+        prev = float(meta.get("chartPreviousClose") or meta.get("previousClose") or price)
+        chg = (price - prev) / prev * 100 if prev else 0.0
+        return {"name": name.upper(), "ysym": ysym, "price": price, "chg": chg}
+    except Exception:
+        return None
+
+
+def is_tradfi(sym: str) -> bool:
+    return sym.upper().replace("USDT", "") in TRADFI_SYMBOLS or sym.upper() in TRADFI_SYMBOLS
 
 
 async def md_funding(pair: str):
@@ -911,6 +946,11 @@ async def watch_cmd(interaction: discord.Interaction, action: app_commands.Choic
             added = []
             for s in syms:
                 if s and s not in current:
+                    if is_tradfi(s):
+                        if await md_tradfi(s) is not None:
+                            current.append(s)
+                            added.append(s)
+                        continue
                     pair = s if s.endswith("USDT") else f"{s}USDT"
                     if await md_price(pair) is not None:
                         current.append(s)
@@ -933,6 +973,13 @@ async def watch_cmd(interaction: discord.Interaction, action: app_commands.Choic
         return
     lines = []
     for s in current:
+        if is_tradfi(s):
+            tf = await md_tradfi(s)
+            if not tf:
+                continue
+            arrow = "\U0001F7E2" if tf["chg"] >= 0 else "\U0001F534"
+            lines.append(f"{arrow} **{s}** {tf['price']:,.2f} ({tf['chg']:+.2f}%)")
+            continue
         pair = s if s.endswith("USDT") else f"{s}USDT"
         t = await md_ticker24(pair)
         if not t:
@@ -2645,6 +2692,18 @@ async def price(interaction: discord.Interaction, coin: str):
         pair = symbol
     else:
         pair = f"{symbol}USDT"
+    if is_tradfi(symbol):
+        tf = await md_tradfi(symbol)
+        if not tf:
+            await interaction.followup.send(f"Couldn't fetch **{symbol}** right now.")
+            return
+        arrow = "\U0001F7E2" if tf["chg"] >= 0 else "\U0001F534"
+        color = GREEN if tf["chg"] >= 0 else RED
+        embed = discord.Embed(title=f"{arrow} {symbol}", color=color, timestamp=datetime.now(timezone.utc))
+        embed.description = f"**Price:** {tf['price']:,.2f}\n**24h:** {tf['chg']:+.2f}%"
+        embed.set_footer(text="Scient Lounge - traditional markets")
+        await interaction.followup.send(embed=embed)
+        return
     data = await md_ticker24(pair)
     if not data:
         await interaction.followup.send(f"Couldn't find **{symbol}** on Binance or Bybit - check the symbol (e.g. BTC, SOL, ETH).")
