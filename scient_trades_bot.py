@@ -812,8 +812,7 @@ async def tg_move_loop():
         ptxt = f"{c:,.0f}" if c >= 1000 else f"{c:,.2f}"
         caption = (
             f"{emoji} <b>{sym} {word} {chg:+.2f}% in the last hour</b>\n"
-            f"Now trading at ${ptxt}\n\n"
-            f"<i>Setups, not signals - full analysis inside Scient Lounge</i>"
+            f"Now trading at ${ptxt}"
         )
         ok = await tg_send_photo(buf, caption)
         if ok:
@@ -907,8 +906,6 @@ async def build_daily_brief() -> str:
         lines.append(f"\U0001F4B8 <b>BTC Funding:</b> {fund_txt}")
     if movers_txt:
         lines.append(f"\U0001F3C6 <b>Top mover / loser:</b> {movers_txt}")
-    lines.append("")
-    lines.append("<i>Setups, not signals - full analysis inside Scient Lounge</i>")
     return "\n".join(lines)
 
 
@@ -1025,13 +1022,18 @@ def build_digest_text() -> str:
     for i, it in enumerate(items, 1):
         h = _tg_escape(it["headline"])
         prefix = "\U0001F6A8 " if it.get("urgent") else ""
-        srcname = f" <i>- {it.get('source')}</i>" if it.get("source") else ""
-        if it.get("link"):
-            lines.append(f"{i}. {prefix}<a href=\"{it['link']}\">{h}</a>{srcname}")
+        src = it.get("source")
+        link = it.get("link")
+        # headline stays plain; link is embedded on the source name (or the word "link")
+        if link and src:
+            tail = f' <a href="{link}"><i>{_tg_escape(src)}</i></a>'
+        elif link:
+            tail = f' <a href="{link}">link</a>'
+        elif src:
+            tail = f' <i>- {_tg_escape(src)}</i>'
         else:
-            lines.append(f"{i}. {prefix}{h}{srcname}")
-    lines.append("")
-    lines.append("<i>Setups, not signals - full analysis inside Scient Lounge</i>")
+            tail = ""
+        lines.append(f"{i}. {prefix}<b>{h}</b>{tail}")
     return "\n".join(lines)
 
 
@@ -1049,11 +1051,19 @@ async def post_digest_discord():
     lines = []
     for i, it in enumerate(items, 1):
         prefix = "\U0001F6A8 " if it.get("urgent") else ""
-        srcname = f" - *{it.get('source')}*" if it.get("source") else ""
-        if it.get("link"):
-            lines.append(f"{i}. {prefix}[{it['headline'][:200]}]({it['link']}){srcname}")
+        h = it["headline"][:200]
+        src = it.get("source")
+        link = it.get("link")
+        # headline plain (bold); link embedded on source name or the word "link"
+        if link and src:
+            tail = f" [*{src}*]({link})"
+        elif link:
+            tail = f" [link]({link})"
+        elif src:
+            tail = f" - *{src}*"
         else:
-            lines.append(f"{i}. {prefix}{it['headline'][:200]}{srcname}")
+            tail = ""
+        lines.append(f"{i}. {prefix}**{h}**{tail}")
     embed = discord.Embed(title=f"\U0001F4F0 Daily News Digest - {today}", description="\n".join(lines)[:3900], color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.set_footer(text="News Wire - curated daily digest")
     try:
