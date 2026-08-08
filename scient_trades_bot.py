@@ -23,6 +23,8 @@ TRADE_UPDATES_CHANNEL_ID = 1525863205174378617
 OPEN_BOARD_CHANNEL_ID = 1525863082256109690
 X_FEED_CHANNEL_ID = 1525862152076923020
 SPOT_CHANNEL_ID = 1533876035462889482
+# Pro roles that unlock full access (either one triggers the Pro welcome DM)
+PRO_ROLE_IDS = {1500476858477576374, 1484576832362905630}  # Scient Pass (referral), Scient Pro (payment)
 QUANT_CHANNEL_ID = 0  # paste #quant-terminal channel ID here (0 = commands work everywhere)
 
 # ---- News wire config (TreeNews) ----
@@ -104,6 +106,7 @@ SPOT_STATUSES = ["ACCUMULATING", "HOLDING", "DISTRIBUTING"]
 ANALYST_CHOICES = [app_commands.Choice(name=k.capitalize(), value=k) for k in ANALYSTS.keys()]
 
 intents = discord.Intents.default()
+intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
@@ -139,6 +142,124 @@ def is_analyst(interaction: discord.Interaction) -> bool:
     if interaction.user.guild_permissions.administrator:
         return True
     return any(r.name == ANALYST_ROLE_NAME for r in interaction.user.roles)
+
+
+# ================= Unified market data (Binance -> Bybit fallback) =================
+# Bybit intervals differ from Binance: map them.
+_BYBIT_IV = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "1d": "D", "1w": "W"}
+
+
+async def _get_json(session, url, params=None, timeout=15):
+    try:
+        async with session.get(url, params=params, timeout=timeout) as r:
+            if r.status != 200:
+                return None
+            return await r.json()
+    except Exception:
+        return None
+
+
+async def md_klines(pair: str, interval: str, limit: int = 220):
+    """Return list of [openTime, o, h, l, c, v, ...] Binance-style. Tries Binance then Bybit."""
+    async with aiohttp.ClientSession() as s:
+        data = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                               {"symbol": pair, "interval": interval, "limit": limit}, 20)
+        if data and isinstance(data, list) and len(data) > 0:
+            return data
+        # Bybit fallback (spot). Bybit returns newest-first; reverse to oldest-first.
+        biv = _BYBIT_IV.get(interval)
+        if not biv:
+            return None
+        bd = await _get_json(s, "https://api.bybit.com/v5/market/kline",
+                             {"category": "spot", "symbol": pair, "interval": biv, "limit": min(limit, 1000)}, 20)
+        try:
+            rows = bd["result"]["list"]
+            if not rows:
+                return None
+            out = []
+            for r in reversed(rows):
+                # Bybit: [start, open, high, low, close, volume, turnover]
+                out.append([int(r[0]), float(r[1]), float(r[2]), float(r[3]), float(r[4]), float(r[5]), 0, 0, 0, 0, 0, 0])
+            return out
+        except Exception:
+            return None
+
+
+async def md_ticker24(pair: str):
+    """Return dict with lastPrice, priceChangePercent, highPrice, lowPrice, quoteVolume. Binance then Bybit."""
+    async with aiohttp.ClientSession() as s:
+        d = await _get_json(s, "https://api.binance.com/api/v3/ticker/24hr", {"symbol": pair}, 15)
+        if d and "lastPrice" in d:
+            return {
+                "lastPrice": float(d["lastPrice"]), "priceChangePercent": float(d["priceChangePercent"]),
+                "highPrice": float(d["highPrice"]), "lowPrice": float(d["lowPrice"]),
+                "quoteVolume": float(d["quoteVolume"]), "source": "Binance",
+            }
+        bd = await _get_json(s, "https://api.bybit.com/v5/market/tickers", {"category": "spot", "symbol": pair}, 15)
+        try:
+            t = bd["result"]["list"][0]
+            last = float(t["lastPrice"])
+            return {
+                "lastPrice": last, "priceChangePercent": float(t["price24hPcnt"]) * 100,
+                "highPrice": float(t["highPrice24h"]), "lowPrice": float(t["lowPrice24h"]),
+                "quoteVolume": float(t.get("turnover24h", 0)), "source": "Bybit",
+            }
+        except Exception:
+            return None
+
+
+async def md_price(pair: str):
+    """Return float last price. Binance then Bybit."""
+    async with aiohttp.ClientSession() as s:
+        d = await _get_json(s, "https://api.binance.com/api/v3/ticker/price", {"symbol": pair}, 15)
+        if d and "price" in d:
+            return float(d["price"])
+        bd = await _get_json(s, "https://api.bybit.com/v5/market/tickers", {"category": "spot", "symbol": pair}, 15)
+        try:
+            return float(bd["result"]["list"][0]["lastPrice"])
+        except Exception:
+            return None
+
+
+async def md_funding(pair: str):
+    """Return dict rate(%), mark, nextFundingTime(s). Binance perp then Bybit linear."""
+    async with aiohttp.ClientSession() as s:
+        d = await _get_json(s, "https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol": pair}, 15)
+        if d and "lastFundingRate" in d:
+            return {"rate": float(d["lastFundingRate"]) * 100, "mark": float(d["markPrice"]),
+                    "next": int(d["nextFundingTime"]) // 1000, "source": "Binance"}
+        bd = await _get_json(s, "https://api.bybit.com/v5/market/tickers", {"category": "linear", "symbol": pair}, 15)
+        try:
+            t = bd["result"]["list"][0]
+            return {"rate": float(t["fundingRate"]) * 100, "mark": float(t["markPrice"]),
+                    "next": int(t["nextFundingTime"]) // 1000, "source": "Bybit"}
+        except Exception:
+            return None
+
+
+async def md_oi(pair: str):
+    """Return dict oi(coins), source. Binance perp then Bybit linear."""
+    async with aiohttp.ClientSession() as s:
+        d = await _get_json(s, "https://fapi.binance.com/fapi/v1/openInterest", {"symbol": pair}, 15)
+        hist = await _get_json(s, "https://fapi.binance.com/futures/data/openInterestHist",
+                               {"symbol": pair, "period": "1h", "limit": 25}, 15)
+        if d and "openInterest" in d:
+            oi_then = None
+            if isinstance(hist, list) and len(hist) >= 24:
+                try:
+                    oi_then = float(hist[0]["sumOpenInterest"])
+                except Exception:
+                    oi_then = None
+            return {"oi": float(d["openInterest"]), "oi_then": oi_then, "source": "Binance"}
+        bd = await _get_json(s, "https://api.bybit.com/v5/market/open-interest",
+                             {"category": "linear", "symbol": pair, "intervalTime": "1h", "limit": 25}, 15)
+        try:
+            rows = bd["result"]["list"]
+            oi_now = float(rows[0]["openInterest"])
+            oi_then = float(rows[-1]["openInterest"]) if len(rows) >= 24 else None
+            return {"oi": oi_now, "oi_then": oi_then, "source": "Bybit"}
+        except Exception:
+            return None
 
 
 def parse_num(val):
@@ -660,13 +781,8 @@ async def tg_move_loop():
     now = datetime.now(timezone.utc)
     for sym in TG_MOVE_SYMBOLS:
         pair = f"{sym}USDT"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": "1h", "limit": 2}, timeout=15) as resp:
-                    if resp.status != 200:
-                        continue
-                    klines = await resp.json()
-        except Exception:
+        klines = await md_klines(pair, "1h", 2)
+        if not klines:
             continue
         if len(klines) < 2:
             continue
@@ -682,10 +798,10 @@ async def tg_move_loop():
         last_alert = state.get("last_alert")
         if last_alert and (now - last_alert).total_seconds() < TG_MOVE_COOLDOWN_MIN * 60:
             continue
+        chart_klines = await md_klines(pair, "1h", 220)
+        if not chart_klines:
+            continue
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": "1h", "limit": 220}, timeout=20) as resp:
-                    chart_klines = await resp.json()
             buf = await asyncio.to_thread(make_chart_image, f"{sym}/USDT", "1H", chart_klines)
         except Exception as e:
             print(f"[tg] move chart error: {e}")
@@ -1238,6 +1354,137 @@ class FollowNewsButton(Button):
 
     async def callback(self, interaction: discord.Interaction):
         await toggle_role(interaction, NEWS_PING_ROLE_ID, "Breaking News")
+
+
+def build_join_dm() -> discord.Embed:
+    embed = discord.Embed(
+        title="Welcome to Scient Lounge \U0001F44B",
+        color=NAVY,
+        description=(
+            "Glad to have you here. Scient Lounge is a trading community built around "
+            "**process, not hype** - real setups, real tools, and a market terminal built into the server.\n\n"
+            "Here's what you can start using right now, free:"
+        ),
+    )
+    embed.add_field(
+        name="\U0001F4CA The Quant Terminal",
+        value=(
+            "Head to **#quant-terminal** and try:\n"
+            "`/price BTC` - live price\n"
+            "`/chart BTC 4H` - instant candlestick chart with EMAs\n"
+            "`/fear` - market Fear & Greed index\n"
+            "`/heatmap` - the whole market at a glance\n"
+            "Type `/help` to see everything."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F9E0 Learn & Test Yourself",
+        value="`/quiz` - trading quizzes from basics to advanced. Build a streak.",
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F513 Want the full picture?",
+        value=(
+            "Members with **full access** get live analyst trade setups, entry/SL/targets, "
+            "the full trade journal with verified results, priority tools, and the breaking-news wire. "
+            "Check the upgrade options in the server whenever you're ready - no pressure."
+        ),
+        inline=False,
+    )
+    embed.set_footer(text="Scient Lounge - setups, not signals")
+    return embed
+
+
+def build_pro_dm() -> discord.Embed:
+    embed = discord.Embed(
+        title="You're in. Full access unlocked \U0001F680",
+        color=GOLD,
+        description=(
+            "Welcome to the full Scient Lounge experience. Here's exactly what you now have access to - "
+            "take two minutes to set yourself up so you don't miss anything."
+        ),
+    )
+    embed.add_field(
+        name="\U0001F4C8 Live Analyst Setups",
+        value=(
+            "Every trade our analysts take is posted in **#future-trades** and **#spot-trades** with "
+            "entry, stop loss, targets, and the reasoning in a thread. Updates (TP hits, SL moves, closes) "
+            "are tracked live on the card and in **#trade-updates**."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F514 Never miss a setup",
+        value=(
+            "Go to **#follow-analysts-roles** and pick which analysts you want to be pinged for. "
+            "You can also turn on the **Breaking News** ping for urgent market events."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F4CB Check the track record",
+        value=(
+            "`/stats` - any analyst's full scorecard: win rate, total R, best/worst\n"
+            "`/recent` - the latest closed trades with results\n"
+            "`/open` - every live position right now"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F9EE Your risk tools (private)",
+        value=(
+            "`/pnl` - position size from your account, risk %, entry and SL. Use this before every trade.\n"
+            "`/liq` - liquidation price for any entry and leverage"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F4CA Full Quant Terminal",
+        value=(
+            "**#quant-terminal**: `/chart` `/levels` `/funding` `/oi` `/vol` `/heatmap` `/dominance` "
+            "`/compare` and more. Type `/help` for the full list."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F4F0 News",
+        value="The daily news digest and market brief keep you on top of what matters. Watch **#news-wire**.",
+        inline=False,
+    )
+    embed.set_footer(text="Scient Lounge - welcome aboard")
+    return embed
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    if member.bot:
+        return
+    try:
+        await member.send(embed=build_join_dm())
+        print(f"[welcome] join DM sent to {member} ({member.id})")
+    except discord.Forbidden:
+        print(f"[welcome] join DM blocked (DMs closed) for {member} ({member.id})")
+    except Exception as e:
+        print(f"[welcome] join DM error for {member.id}: {e}")
+
+
+@bot.event
+async def on_member_update(before: discord.Member, after: discord.Member):
+    if after.bot:
+        return
+    before_ids = {r.id for r in before.roles}
+    after_ids = {r.id for r in after.roles}
+    gained = after_ids - before_ids
+    if gained & PRO_ROLE_IDS:
+        # only fire once even if both pro roles are added together
+        try:
+            await after.send(embed=build_pro_dm())
+            print(f"[welcome] PRO DM sent to {after} ({after.id})")
+        except discord.Forbidden:
+            print(f"[welcome] PRO DM blocked (DMs closed) for {after} ({after.id})")
+        except Exception as e:
+            print(f"[welcome] PRO DM error for {after.id}: {e}")
 
 
 @bot.event
@@ -2063,25 +2310,14 @@ async def price(interaction: discord.Interaction, coin: str):
         pair = symbol
     else:
         pair = f"{symbol}USDT"
-    url = "https://api.binance.com/api/v3/ticker/24hr"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params={"symbol": pair}, timeout=15) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send(f"Couldn't find **{symbol}** - check the symbol (e.g. BTC, SOL, ETH).")
-                    return
-                data = await resp.json()
-    except Exception:
-        await interaction.followup.send("Price feed unavailable right now - try again in a minute.")
+    data = await md_ticker24(pair)
+    if not data:
+        await interaction.followup.send(f"Couldn't find **{symbol}** on Binance or Bybit - check the symbol (e.g. BTC, SOL, ETH).")
         return
-    try:
-        last = float(data["lastPrice"])
-        chg = float(data["priceChangePercent"])
-        high = float(data["highPrice"])
-        low = float(data["lowPrice"])
-    except Exception:
-        await interaction.followup.send(f"Couldn't parse price data for **{symbol}**.")
-        return
+    last = data["lastPrice"]
+    chg = data["priceChangePercent"]
+    high = data["highPrice"]
+    low = data["lowPrice"]
     arrow = "\U0001F7E2" if chg >= 0 else "\U0001F534"
     color = GREEN if chg >= 0 else RED
     embed = discord.Embed(title=f"{arrow} {symbol}/USDT", color=color, timestamp=datetime.now(timezone.utc))
@@ -2202,16 +2438,9 @@ async def chart_cmd(interaction: discord.Interaction, coin: str, timeframe: app_
     symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
     pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
     interval = CHART_INTERVALS[timeframe.value]
-    url = "https://api.binance.com/api/v3/klines"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params={"symbol": pair, "interval": interval, "limit": 220}, timeout=20) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send(f"Couldn't find **{symbol}** - check the symbol.")
-                    return
-                klines = await resp.json()
-    except Exception:
-        await interaction.followup.send("Chart data unavailable right now - try again in a minute.")
+    klines = await md_klines(pair, interval, 220)
+    if not klines:
+        await interaction.followup.send(f"Couldn't find **{symbol}** on Binance or Bybit - check the symbol.")
         return
     if not klines or len(klines) < 20:
         await interaction.followup.send(f"Not enough data for **{symbol}** on {timeframe.value}.")
@@ -2260,24 +2489,13 @@ async def funding(interaction: discord.Interaction, coin: str):
     await interaction.response.defer()
     symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
     pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
-    url = "https://fapi.binance.com/fapi/v1/premiumIndex"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params={"symbol": pair}, timeout=15) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send(f"No perp market found for **{symbol}**.")
-                    return
-                data = await resp.json()
-    except Exception:
-        await interaction.followup.send("Funding data unavailable right now.")
+    fd = await md_funding(pair)
+    if not fd:
+        await interaction.followup.send(f"No perp market found for **{symbol}** on Binance or Bybit.")
         return
-    try:
-        rate = float(data["lastFundingRate"]) * 100
-        mark = float(data["markPrice"])
-        nxt = int(data["nextFundingTime"]) // 1000
-    except Exception:
-        await interaction.followup.send(f"Couldn't parse funding data for **{symbol}**.")
-        return
+    rate = fd["rate"]
+    mark = fd["mark"]
+    nxt = fd["next"]
     lean = "Longs paying shorts (crowded long)" if rate > 0 else "Shorts paying longs (crowded short)" if rate < 0 else "Neutral"
     color = RED if abs(rate) > 0.05 else GREEN if abs(rate) < 0.01 else GOLD
     embed = discord.Embed(title=f"Funding - {symbol} Perp", color=color, timestamp=datetime.now(timezone.utc))
@@ -2333,32 +2551,19 @@ async def oi(interaction: discord.Interaction, coin: str):
     await interaction.response.defer()
     symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
     pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://fapi.binance.com/fapi/v1/openInterest", params={"symbol": pair}, timeout=15) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send(f"No perp market found for **{symbol}**.")
-                    return
-                now_data = await resp.json()
-            async with session.get("https://fapi.binance.com/futures/data/openInterestHist", params={"symbol": pair, "period": "1h", "limit": 25}, timeout=15) as resp2:
-                hist = await resp2.json() if resp2.status == 200 else []
-            async with session.get("https://fapi.binance.com/fapi/v1/premiumIndex", params={"symbol": pair}, timeout=15) as resp3:
-                px = await resp3.json() if resp3.status == 200 else {}
-    except Exception:
-        await interaction.followup.send("OI data unavailable right now.")
+    od = await md_oi(pair)
+    fd = await md_funding(pair)
+    if not od:
+        await interaction.followup.send(f"No perp market found for **{symbol}** on Binance or Bybit.")
         return
-    try:
-        oi_now = float(now_data["openInterest"])
-        mark = float(px.get("markPrice", 0))
-        oi_usd = oi_now * mark if mark else None
-    except Exception:
-        await interaction.followup.send(f"Couldn't parse OI data for **{symbol}**.")
-        return
+    oi_now = od["oi"]
+    mark = fd["mark"] if fd else 0
+    oi_usd = oi_now * mark if mark else None
     chg_txt = ""
     color = NAVY
-    if isinstance(hist, list) and len(hist) >= 24:
+    if od.get("oi_then"):
         try:
-            oi_then = float(hist[0]["sumOpenInterest"])
+            oi_then = od["oi_then"]
             chg = (oi_now - oi_then) / oi_then * 100
             arrow = "\U0001F4C8" if chg >= 0 else "\U0001F4C9"
             chg_txt = f"\n**24h change:** {arrow} {chg:+.2f}%"
@@ -2433,17 +2638,10 @@ async def convert(interaction: discord.Interaction, amount: str, coin: str, to_c
         return
     symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
     pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": pair}, timeout=15) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send(f"Couldn't find **{symbol}**.")
-                    return
-                data = await resp.json()
-    except Exception:
-        await interaction.followup.send("Price feed unavailable right now.")
+    price = await md_price(pair)
+    if not price:
+        await interaction.followup.send(f"Couldn't find **{symbol}** on Binance or Bybit.")
         return
-    price = float(data["price"])
     base = symbol[:-4] if symbol.endswith("USDT") else symbol
     if to_coin:
         qty = amt / price
@@ -2711,15 +2909,9 @@ async def vol(interaction: discord.Interaction, coin: str):
     await interaction.response.defer()
     symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
     pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": "4h", "limit": 60}, timeout=15) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send(f"Couldn't find **{symbol}**.")
-                    return
-                klines = await resp.json()
-    except Exception:
-        await interaction.followup.send("Data unavailable right now.")
+    klines = await md_klines(pair, "4h", 60)
+    if not klines:
+        await interaction.followup.send(f"Couldn't find **{symbol}** on Binance or Bybit.")
         return
     if len(klines) < 20:
         await interaction.followup.send(f"Not enough data for **{symbol}**.")
@@ -2761,15 +2953,9 @@ async def levels(interaction: discord.Interaction, coin: str, timeframe: app_com
     interval = {"1H": "1h", "4H": "4h", "1D": "1d"}[tfv]
     symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
     pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": interval, "limit": 300}, timeout=15) as resp:
-                if resp.status != 200:
-                    await interaction.followup.send(f"Couldn't find **{symbol}**.")
-                    return
-                klines = await resp.json()
-    except Exception:
-        await interaction.followup.send("Data unavailable right now.")
+    klines = await md_klines(pair, interval, 300)
+    if not klines:
+        await interaction.followup.send(f"Couldn't find **{symbol}** on Binance or Bybit.")
         return
     if len(klines) < 50:
         await interaction.followup.send(f"Not enough data for **{symbol}** on {tfv}.")
@@ -2916,17 +3102,12 @@ async def compare(interaction: discord.Interaction, coin1: str, coin2: str):
         s = re.sub(r"[^A-Za-z0-9]", "", c).upper()
         syms.append(s if s.endswith("USDT") else f"{s}USDT")
     results = []
-    try:
-        async with aiohttp.ClientSession() as session:
-            for pair in syms:
-                async with session.get("https://api.binance.com/api/v3/klines", params={"symbol": pair, "interval": "1d", "limit": 30}, timeout=15) as resp:
-                    if resp.status != 200:
-                        await interaction.followup.send(f"Couldn't find **{pair[:-4]}**.")
-                        return
-                    results.append(await resp.json())
-    except Exception:
-        await interaction.followup.send("Data unavailable right now.")
-        return
+    for pair in syms:
+        kl = await md_klines(pair, "1d", 30)
+        if not kl:
+            await interaction.followup.send(f"Couldn't find **{pair[:-4]}** on Binance or Bybit.")
+            return
+        results.append(kl)
     n = min(len(results[0]), len(results[1]))
     if n < 5:
         await interaction.followup.send("Not enough data to compare.")
