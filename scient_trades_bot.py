@@ -1963,18 +1963,37 @@ async def setup_follow_panel(interaction: discord.Interaction):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
     embed = discord.Embed(
-        title="Follow Your Analysts",
+        title="\U0001F514 Choose Your Alerts",
         description=(
-            "Tap a button to get pinged when that analyst posts a trade. "
-            "Tap again to stop.\n\n"
-            "**Analysts:** Scient, Owais, 94, Michael, Delta, Gaijin\n"
-            "**Follow All** - get pinged on every new trade\n"
-            "**X Updates** - get pinged when new X posts are shared\n"
-            "**\U0001F6A8 Breaking News** - get pinged on urgent market news only (hacks, halts, delistings)"
+            "Pick what you want to be notified about. Tap a button to turn it on, "
+            "tap it again to turn it off. You can change these any time."
         ),
         color=NAVY,
     )
-    embed.set_footer(text="Scient Lounge - Alerts")
+    embed.add_field(
+        name="Per-analyst alerts",
+        value=(
+            f"{' · '.join(f'**{k.capitalize()}**' for k in ANALYSTS)}\n"
+            "Pinged only when that analyst posts a new setup - good if you follow one style closely."
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="Follow All",
+        value="Pinged on every new setup from every analyst. The one to pick if you don't want to miss anything.",
+        inline=False,
+    )
+    embed.add_field(
+        name="X Updates",
+        value="Pinged when a new post from our X account is shared in the server.",
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F6A8 Breaking News",
+        value="Urgent market events only - hacks, exchange halts, delistings. Rare by design, so it stays worth reading.",
+        inline=False,
+    )
+    embed.set_footer(text="Scient Lounge - you're in control of your pings")
     await interaction.channel.send(embed=embed, view=FollowPanel())
     await interaction.response.send_message("Follow panel posted.", ephemeral=True)
 
@@ -2210,9 +2229,15 @@ async def editable_any_ac(interaction: discord.Interaction, current: str):
 async def refresh_and_edit(t: dict, spot_mode: bool = False):
     channel = bot.get_channel(t["channel_id"])
     msg = await channel.fetch_message(t["message_id"])
-    image_url = msg.attachments[0].url if msg.attachments else None
     builder = build_spot_embed if spot_mode else build_embed
-    await msg.edit(embed=builder(t, image_url=image_url))
+    embed = builder(t)
+    if msg.attachments:
+        # reference the existing attachment (attachment://) instead of its CDN url -
+        # the CDN url makes Discord render the chart twice (attachment + embed image)
+        embed.set_image(url=f"attachment://{msg.attachments[0].filename}")
+        await msg.edit(embed=embed, attachments=list(msg.attachments))
+    else:
+        await msg.edit(embed=embed)
     return msg
 
 
@@ -2465,8 +2490,16 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
         embed.set_image(url=f"attachment://{chart.filename}")
         await msg.edit(embed=embed, attachments=[f])
     else:
-        image_url = msg.attachments[0].url if msg.attachments else None
-        await msg.edit(embed=builder(t, image_url=image_url))
+        # keep the existing attachment and reference it the same way the original post does
+        # (using the CDN url here makes Discord render the image twice - once as the
+        #  attachment, once inside the embed)
+        if msg.attachments:
+            att = msg.attachments[0]
+            embed = builder(t)
+            embed.set_image(url=f"attachment://{att.filename}")
+            await msg.edit(embed=embed, attachments=list(msg.attachments))
+        else:
+            await msg.edit(embed=builder(t))
     if spot_mode:
         await refresh_spot_board()
     else:
