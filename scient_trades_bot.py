@@ -1797,7 +1797,7 @@ def build_pro_dm() -> discord.Embed:
     embed.add_field(
         name="\U0001F514 Never miss a setup",
         value=(
-            "Go to **#follow-analysts-roles** and pick which analysts you want to be pinged for. "
+            "Go to **#select-analyst-alerts** and pick which analysts you want to be pinged for. "
             "You can also turn on the **Breaking News** ping for urgent market events."
         ),
         inline=False,
@@ -3608,7 +3608,7 @@ def build_help_embed() -> discord.Embed:
             "`/alert` - set a price alert, DM when it triggers\n"
             "`/alerts` - view and manage your alerts\n"
             "`/follow` / `/unfollow` - get pinged when an analyst posts\n"
-            "Or use the buttons in #follow-analysts-roles"
+            "Or use the buttons in #select-analyst-alerts"
         ),
         inline=False,
     )
