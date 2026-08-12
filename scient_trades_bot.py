@@ -999,15 +999,17 @@ async def watch_cmd(interaction: discord.Interaction, action: app_commands.Choic
 
 
 ECON_EVENTS = [
-    ("2026-08-13", "US CPI (July)"),
-    ("2026-08-21", "Jackson Hole Symposium begins"),
-    ("2026-09-11", "US CPI (August)"),
-    ("2026-09-17", "FOMC Rate Decision"),
-    ("2026-10-15", "US CPI (September)"),
-    ("2026-10-29", "FOMC Rate Decision"),
-    ("2026-11-13", "US CPI (October)"),
-    ("2026-12-10", "US CPI (November)"),
-    ("2026-12-17", "FOMC Rate Decision"),
+    # CPI: BLS official release schedule (8:30 AM ET) - bls.gov/schedule/news_release/cpi.htm
+    ("2026-08-12", "US CPI (July) - 8:30 AM ET"),
+    ("2026-09-11", "US CPI (August) - 8:30 AM ET"),
+    ("2026-10-14", "US CPI (September) - 8:30 AM ET"),
+    ("2026-11-10", "US CPI (October) - 8:30 AM ET"),
+    ("2026-12-10", "US CPI (November) - 8:30 AM ET"),
+    # FOMC: decision day = second day of meeting, 2:00 PM ET
+    # federalreserve.gov/monetarypolicy/fomccalendars.htm
+    ("2026-09-16", "FOMC Rate Decision + dot plot - 2:00 PM ET"),
+    ("2026-10-28", "FOMC Rate Decision - 2:00 PM ET"),
+    ("2026-12-09", "FOMC Rate Decision + dot plot - 2:00 PM ET"),
 ]
 
 
@@ -1030,7 +1032,7 @@ async def calendar_cmd(interaction: discord.Interaction):
         embed.description = "\n".join(upcoming[:10]) + "\n\n*CPI and FOMC dates move crypto. Manage risk around them.*"
     else:
         embed.description = "No upcoming events on file. Ping an admin to refresh the calendar."
-    embed.set_footer(text="Scient Lounge - macro schedule")
+    embed.set_footer(text="Scient Lounge - official BLS + Federal Reserve schedules")
     await interaction.followup.send(embed=embed)
 
 
