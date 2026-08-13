@@ -3624,7 +3624,7 @@ async def cvd_cmd(interaction: discord.Interaction, coin: str, timeframe: app_co
         read = "Price down into positive delta - buyers absorbing, possible accumulation."
     else:
         read = "No strong divergence between price and flows right now."
-    lines = [f"**Window ({n} x {tfv}):** price {px_chg:+.2f}% | Spot CVD {_musd(d_spot)} | Perp CVD {_musd(d_perp)}"]
+    lines = [f"**{symbol} ({n} x {tfv}):** price {px_chg:+.2f}% | Spot CVD {_musd(d_spot)} | Perp CVD {_musd(d_perp)}"]
     ctx = []
     if od and od.get("oi_then"):
         oi_chg = (od["oi"] - od["oi_then"]) / od["oi_then"] * 100
