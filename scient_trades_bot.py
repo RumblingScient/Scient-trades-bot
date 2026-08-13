@@ -275,6 +275,18 @@ async def md_tradfi(name: str):
         return None
 
 
+async def md_coinbase_price(base: str):
+    """Coinbase spot price for BASE-USD. Returns float or None."""
+    url = f"https://api.exchange.coinbase.com/products/{base}-USD/ticker"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    async with aiohttp.ClientSession(headers=headers) as s:
+        d = await _get_json(s, url, None, 15)
+    try:
+        return float(d["price"])
+    except Exception:
+        return None
+
+
 def is_tradfi(sym: str) -> bool:
     return sym.upper().replace("USDT", "") in TRADFI_SYMBOLS or sym.upper() in TRADFI_SYMBOLS
 
@@ -3499,6 +3511,140 @@ async def vol(interaction: discord.Interaction, coin: str):
     await interaction.followup.send(embed=embed)
 
 
+def make_cvd_image(symbol: str, tf_label: str, dates: list, closes: list, cvd_spot: list, cvd_perp: list) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True,
+                                   gridspec_kw={"height_ratios": [2, 1.4], "hspace": 0.06},
+                                   facecolor="#131722")
+    for ax in (ax1, ax2):
+        ax.set_facecolor("#131722")
+        ax.grid(color="#1E222D", linewidth=0.5)
+        for sp in ax.spines.values():
+            sp.set_color("#2A2E39")
+        ax.tick_params(colors="#B2B5BE", labelsize=8)
+        ax.yaxis.tick_right()
+    ax1.plot(dates, closes, color="#EAECEF", linewidth=1.4)
+    ax1.set_title(f"{symbol}  {tf_label}  |  Price vs CVD", color="#EAECEF", fontsize=12, loc="left", pad=10)
+    ax2.plot(dates, cvd_spot, color="#E8590C", linewidth=1.6, label="Spot CVD")
+    ax2.plot(dates, cvd_perp, color="#378ADD", linewidth=1.6, label="Perp CVD")
+    ax2.axhline(0, color="#B2B5BE", linewidth=0.6, linestyle="--", alpha=0.5)
+    leg = ax2.legend(facecolor="#131722", edgecolor="#2A2E39", labelcolor="#EAECEF", fontsize=9, loc="upper left")
+    def _fmt_usd(x, _):
+        ax_abs = abs(x)
+        if ax_abs >= 1e9: return f"{x/1e9:.1f}B"
+        if ax_abs >= 1e6: return f"{x/1e6:.0f}M"
+        if ax_abs >= 1e3: return f"{x/1e3:.0f}K"
+        return f"{x:.0f}"
+    import matplotlib.ticker as mticker
+    ax2.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_usd))
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+async def _fetch_cvd_klines(url: str, pair: str, interval: str, limit: int):
+    async with aiohttp.ClientSession() as s:
+        return await _get_json(s, url, {"symbol": pair, "interval": interval, "limit": limit}, 20)
+
+
+def _cvd_series(klines: list):
+    """Cumulative volume delta in USD from taker-buy quote volume (idx 10) vs total quote volume (idx 7)."""
+    out = []
+    run = 0.0
+    for k in klines:
+        try:
+            qv = float(k[7])
+            tq = float(k[10])
+        except Exception:
+            out.append(run)
+            continue
+        run += (2 * tq - qv)  # taker buys minus taker sells, in quote (USD) terms
+        out.append(run)
+    return out
+
+
+CVD_INTERVALS = {"15m": "15m", "1H": "1h", "4H": "4h"}
+
+
+@bot.tree.command(name="cvd", description="Spot vs Perp CVD with OI and funding - who is driving the move?")
+@app_commands.describe(coin="Coin symbol, e.g. BTC", timeframe="Candle timeframe")
+@app_commands.choices(timeframe=[app_commands.Choice(name=k, value=k) for k in CVD_INTERVALS])
+async def cvd_cmd(interaction: discord.Interaction, coin: str, timeframe: app_commands.Choice[str] = None):
+    await interaction.response.defer()
+    tfv = timeframe.value if timeframe else "1H"
+    interval = CVD_INTERVALS[tfv]
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    spot = await _fetch_cvd_klines("https://api.binance.com/api/v3/klines", pair, interval, 200)
+    perp = await _fetch_cvd_klines("https://fapi.binance.com/fapi/v1/klines", pair, interval, 200)
+    if not spot or not isinstance(spot, list) or len(spot) < 30:
+        await interaction.followup.send(f"CVD needs Binance taker data and **{symbol}** isn't on Binance spot - try a major pair.")
+        return
+    if not perp or not isinstance(perp, list):
+        perp = []
+    n = min(len(spot), len(perp)) if perp else len(spot)
+    spot = spot[-n:]
+    perp = perp[-n:] if perp else []
+    cvd_spot = _cvd_series(spot)
+    cvd_perp = _cvd_series(perp) if perp else [0.0] * n
+    from datetime import datetime as _dt
+    dates = [_dt.fromtimestamp(int(k[0]) / 1000) for k in spot]
+    closes = [float(k[4]) for k in spot]
+    try:
+        buf = await asyncio.to_thread(make_cvd_image, f"{symbol}/USDT", tfv, dates, closes, cvd_spot, cvd_perp)
+    except Exception as e:
+        await interaction.followup.send(f"CVD rendering failed: {e}")
+        return
+    # context numbers
+    fd = await md_funding(pair)
+    od = await md_oi(pair)
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    cb_px = await md_coinbase_price(base)
+    premium_pct = None
+    if cb_px and closes[-1] > 0:
+        premium_pct = (cb_px - closes[-1]) / closes[-1] * 100
+    def _musd(x):
+        return f"{'+' if x >= 0 else '-'}${abs(x)/1e6:.1f}M" if abs(x) < 1e9 else f"{'+' if x >= 0 else '-'}${abs(x)/1e9:.2f}B"
+    d_spot = cvd_spot[-1] - cvd_spot[0]
+    d_perp = (cvd_perp[-1] - cvd_perp[0]) if perp else 0.0
+    px_chg = (closes[-1] - closes[0]) / closes[0] * 100
+    # simple auto-read
+    if px_chg > 0.5 and d_spot > 0 and d_spot >= d_perp:
+        read = "Spot-led move - real buyers, healthier structure."
+    elif px_chg > 0.5 and d_perp > 0 and d_perp > d_spot:
+        read = "Perp-led move - leverage driving, watch funding for crowding."
+    elif px_chg > 0.5 and d_spot < 0 and d_perp < 0:
+        read = "Price up while CVD bleeds - short covering or thin absorption. Fragile."
+    elif px_chg < -0.5 and (d_spot > 0 or d_perp > 0):
+        read = "Price down into positive delta - buyers absorbing, possible accumulation."
+    else:
+        read = "No strong divergence between price and flows right now."
+    lines = [f"**Window ({n} x {tfv}):** price {px_chg:+.2f}% | Spot CVD {_musd(d_spot)} | Perp CVD {_musd(d_perp)}"]
+    ctx = []
+    if od and od.get("oi_then"):
+        oi_chg = (od["oi"] - od["oi_then"]) / od["oi_then"] * 100
+        ctx.append(f"OI 24h {oi_chg:+.2f}%")
+    if fd:
+        ctx.append(f"funding {fd['rate']:+.4f}%")
+    if premium_pct is not None:
+        ctx.append(f"Coinbase premium {premium_pct:+.3f}%")
+    if ctx:
+        lines.append("**Context:** " + " | ".join(ctx))
+    if premium_pct is not None:
+        if premium_pct >= 0.05:
+            read += " Coinbase premium positive - US bid active."
+        elif premium_pct <= -0.05:
+            read += " Coinbase premium negative - US money absent or selling."
+    lines.append(f"**Read:** {read}")
+    f = discord.File(buf, filename=f"{symbol}_cvd_{tfv}.png")
+    await interaction.followup.send(content="\n".join(lines), file=f)
+
+
 @bot.tree.command(name="levels", description="Auto-detected support & resistance levels")
 @app_commands.describe(coin="Coin symbol, e.g. BTC, SOL", timeframe="Timeframe for structure")
 @app_commands.choices(timeframe=[app_commands.Choice(name=k, value=k) for k in ("1H", "4H", "1D")])
@@ -3695,6 +3841,7 @@ def build_help_embed() -> discord.Embed:
             "`/chart` - candlestick chart with EMAs (15m to 1W)\n"
             "`/funding` - perp funding rate + market lean\n"
             "`/oi` - open interest + 24h change\n"
+            "`/cvd` - spot vs perp CVD + OI + funding, who's driving the move\n"
             "`/gainers` / `/losers` - top 5 movers of the day\n"
             "`/heatmap` - 24h market heatmap image\n"
             "`/levels` - auto support & resistance levels\n"
