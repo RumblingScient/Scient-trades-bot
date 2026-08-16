@@ -630,7 +630,7 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     embed.description = "\n".join(lines)
 
     embed.set_author(name=t["analyst_name"], icon_url=t.get("analyst_avatar") or None)
-    embed.set_footer(text=footer_with_edit(t, "Scient Lounge - Trade Setups"))
+    embed.set_footer(text=footer_with_edit(t, "Journal entry, not financial advice · Risk % = portfolio risked · Never risk more than you can afford to lose"))
     if image_url:
         embed.set_image(url=image_url)
     return embed
@@ -679,7 +679,7 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
     embed.description = "\n".join(lines)
 
     embed.set_author(name=p["analyst_name"], icon_url=p.get("analyst_avatar") or None)
-    embed.set_footer(text=footer_with_edit(p, "Scient Lounge - Spot Plays"))
+    embed.set_footer(text=footer_with_edit(p, "Spot journal entry, not financial advice · Never risk more than you can afford to lose"))
     if image_url:
         embed.set_image(url=image_url)
     return embed
