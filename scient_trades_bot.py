@@ -959,7 +959,7 @@ async def watch_cmd(interaction: discord.Interaction, action: app_commands.Choic
         if not coins:
             await interaction.followup.send(f"Give me coins to {act}, e.g. `/watch {act} coins:BTC ETH SOL`", ephemeral=True)
             return
-        syms = [re.sub(r"[^A-Za-z0-9]", "", c).upper() for c in re.split(r"[ ,]+", coins) if c.strip()]
+        syms = [re.sub(r"[^A-Za-z0-9]", "", c).upper() for c in re.split(r"[ ,]+", coins) if c.strip()][:10]
         if act == "add":
             added = []
             for s in syms:
@@ -989,21 +989,21 @@ async def watch_cmd(interaction: discord.Interaction, action: app_commands.Choic
     if not current:
         await interaction.followup.send("Your watchlist is empty. Add coins with `/watch add coins:BTC ETH SOL`.", ephemeral=True)
         return
-    lines = []
-    for s in current:
+    async def _row(s):
         if is_tradfi(s):
             tf = await md_tradfi(s)
             if not tf:
-                continue
+                return None
             arrow = "\U0001F7E2" if tf["chg"] >= 0 else "\U0001F534"
-            lines.append(f"{arrow} **{s}** {tf['price']:,.2f} ({tf['chg']:+.2f}%)")
-            continue
+            return f"{arrow} **{s}** {tf['price']:,.2f} ({tf['chg']:+.2f}%)"
         pair = s if s.endswith("USDT") else f"{s}USDT"
         t = await md_ticker24(pair)
         if not t:
-            continue
+            return None
         arrow = "\U0001F7E2" if t["priceChangePercent"] >= 0 else "\U0001F534"
-        lines.append(f"{arrow} **{s}** ${fnum(t['lastPrice'])} ({t['priceChangePercent']:+.2f}%)")
+        return f"{arrow} **{s}** ${fnum(t['lastPrice'])} ({t['priceChangePercent']:+.2f}%)"
+    results = await asyncio.gather(*[_row(s) for s in current], return_exceptions=True)
+    lines = [r for r in results if isinstance(r, str)]
     embed = discord.Embed(title="Your Watchlist", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines) if lines else "*Couldn't fetch prices right now.*"
     embed.set_footer(text="Scient Lounge - 24h change")
@@ -1054,12 +1054,9 @@ async def alert_check_loop():
     if not alerts:
         return
     # gather unique pairs to price once
-    pairs = {a["pair"] for arr in alerts.values() for a in arr}
-    prices = {}
-    for p in pairs:
-        px = await md_price(p)
-        if px is not None:
-            prices[p] = px
+    pairs = list({a["pair"] for arr in alerts.values() for a in arr})
+    fetched = await asyncio.gather(*[md_price(p) for p in pairs], return_exceptions=True)
+    prices = {p: px for p, px in zip(pairs, fetched) if isinstance(px, (int, float)) and px is not None}
     changed = False
     for uid, arr in list(alerts.items()):
         remaining = []
@@ -4023,6 +4020,45 @@ async def spot_board_cmd(interaction: discord.Interaction):
     await interaction.followup.send("Spot board rebuilt.", ephemeral=True)
 
 
+def build_trades_csv(trades: list, analyst_name: str) -> io.BytesIO:
+    import csv as _csv
+    buf = io.StringIO()
+    w = _csv.writer(buf)
+    w.writerow(["date", "analyst", "pair", "direction", "timeframe", "entry_type",
+                "entry", "entry2", "sl", "risk_pct", "tp1", "tp2", "tp3",
+                "fills", "avg_exit", "result", "result_r", "status", "frameworks", "edited"])
+    for t in trades:
+        fills = "; ".join(f"{f.get('label','')}@{f.get('price','')}x{f.get('pct','')}%" for f in t.get("fills", []) or [])
+        status = "CLOSED" if t.get("closed") else ("BE-set" if t.get("be") else "OPEN")
+        created = t.get("created_at", "") or ""
+        w.writerow([
+            created[:10], analyst_name, t.get("pair", ""), t.get("direction", ""),
+            t.get("timeframe", ""), t.get("entry_type", ""),
+            t.get("entry", ""), t.get("entry2", ""), t.get("sl", ""), t.get("risk", ""),
+            t.get("tp1", ""), t.get("tp2", ""), t.get("tp3", ""),
+            fills, t.get("avg_exit", ""), t.get("result", ""), t.get("result_r", ""),
+            status, " + ".join(t.get("frameworks", []) or []), "yes" if t.get("edited") else "",
+        ])
+    out = io.BytesIO(buf.getvalue().encode("utf-8-sig"))  # BOM so Excel opens it cleanly
+    out.seek(0)
+    return out
+
+
+class StatsCSVView(View):
+    def __init__(self, trades: list, analyst_name: str):
+        super().__init__(timeout=600)
+        self.trades = trades
+        self.analyst_name = analyst_name
+        btn = Button(label="\U0001F4E5 Download CSV", style=discord.ButtonStyle.secondary)
+        btn.callback = self.send_csv
+        self.add_item(btn)
+
+    async def send_csv(self, interaction: discord.Interaction):
+        f = discord.File(build_trades_csv(self.trades, self.analyst_name),
+                         filename=f"{self.analyst_name}_journal.csv")
+        await interaction.response.send_message(file=f, ephemeral=True)
+
+
 @bot.tree.command(name="stats", description="Trade journal scorecard (futures)")
 @app_commands.describe(analyst="Whose stats? (blank = your own)")
 async def stats(interaction: discord.Interaction, analyst: discord.Member = None):
@@ -4061,7 +4097,7 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     embed.add_field(name="Best", value=(f"{best:+g}R" if best is not None else "-"), inline=True)
     embed.add_field(name="Worst", value=(f"{worst:+g}R" if worst is not None else "-"), inline=True)
     embed.set_footer(text="Scient Lounge - Journal")
-    await interaction.followup.send(embed=embed, ephemeral=True)
+    await interaction.followup.send(embed=embed, view=StatsCSVView(mine, target.display_name), ephemeral=True)
 
 
 @bot.tree.command(name="spot_stats", description="Spot plays scorecard")
