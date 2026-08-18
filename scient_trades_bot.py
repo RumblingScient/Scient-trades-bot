@@ -2142,7 +2142,8 @@ async def setup_follow_panel(interaction: discord.Interaction):
     direction="Long or Short",
     entry_type="Market (filled now), Limit single, or Limit DCA (two entries)",
     entry="Entry price (Entry 1 if DCA)",
-    stop_loss="SL price",
+    stop_loss="SL price (the level)",
+    sl_condition="Optional soft SL, e.g. 4H close below - shows as a condition, not a hard stop",
     risk="Account risk (just a number = %, e.g. 1 shows as 1%)",
     entry2="Second DCA entry price (only for Limit DCA)",
     framework="Setup framework (optional)",
@@ -2165,7 +2166,7 @@ async def setup_follow_panel(interaction: discord.Interaction):
         app_commands.Choice(name="Limit - Range/DCA (two entries)", value="DCA"),
     ],
 )
-async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry_type: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, entry2: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
+async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry_type: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, sl_condition: str = None, entry2: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message(f"Only members with the **{ANALYST_ROLE_NAME}** role can post setups.", ephemeral=True)
         return
@@ -2184,6 +2185,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     akey, acfg = resolve_analyst(interaction.user)
     frameworks = [f.value for f in (framework, framework2) if f]
     t = {
+        "sl_condition": (sl_condition or "").strip()[:60] or None,
         "analyst_id": interaction.user.id, "analyst_name": interaction.user.display_name,
         "analyst_avatar": interaction.user.display_avatar.url, "analyst_key": akey,
         "analyst_color": analyst_color_hex(interaction.user),
@@ -2317,10 +2319,12 @@ def _ac_label(t: dict, spot: bool = False) -> str:
     return f"{who} · {side} · {t['pair'].upper()} {tf(t)} - {short_status(t)}"
 
 
-def _ac_sortkey(t: dict, spot: bool = False):
-    # analyst first, then longs before shorts, spot always last
+def _ac_sortkey(t: dict, spot: bool = False, uid: int = 0):
+    # invoker's own trades first, then other analysts alphabetically;
+    # within each analyst: longs, then shorts, spot always last
+    own_rank = 0 if t.get("analyst_id") == uid else 1
     side_rank = 2 if spot else (0 if str(t.get("direction", "")).upper() == "LONG" else 1)
-    return (t.get("analyst_name", "z").lower(), side_rank, t.get("pair", ""))
+    return (own_rank, t.get("analyst_name", "z").lower(), side_rank, t.get("pair", ""))
 
 
 async def open_trades_ac(interaction: discord.Interaction, current: str):
@@ -2334,7 +2338,7 @@ async def open_trades_ac(interaction: discord.Interaction, current: str):
             continue
         label = _ac_label(t)
         if current.lower() in label.lower():
-            rows.append((_ac_sortkey(t), label, mid))
+            rows.append((_ac_sortkey(t, uid=interaction.user.id), label, mid))
     rows.sort(key=lambda r: r[0])
     return [app_commands.Choice(name=lbl[:100], value=mid) for _, lbl, mid in rows[:25]]
 
@@ -2366,7 +2370,7 @@ async def editable_any_ac(interaction: discord.Interaction, current: str):
             continue
         label = _ac_label(t)
         if current.lower() in label.lower():
-            rows.append((_ac_sortkey(t), label, f"f:{mid}"))
+            rows.append((_ac_sortkey(t, uid=interaction.user.id), label, f"f:{mid}"))
     for mid, p in load_spot().items():
         if p.get("closed"):
             continue
@@ -2376,7 +2380,7 @@ async def editable_any_ac(interaction: discord.Interaction, current: str):
             continue
         label = _ac_label(p, spot=True)
         if current.lower() in label.lower():
-            rows.append((_ac_sortkey(p, spot=True), label, f"s:{mid}"))
+            rows.append((_ac_sortkey(p, spot=True, uid=interaction.user.id), label, f"s:{mid}"))
     rows.sort(key=lambda r: r[0])
     return [app_commands.Choice(name=lbl[:100], value=val) for _, lbl, val in rows[:25]]
 
@@ -2551,7 +2555,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     ],
 )
 @app_commands.autocomplete(trade=editable_any_ac)
-async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, stop_loss: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
+async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, stop_loss: str = None, sl_condition: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -2600,6 +2604,10 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
             t["entry2"] = entry2; changes.append("entry 2")
         if stop_loss is not None:
             t["sl"] = stop_loss; changes.append("SL")
+        if sl_condition is not None:
+            cond = sl_condition.strip()[:60]
+            t["sl_condition"] = cond or None
+            changes.append("SL condition" if cond else "SL condition removed")
         if risk is not None:
             t["risk"] = risk; changes.append("risk")
         if entry_type is not None:
@@ -2672,7 +2680,8 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     trade="Pick an open trade",
     event="What happened",
     size_pct="TP/Partial TP only - % of position closed (e.g. 25). Skip for other events",
-    price="Partial TP and Closed only - fill/exit price. Skip for fills and BE",
+    price="Partial TP, Closed, SL Updated - the price. Required on SL Hit if the trade has a soft SL",
+    sl_condition="SL Updated only - new soft condition e.g. 4H close below (empty = hard SL)",
     note="Optional note",
 )
 @app_commands.choices(event=[
@@ -2683,12 +2692,13 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     app_commands.Choice(name="TP3 Hit", value="TP3"),
     app_commands.Choice(name="Partial TP (custom price)", value="PTP"),
     app_commands.Choice(name="SL Moved to Entry (Risk-Free)", value="BE"),
+    app_commands.Choice(name="SL Updated (new level/condition)", value="SLU"),
     app_commands.Choice(name="SL Hit (closes trade)", value="SL"),
     app_commands.Choice(name="Closed (bot calculates result)", value="CLOSE"),
     app_commands.Choice(name="Invalidated (never triggered)", value="CI"),
 ])
 @app_commands.autocomplete(trade=open_trades_ac)
-async def update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str], size_pct: str = None, price: str = None, note: str = None):
+async def update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str], size_pct: str = None, price: str = None, sl_condition: str = None, note: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -2759,6 +2769,16 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
     elif ev == "BE":
         t["be"] = True
         desc = "SL moved to entry - trade is risk-free"
+    elif ev == "SLU":
+        if px is None:
+            await interaction.followup.send("**price is required** - what is the new SL level?", ephemeral=True)
+            return
+        t["sl"] = f"{px:g}"
+        cond = (sl_condition or "").strip()[:60]
+        t["sl_condition"] = cond or None
+        t["be"] = False
+        shown = (cond + " " if cond else "") + f"{px:g}"
+        desc = "SL updated -> " + shown
     elif ev == "SL":
         if t.get("sl_condition") and px is None and not t.get("be"):
             await interaction.followup.send(
