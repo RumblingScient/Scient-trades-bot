@@ -2035,6 +2035,8 @@ async def on_ready():
         tg_move_loop.start()
     if not alert_check_loop.is_running():
         alert_check_loop.start()
+    if not backup_loop.is_running():
+        backup_loop.start()
     if not tg_digest_loop.is_running():
         tg_digest_loop.start()
     if TG_NEWS_CHANNELS and not tg_sources_loop.is_running():
@@ -3642,6 +3644,358 @@ async def cvd_cmd(interaction: discord.Interaction, coin: str, timeframe: app_co
     await interaction.followup.send(content="\n".join(lines), file=f)
 
 
+def make_rvol_image(symbol: str, months: list, rvs: list, current_rv: float) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(12, 5.5), facecolor="#131722")
+    ax.set_facecolor("#131722")
+    ax.grid(color="#1E222D", linewidth=0.5, axis="y")
+    for sp in ax.spines.values():
+        sp.set_color("#2A2E39")
+    ax.tick_params(colors="#B2B5BE", labelsize=8)
+    colors = ["#E8590C" if i == len(rvs) - 1 else "#1C4E80" for i in range(len(rvs))]
+    ax.bar(range(len(rvs)), rvs, color=colors, width=0.8)
+    step = max(1, len(months) // 12)
+    ax.set_xticks(range(0, len(months), step))
+    ax.set_xticklabels([months[i] for i in range(0, len(months), step)], rotation=45, ha="right")
+    ax.set_title(f"{symbol}  |  30d Realized Volatility by Month (annualized)",
+                 color="#EAECEF", fontsize=12, loc="left", pad=10)
+    ax.yaxis.set_major_formatter(lambda x, _: f"{x:.0f}%")
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="rvol", description="Realized volatility regime - is the market compressed or wild?")
+@app_commands.describe(coin="Coin symbol, e.g. BTC")
+async def rvol_cmd(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    import math
+    klines = None
+    try:
+        async with aiohttp.ClientSession() as s:
+            klines = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                                     {"symbol": pair, "interval": "1d", "limit": 1000}, 20)
+    except Exception:
+        pass
+    if not klines or not isinstance(klines, list) or len(klines) < 60:
+        await interaction.followup.send(f"Not enough history for **{symbol}** (needs Binance daily data).")
+        return
+    closes = [float(k[4]) for k in klines]
+    stamps = [int(k[0]) // 1000 for k in klines]
+    rets = []
+    for i in range(1, len(closes)):
+        if closes[i-1] > 0:
+            rets.append(math.log(closes[i] / closes[i-1]))
+        else:
+            rets.append(0.0)
+    def _std(xs):
+        if len(xs) < 2:
+            return 0.0
+        m = sum(xs) / len(xs)
+        return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
+    # rolling 30d RV annualized, then bucket by month (avg)
+    monthly = {}
+    for i in range(30, len(rets) + 1):
+        rv = _std(rets[i-30:i]) * math.sqrt(365) * 100
+        mkey = datetime.fromtimestamp(stamps[i], tz=timezone.utc).strftime("%Y-%m")
+        monthly.setdefault(mkey, []).append(rv)
+    months = sorted(monthly.keys())
+    rvs = [sum(monthly[m]) / len(monthly[m]) for m in months]
+    current_rv = _std(rets[-30:]) * math.sqrt(365) * 100
+    # 1y percentile of current vs daily rolling values
+    recent_series = []
+    for i in range(max(30, len(rets) - 365), len(rets) + 1):
+        recent_series.append(_std(rets[i-30:i]) * math.sqrt(365) * 100)
+    below = sum(1 for x in recent_series if x <= current_rv)
+    pctile = below / len(recent_series) * 100 if recent_series else 50
+    if pctile <= 20:
+        read = "Volatility compressed to the low end of its range - expansion usually follows. Watch for the break."
+    elif pctile >= 80:
+        read = "Elevated volatility - wide stops or smaller size. Mean reversion likely eventually."
+    else:
+        read = "Mid-range volatility - no regime extreme."
+    labels = [m[2:] for m in months]  # YY-MM
+    try:
+        buf = await asyncio.to_thread(make_rvol_image, f"{symbol}/USDT", labels, rvs, current_rv)
+    except Exception as e:
+        await interaction.followup.send(f"Chart render failed: {e}")
+        return
+    content = (f"**{symbol} 30d Realized Vol:** {current_rv:.1f}% - **{pctile:.0f}th percentile** (1yr)\n"
+               f"**Read:** {read}")
+    f = discord.File(buf, filename=f"{symbol}_rvol.png")
+    await interaction.followup.send(content=content, file=f)
+
+
+@bot.tree.command(name="snapshot", description="Full market check for a coin in one command")
+@app_commands.describe(coin="Coin symbol, e.g. BTC")
+async def snapshot_cmd(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    t24, fd, od = await asyncio.gather(md_ticker24(pair), md_funding(pair), md_oi(pair))
+    if not t24:
+        await interaction.followup.send(f"Couldn't find **{symbol}** on Binance or Bybit.")
+        return
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    cb = await md_coinbase_price(base)
+    # quick 24h CVD from 1h klines (Binance only)
+    cvd_line = None
+    try:
+        async with aiohttp.ClientSession() as s:
+            kl_s = await _get_json(s, "https://api.binance.com/api/v3/klines", {"symbol": pair, "interval": "1h", "limit": 24}, 15)
+            kl_p = await _get_json(s, "https://fapi.binance.com/fapi/v1/klines", {"symbol": pair, "interval": "1h", "limit": 24}, 15)
+        def _delta(kl):
+            tot = 0.0
+            for k in kl:
+                tot += 2 * float(k[10]) - float(k[7])
+            return tot
+        if kl_s and isinstance(kl_s, list):
+            ds = _delta(kl_s)
+            dp = _delta(kl_p) if kl_p and isinstance(kl_p, list) else None
+            def _m(x):
+                return f"{'+' if x >= 0 else '-'}${abs(x)/1e6:.0f}M"
+            cvd_line = f"**CVD (24h):** Spot {_m(ds)}" + (f" | Perp {_m(dp)}" if dp is not None else "")
+    except Exception:
+        pass
+    # fear & greed
+    fg_line = None
+    try:
+        async with aiohttp.ClientSession() as s:
+            fg = await _get_json(s, "https://api.alternative.me/fng/", None, 10)
+        v = fg["data"][0]
+        fg_line = f"**Fear & Greed:** {v['value']} ({v['value_classification']})"
+    except Exception:
+        pass
+    arrow = "\U0001F7E2" if t24["priceChangePercent"] >= 0 else "\U0001F534"
+    lines = [f"**Price:** ${fnum(t24['lastPrice'])} {arrow} {t24['priceChangePercent']:+.2f}% (24h)"]
+    ctx = []
+    if fd:
+        lean = "longs paying" if fd["rate"] > 0 else "shorts paying"
+        ctx.append(f"**Funding:** {fd['rate']:+.4f}% - {lean}")
+    if od and od.get("oi_then"):
+        ctx.append(f"**OI 24h:** {(od['oi'] - od['oi_then']) / od['oi_then'] * 100:+.2f}%")
+    if ctx:
+        lines.append(" | ".join(ctx))
+    if cvd_line:
+        lines.append(cvd_line)
+    if cb and t24["lastPrice"] > 0:
+        prem = (cb - t24["lastPrice"]) / t24["lastPrice"] * 100
+        lines.append(f"**Coinbase premium:** {prem:+.3f}%")
+    if fg_line:
+        lines.append(fg_line)
+    embed = discord.Embed(title=f"\U0001F4F8 {symbol} Snapshot", color=NAVY, timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Scient Lounge - morning check, one command")
+    await interaction.followup.send(embed=embed)
+
+
+@tasks.loop(time=dt_time(hour=21, minute=30, tzinfo=timezone.utc))  # 3:00 AM IST
+async def backup_loop():
+    try:
+        import shutil
+        bdir = Path.home() / "bot_backups"
+        bdir.mkdir(exist_ok=True)
+        stamp = datetime.now(IST).strftime("%Y%m%d")
+        ddir = bdir / stamp
+        ddir.mkdir(exist_ok=True)
+        n = 0
+        for f in Path(__file__).parent.glob("*.json"):
+            shutil.copy2(f, ddir / f.name)
+            n += 1
+        # rotate: keep newest 7 daily folders
+        folders = sorted([d for d in bdir.iterdir() if d.is_dir()])
+        for old in folders[:-7]:
+            shutil.rmtree(old, ignore_errors=True)
+        print(f"[backup] {n} files -> {ddir}", flush=True)
+    except Exception as e:
+        print(f"[backup] error: {e}", flush=True)
+
+
+@backup_loop.before_loop
+async def before_backup():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name="whale", description="Large individual trades in the last hour - what are whales doing?")
+@app_commands.describe(coin="Coin symbol, e.g. BTC", min_usd="Minimum trade size in USD (default 500000)")
+async def whale_cmd(interaction: discord.Interaction, coin: str, min_usd: int = 500000):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    min_usd = max(50_000, min(min_usd, 10_000_000))
+    end = int(datetime.now(timezone.utc).timestamp() * 1000)
+    start = end - 3600_000
+    trades = []
+    try:
+        async with aiohttp.ClientSession() as s:
+            cur = start
+            for _ in range(6):  # aggTrades pages, max ~6k trades scanned
+                d = await _get_json(s, "https://api.binance.com/api/v3/aggTrades",
+                                    {"symbol": pair, "startTime": cur, "endTime": end, "limit": 1000}, 15)
+                if not d or not isinstance(d, list):
+                    break
+                trades += d
+                if len(d) < 1000:
+                    break
+                cur = int(d[-1]["T"]) + 1
+    except Exception:
+        pass
+    if not trades:
+        await interaction.followup.send(f"No trade data for **{symbol}** on Binance (whale scan is Binance-only).")
+        return
+    buys = []
+    sells = []
+    for t in trades:
+        try:
+            usd = float(t["p"]) * float(t["q"])
+        except Exception:
+            continue
+        if usd < min_usd:
+            continue
+        # m = True means buyer is maker -> aggressive SELL
+        (sells if t.get("m") else buys).append((usd, float(t["p"])))
+    buy_usd = sum(u for u, _ in buys)
+    sell_usd = sum(u for u, _ in sells)
+    top = sorted(buys + [(-u, p) for u, p in sells], key=lambda x: -abs(x[0]))[:8]
+    lines = [f"**Last 1h, trades >= ${min_usd/1e3:.0f}K:** {len(buys)} buys (${buy_usd/1e6:.1f}M) vs {len(sells)} sells (${sell_usd/1e6:.1f}M)"]
+    if buy_usd + sell_usd > 0:
+        lean = buy_usd / (buy_usd + sell_usd) * 100
+        lines.append(f"**Whale lean:** {lean:.0f}% buy-side")
+    for u, p in top:
+        side = "\U0001F7E2 BUY " if u > 0 else "\U0001F534 SELL"
+        lines.append(f"{side} ${abs(u)/1e6:.2f}M @ ${fnum(p)}")
+    if len(buys) + len(sells) == 0:
+        lines.append(f"*No single trades above ${min_usd/1e3:.0f}K this hour - quiet whales.*")
+    embed = discord.Embed(title=f"\U0001F40B Whale Watch - {symbol}", color=NAVY, timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Scient Lounge - Binance spot aggTrades")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="lsr", description="Long/Short ratio of top traders (Binance futures)")
+@app_commands.describe(coin="Coin symbol, e.g. BTC")
+async def lsr_cmd(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    try:
+        async with aiohttp.ClientSession() as s:
+            acct = await _get_json(s, "https://fapi.binance.com/futures/data/topLongShortAccountRatio",
+                                   {"symbol": pair, "period": "1h", "limit": 25}, 15)
+            pos = await _get_json(s, "https://fapi.binance.com/futures/data/topLongShortPositionRatio",
+                                  {"symbol": pair, "period": "1h", "limit": 25}, 15)
+            glob = await _get_json(s, "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
+                                   {"symbol": pair, "period": "1h", "limit": 2}, 15)
+    except Exception:
+        acct = pos = glob = None
+    if not acct or not isinstance(acct, list):
+        await interaction.followup.send(f"No LSR data for **{symbol}** (Binance futures only).")
+        return
+    def _ratio(d):
+        try:
+            return float(d[-1]["longShortRatio"])
+        except Exception:
+            return None
+    r_acct = _ratio(acct)
+    r_pos = _ratio(pos) if pos and isinstance(pos, list) else None
+    r_glob = _ratio(glob) if glob and isinstance(glob, list) else None
+    chg = ""
+    try:
+        prev = float(acct[0]["longShortRatio"])
+        if prev:
+            chg = f" ({(r_acct - prev) / prev * 100:+.1f}% vs 24h ago)"
+    except Exception:
+        pass
+    lines = []
+    if r_acct is not None:
+        pct_long = r_acct / (1 + r_acct) * 100
+        lines.append(f"**Top traders (accounts):** {r_acct:.2f} - {pct_long:.0f}% long{chg}")
+    if r_pos is not None:
+        lines.append(f"**Top traders (positions):** {r_pos:.2f}")
+    if r_glob is not None:
+        lines.append(f"**All accounts:** {r_glob:.2f}")
+    read = ""
+    if r_acct is not None:
+        if r_acct >= 2.5:
+            read = "Heavily long-crowded - fuel for downside wicks."
+        elif r_acct <= 0.7:
+            read = "Short-crowded - squeeze fuel above."
+        else:
+            read = "Positioning balanced."
+    if read:
+        lines.append(f"**Read:** {read}")
+    embed = discord.Embed(title=f"\u2696\uFE0F Long/Short Ratio - {symbol}", color=NAVY, timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Scient Lounge - Binance futures, 1h data")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="orderbook", description="Bid/ask walls and imbalance - where is the liquidity?")
+@app_commands.describe(coin="Coin symbol, e.g. BTC")
+async def orderbook_cmd(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    try:
+        async with aiohttp.ClientSession() as s:
+            d = await _get_json(s, "https://api.binance.com/api/v3/depth", {"symbol": pair, "limit": 1000}, 15)
+    except Exception:
+        d = None
+    if not d or "bids" not in d:
+        await interaction.followup.send(f"No orderbook data for **{symbol}** (Binance spot only).")
+        return
+    try:
+        best_bid = float(d["bids"][0][0])
+        best_ask = float(d["asks"][0][0])
+        mid = (best_bid + best_ask) / 2
+        spread_pct = (best_ask - best_bid) / mid * 100
+        lo, hi = mid * 0.98, mid * 1.02
+        bids = [(float(p), float(q)) for p, q in d["bids"] if float(p) >= lo]
+        asks = [(float(p), float(q)) for p, q in d["asks"] if float(p) <= hi]
+    except Exception:
+        await interaction.followup.send("Couldn't parse orderbook.")
+        return
+    def _walls(levels, n=3):
+        # cluster into 0.25% buckets and pick the heaviest
+        buckets = {}
+        for p, q in levels:
+            key = round(p / (mid * 0.0025))
+            buckets.setdefault(key, [0.0, 0.0])
+            buckets[key][0] += p * q
+            buckets[key][1] += q
+        top = sorted(buckets.items(), key=lambda kv: -kv[1][0])[:n]
+        out = []
+        for key, (usd, qty) in sorted(top, key=lambda kv: kv[0]):
+            out.append((key * mid * 0.0025, usd))
+        return out
+    bid_usd = sum(p * q for p, q in bids)
+    ask_usd = sum(p * q for p, q in asks)
+    bid_walls = _walls(bids)
+    ask_walls = _walls(asks)
+    lines = [f"**Mid:** ${fnum(mid)} | **Spread:** {spread_pct:.3f}%", ""]
+    lines.append("**Ask walls (+/-2%):**")
+    for p, usd in sorted(ask_walls, key=lambda x: x[0]):
+        lines.append(f"\U0001F534 ${fnum(p)} (${usd/1e6:.1f}M)")
+    lines.append("**Bid walls:**")
+    for p, usd in sorted(bid_walls, key=lambda x: -x[0]):
+        lines.append(f"\U0001F7E2 ${fnum(p)} (${usd/1e6:.1f}M)")
+    if bid_usd + ask_usd > 0:
+        bid_pct = bid_usd / (bid_usd + ask_usd) * 100
+        lines.append("")
+        lines.append(f"**Imbalance (+/-2%):** Bids {bid_pct:.0f}% / Asks {100-bid_pct:.0f}%")
+    embed = discord.Embed(title=f"\U0001F4DA Orderbook - {symbol}", color=NAVY, timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Walls move - context, not gospel · Binance spot")
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="levels", description="Auto-detected support & resistance levels")
 @app_commands.describe(coin="Coin symbol, e.g. BTC, SOL", timeframe="Timeframe for structure")
 @app_commands.choices(timeframe=[app_commands.Choice(name=k, value=k) for k in ("1H", "4H", "1D")])
@@ -3839,6 +4193,11 @@ def build_help_embed() -> discord.Embed:
             "`/funding` - perp funding rate + market lean\n"
             "`/oi` - open interest + 24h change\n"
             "`/cvd` - spot vs perp CVD + OI + funding, who's driving the move\n"
+            "`/snapshot` - full market check in one command\n"
+            "`/orderbook` - bid/ask walls and imbalance\n"
+            "`/whale` - large trades in the last hour\n"
+            "`/lsr` - long/short ratio of top traders\n"
+            "`/rvol` - volatility regime, compressed or wild\n"
             "`/gainers` / `/losers` - top 5 movers of the day\n"
             "`/heatmap` - 24h market heatmap image\n"
             "`/levels` - auto support & resistance levels\n"
