@@ -1576,7 +1576,6 @@ async def post_liquidation(exchange: str, base: str, liq_type: str, notional: fl
     if _liq_rate["count"] >= LIQ_MAX_PER_MIN and notional < LIQ_BIG_USD:
         return  # busy minute - let only the big ones through
     _liq_rate["count"] += 1
-    _liq_hist_append(base, liq_type, notional, price)
     if notional >= 10_000_000:
         size_emoji = "\U0001F4A5\U0001F4A5"
     elif notional >= 5_000_000:
@@ -3774,69 +3773,6 @@ async def agg_cmd(interaction: discord.Interaction, coin: str):
     await interaction.followup.send(embed=embed)
 
 
-LIQ_HISTORY_FILE = Path(__file__).with_name("liq_history.json")
-
-
-def _liq_hist_append(base: str, liq_type: str, notional: float, price: float):
-    try:
-        hist = _load(LIQ_HISTORY_FILE)
-        arr = hist.get("events", [])
-        arr.append({"b": base, "t": liq_type, "n": round(notional), "p": price,
-                    "ts": int(datetime.now(timezone.utc).timestamp())})
-        cutoff = int(datetime.now(timezone.utc).timestamp()) - 7 * 86400
-        arr = [e for e in arr if e["ts"] >= cutoff][-5000:]
-        hist["events"] = arr
-        _save(LIQ_HISTORY_FILE, hist)
-    except Exception as e:
-        print(f"[liq] history save error: {e}", flush=True)
-
-
-@bot.tree.command(name="liqmap", description="Where have liquidations clustered this week? (from our live feed)")
-@app_commands.describe(coin="Coin symbol, e.g. BTC")
-async def liqmap_cmd(interaction: discord.Interaction, coin: str):
-    await interaction.response.defer()
-    base = re.sub(r"[^A-Za-z0-9]", "", coin).upper().replace("USDT", "")
-    hist = _load(LIQ_HISTORY_FILE)
-    events = [e for e in hist.get("events", []) if e.get("b") == base]
-    if len(events) < 5:
-        await interaction.followup.send(
-            f"Not enough **{base}** liquidations recorded yet ({len(events)} so far). "
-            f"The map builds from our live feed - give it a few days of data."
-        )
-        return
-    prices = [e["p"] for e in events]
-    lo, hi = min(prices), max(prices)
-    if hi <= lo:
-        await interaction.followup.send("Price range too narrow to map.")
-        return
-    buckets = 12
-    step = (hi - lo) / buckets
-    agg = {}
-    for e in events:
-        k = min(int((e["p"] - lo) / step), buckets - 1)
-        agg.setdefault(k, [0.0, 0.0])
-        if e["t"] == "Long":
-            agg[k][0] += e["n"]
-        else:
-            agg[k][1] += e["n"]
-    max_v = max(l + s for l, s in agg.values())
-    lines = []
-    for k in sorted(agg.keys(), reverse=True):
-        l_usd, s_usd = agg[k]
-        tot = l_usd + s_usd
-        bar = "\u2588" * max(1, int(tot / max_v * 14))
-        px = lo + (k + 0.5) * step
-        tag = "\U0001F534" if l_usd > s_usd else "\U0001F7E2"
-        lines.append(f"`${fnum(px)}` {tag} {bar} ${tot/1e6:.1f}M")
-    total = sum(e["n"] for e in events)
-    days = max(1, (events[-1]["ts"] - events[0]["ts"]) / 86400)
-    embed = discord.Embed(title=f"\U0001F5FA Liquidation Map - {base} (last {days:.0f}d)", color=NAVY,
-                          timestamp=datetime.now(timezone.utc))
-    embed.description = "\n".join(lines) + f"\n\n**{len(events)} events | ${total/1e6:.0f}M total** \U0001F534 long-heavy \U0001F7E2 short-heavy"
-    embed.set_footer(text="Scient Lounge - real recorded liquidations, not estimates")
-    await interaction.followup.send(embed=embed)
-
-
 @bot.tree.command(name="whale", description="Large individual trades in the last hour - what are whales doing?")
 @app_commands.describe(coin="Coin symbol, e.g. BTC", min_usd="Minimum trade size in USD (default 500000)")
 async def whale_cmd(interaction: discord.Interaction, coin: str, min_usd: int = 500000):
@@ -3952,61 +3888,54 @@ async def lsr_cmd(interaction: discord.Interaction, coin: str):
 
 
 def make_liqzones_image(symbol: str, price: float, zones: list) -> io.BytesIO:
-    """Dense Coinglass-style heatmap. zones: [{price, intensity, side, lev}]
-    We spread each zone's intensity into a fine price grid with a gaussian bloom,
-    so the result reads as a continuous heat column instead of a few thin bars."""
+    """Clean two-sided liquidation chart: long-liq clusters below price (red),
+    short-liq clusters above price (green). Bar length = estimated intensity."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import numpy as np
-    from matplotlib.colors import LinearSegmentedColormap
 
-    lo = price * 0.68
-    hi = price * 1.32
-    N = 600
-    grid = np.linspace(lo, hi, N)
-    heat = np.zeros(N)
-    for z in zones:
-        if not (lo <= z["price"] <= hi):
-            continue
-        sigma = price * 0.006  # bloom width
-        heat += z["intensity"] * np.exp(-((grid - z["price"]) ** 2) / (2 * sigma ** 2))
-    if heat.max() > 0:
-        heat /= heat.max()
+    longs = sorted([z for z in zones if z["side"] == "long"], key=lambda z: z["price"])
+    shorts = sorted([z for z in zones if z["side"] == "short"], key=lambda z: z["price"])
 
-    cmap = LinearSegmentedColormap.from_list(
-        "liq", ["#0e1015", "#161447", "#3b1f8f", "#7b2ea8", "#d13b6e", "#f5a11b", "#ffe066"])
+    fig, ax = plt.subplots(figsize=(11, 7.5), facecolor="#131722")
+    ax.set_facecolor("#131722")
 
-    fig, ax = plt.subplots(figsize=(12, 7), facecolor="#0b0d12")
-    ax.set_facecolor("#0b0d12")
-    # render as a 2D image column (heat repeated across x) for a smooth glow
-    img = np.tile(heat.reshape(-1, 1), (1, 60))
-    ax.imshow(img, aspect="auto", origin="lower", cmap=cmap,
-              extent=[0, 1, lo, hi], vmin=0, vmax=1, interpolation="bilinear")
+    bar_h = price * 0.006
+    for z in longs:
+        ax.barh(z["price"], -z["intensity"], height=bar_h, color="#E5484D", alpha=0.92,
+                edgecolor="#ff6b6f", linewidth=0.5)
+        dist = (z["price"] - price) / price * 100
+        ax.text(-z["intensity"] - 0.03, z["price"], f"{z['lev']}x  {dist:+.1f}%",
+                color="#ff8f92", fontsize=8.5, va="center", ha="right")
+    for z in shorts:
+        ax.barh(z["price"], z["intensity"], height=bar_h, color="#30A46C", alpha=0.92,
+                edgecolor="#4fd18b", linewidth=0.5)
+        dist = (z["price"] - price) / price * 100
+        ax.text(z["intensity"] + 0.03, z["price"], f"{z['lev']}x  {dist:+.1f}%",
+                color="#5fe0a0", fontsize=8.5, va="center", ha="left")
 
-    ax.axhline(price, color="#FFFFFF", linewidth=1.3)
-    ax.text(1.01, price, f" ${fnum(price)}", color="#FFFFFF", fontsize=9, va="center", ha="left",
-            transform=ax.get_yaxis_transform())
+    ax.axhline(price, color="#EAECEF", linewidth=1.4)
+    ax.text(0, price, f"  ${fnum(price)}  ", color="#131722", fontsize=9.5, fontweight="bold",
+            va="center", ha="center", bbox=dict(boxstyle="round,pad=0.3", fc="#EAECEF", ec="none"))
 
-    # mark the heaviest zones on the side
-    for z in sorted(zones, key=lambda z: -z["intensity"])[:4]:
-        if lo <= z["price"] <= hi:
-            dist = (z["price"] - price) / price * 100
-            ax.text(1.01, z["price"], f" {z['lev']}x {z['side']}  {dist:+.0f}%",
-                    color="#ffe066", fontsize=8, va="center", ha="left",
-                    transform=ax.get_yaxis_transform())
+    ax.set_xlim(-1.35, 1.35)
+    ax.axvline(0, color="#2A2E39", linewidth=0.8)
+    ax.text(-0.7, ax.get_ylim()[1], "LONG liquidations \u25BC", color="#E5484D",
+            fontsize=10, ha="center", va="bottom", fontweight="bold")
+    ax.text(0.7, ax.get_ylim()[1], "\u25B2 SHORT liquidations", color="#30A46C",
+            fontsize=10, ha="center", va="bottom", fontweight="bold")
 
-    ax.set_title(f"{symbol}   Liquidation Heatmap  (estimated intensity)",
-                 color="#EAECEF", fontsize=13, loc="left", pad=12)
+    ax.set_title(f"{symbol}   Estimated Liquidation Zones", color="#EAECEF", fontsize=13, loc="left", pad=24)
     ax.set_xticks([])
-    ax.set_xlim(0, 1)
-    ax.tick_params(colors="#8A8F9C", labelsize=8)
+    ax.tick_params(colors="#B2B5BE", labelsize=8)
     ax.yaxis.set_major_formatter(lambda x, _: f"${fnum(x)}")
+    ax.grid(color="#1E222D", linewidth=0.5, axis="y")
     for sp in ax.spines.values():
         sp.set_color("#20242E")
     plt.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, dpi=130, facecolor="#0b0d12", bbox_inches="tight")
+    fig.savefig(buf, dpi=130, facecolor="#131722", bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -4050,24 +3979,32 @@ async def liqzones_cmd(interaction: discord.Interaction, coin: str):
         w = TIER_WEIGHT[lev]
         zones.append({"price": long_liq, "side": "long", "lev": lev, "raw": w * long_share})
         zones.append({"price": short_liq, "side": "short", "lev": lev, "raw": w * short_share})
+    # drop zones hugging the price (within 1.5%) - they clutter the center and aren't actionable
+    zones = [z for z in zones if abs(z["price"] - price) / price >= 0.015]
+    if not zones:
+        await interaction.followup.send("Not enough separation to map liquidation zones right now.")
+        return
     max_raw = max(z["raw"] for z in zones)
     for z in zones:
-        z["intensity"] = max(0.12, z["raw"] / max_raw)
+        z["intensity"] = max(0.15, z["raw"] / max_raw)
     try:
         buf = await asyncio.to_thread(make_liqzones_image, f"{base}/USDT", price, zones)
     except Exception as e:
         await interaction.followup.send(f"Heatmap render failed: {e}")
         return
-    # magnet zones summary
-    top = sorted(zones, key=lambda z: -z["intensity"])[:3]
+    top_long = sorted([z for z in zones if z["side"] == "long"], key=lambda z: -z["intensity"])[:2]
+    top_short = sorted([z for z in zones if z["side"] == "short"], key=lambda z: -z["intensity"])[:2]
     lines = [f"**Price:** ${fnum(price)}" + (f" | **OI:** ${oi_usd/1e9:.2f}B" if oi_usd else "")]
     lines.append(f"**Positioning:** {long_share*100:.0f}% long / {short_share*100:.0f}% short")
-    lines.append("**Magnet zones (heaviest estimated liquidations):**")
-    for z in top:
+    lines.append("**\U0001F53B Long liquidations below** (downside magnets):")
+    for z in top_long:
         dist = (z["price"] - price) / price * 100
-        arrow = "\U0001F53A" if z["side"] == "short" else "\U0001F53B"
-        lines.append(f"{arrow} ${fnum(z['price'])} ({dist:+.1f}%) - {z['lev']}x {z['side']}s")
-    lines.append("*Modeled from OI + positioning, not exchange-confirmed. Relative intensity, not absolute. Best on BTC/ETH.*")
+        lines.append(f"   ${fnum(z['price'])} ({dist:+.1f}%) - {z['lev']}x")
+    lines.append("**\U0001F53A Short liquidations above** (upside magnets):")
+    for z in top_short:
+        dist = (z["price"] - price) / price * 100
+        lines.append(f"   ${fnum(z['price'])} ({dist:+.1f}%) - {z['lev']}x")
+    lines.append("*Estimated from OI + positioning, not exchange-confirmed. Best on BTC/ETH.*")
     f = discord.File(buf, filename=f"{base}_liqzones.png")
     await interaction.followup.send(content="\n".join(lines), file=f)
 
@@ -4252,7 +4189,6 @@ def build_help_embed() -> discord.Embed:
             "`/lsr` - long/short ratio of top traders\n"
             "`/whale` - large trades in the last hour\n"
             "`/liqzones` - estimated liquidation heatmap (magnet zones)\n"
-            "`/liqmap` - where liquidations clustered this week"
         ),
         inline=False,
     )
