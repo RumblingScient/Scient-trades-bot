@@ -597,7 +597,7 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     type_label = "Market" if t.get("entry_type") == "MARKET" else "Limit"
     line1 = (
         f"**Entry ({type_label}):** {entry_display(t)}"
-        f" | **SL:** {t['sl']}{sl_mark}"
+        f" | **SL:** {(t.get('sl_condition') + ' ' ) if t.get('sl_condition') else ''}{t['sl']}{sl_mark}"
         f" | **Risk:** {fmt_risk(t.get('risk')) or '-'}"
         f" | **R:R:** {display_rr(t) or '-'}"
     )
@@ -2308,19 +2308,35 @@ async def spot(interaction: discord.Interaction, pair: str, dca_zone: str, targe
     await interaction.followup.send(f"Spot play posted in {channel.mention} ({msg.jump_url})", ephemeral=True)
 
 
+def _ac_label(t: dict, spot: bool = False) -> str:
+    """Grouped autocomplete label: analyst · side · pair - status."""
+    who = t.get("analyst_name", "?")
+    if spot:
+        return f"{who} · \U0001F48E SPOT · {t['pair'].upper()} - {spot_status_line(t)}"
+    side = "\U0001F7E2 LONG" if str(t.get("direction", "")).upper() == "LONG" else "\U0001F534 SHORT"
+    return f"{who} · {side} · {t['pair'].upper()} {tf(t)} - {short_status(t)}"
+
+
+def _ac_sortkey(t: dict, spot: bool = False):
+    # analyst first, then longs before shorts, spot always last
+    side_rank = 2 if spot else (0 if str(t.get("direction", "")).upper() == "LONG" else 1)
+    return (t.get("analyst_name", "z").lower(), side_rank, t.get("pair", ""))
+
+
 async def open_trades_ac(interaction: discord.Interaction, current: str):
     data = load_trades()
     is_admin = interaction.user.guild_permissions.administrator
-    out = []
+    rows = []
     for mid, t in data.items():
         if t.get("closed"):
             continue
         if not is_admin and t.get("analyst_id") != interaction.user.id:
             continue
-        label = f"{t['pair'].upper()} {t['direction']} {tf(t)} - {short_status(t)}"
+        label = _ac_label(t)
         if current.lower() in label.lower():
-            out.append(app_commands.Choice(name=label[:100], value=mid))
-    return out[:25]
+            rows.append((_ac_sortkey(t), label, mid))
+    rows.sort(key=lambda r: r[0])
+    return [app_commands.Choice(name=lbl[:100], value=mid) for _, lbl, mid in rows[:25]]
 
 
 async def open_spot_ac(interaction: discord.Interaction, current: str):
@@ -2340,7 +2356,7 @@ async def open_spot_ac(interaction: discord.Interaction, current: str):
 
 async def editable_any_ac(interaction: discord.Interaction, current: str):
     is_admin = interaction.user.guild_permissions.administrator
-    out = []
+    rows = []
     for mid, t in load_trades().items():
         if t.get("closed"):
             continue
@@ -2348,9 +2364,9 @@ async def editable_any_ac(interaction: discord.Interaction, current: str):
             continue
         if not is_admin and not within_edit_window(t):
             continue
-        label = f"{t['pair'].upper()} {t['direction']} {tf(t)} - {short_status(t)}"
+        label = _ac_label(t)
         if current.lower() in label.lower():
-            out.append(app_commands.Choice(name=label[:100], value=f"f:{mid}"))
+            rows.append((_ac_sortkey(t), label, f"f:{mid}"))
     for mid, p in load_spot().items():
         if p.get("closed"):
             continue
@@ -2358,10 +2374,11 @@ async def editable_any_ac(interaction: discord.Interaction, current: str):
             continue
         if not is_admin and not within_edit_window(p):
             continue
-        label = f"{p['pair'].upper()} SPOT - {spot_status_line(p)}"
+        label = _ac_label(p, spot=True)
         if current.lower() in label.lower():
-            out.append(app_commands.Choice(name=label[:100], value=f"s:{mid}"))
-    return out[:25]
+            rows.append((_ac_sortkey(p, spot=True), label, f"s:{mid}"))
+    rows.sort(key=lambda r: r[0])
+    return [app_commands.Choice(name=lbl[:100], value=val) for _, lbl, val in rows[:25]]
 
 
 async def refresh_and_edit(t: dict, spot_mode: bool = False):
@@ -2743,6 +2760,13 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         t["be"] = True
         desc = "SL moved to entry - trade is risk-free"
     elif ev == "SL":
+        if t.get("sl_condition") and px is None and not t.get("be"):
+            await interaction.followup.send(
+                f"This trade has a **soft SL** ({t['sl_condition']} {t['sl']}). "
+                f"**price is required** - at what exact price did it close?",
+                ephemeral=True,
+            )
+            return
         exit_px = px if px is not None else (entry_num(t) if t.get("be") else sl_num(t))
         if exit_px is None:
             await interaction.followup.send("Couldn't read the SL price - pass `price` with this update.", ephemeral=True)
