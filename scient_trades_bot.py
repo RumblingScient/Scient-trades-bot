@@ -1550,6 +1550,7 @@ async def post_liquidation(exchange: str, base: str, liq_type: str, notional: fl
     if _liq_rate["count"] >= LIQ_MAX_PER_MIN and notional < LIQ_BIG_USD:
         return  # busy minute - let only the big ones through
     _liq_rate["count"] += 1
+    _liq_hist_append(base, liq_type, notional, price)
     if notional >= 10_000_000:
         size_emoji = "\U0001F4A5\U0001F4A5"
     elif notional >= 5_000_000:
@@ -2042,19 +2043,6 @@ async def on_ready():
     if TG_NEWS_CHANNELS and not tg_sources_loop.is_running():
         tg_sources_loop.start()
     print(f"Logged in as {bot.user} - commands synced.")
-
-
-@bot.tree.command(name="tg_test", description="(Admin) Send a test message to the Scient Club Telegram")
-async def tg_test(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Admins only.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    if not TELEGRAM_BOT_TOKEN:
-        await interaction.followup.send("TELEGRAM_BOT_TOKEN not set in .env on the VPS.", ephemeral=True)
-        return
-    ok = await tg_send("\u2705 <b>Quant connected.</b> Scient Club wire is live.")
-    await interaction.followup.send("Test sent to Telegram - check @scientclub." if ok else "Send failed - check bot is admin of the channel and token is correct (see journalctl for [tg] errors).", ephemeral=True)
 
 
 @bot.tree.command(name="tg_digest", description="(Admin) Send the daily news digest to Telegram now")
@@ -3209,222 +3197,6 @@ async def losers(interaction: discord.Interaction):
     await _movers(interaction, top=False)
 
 
-@bot.tree.command(name="convert", description="Convert coin amount to USD (or USD to coin)")
-@app_commands.describe(amount="Amount, e.g. 0.5 or 1500", coin="Coin symbol, e.g. BTC", to_coin="Convert USD amount INTO this coin instead")
-@app_commands.choices(to_coin=[app_commands.Choice(name="Yes - amount is USD, show me coin quantity", value="yes")])
-async def convert(interaction: discord.Interaction, amount: str, coin: str, to_coin: app_commands.Choice[str] = None):
-    await interaction.response.defer()
-    amt = parse_num(amount)
-    if not amt or amt <= 0:
-        await interaction.followup.send("Amount must be a positive number.")
-        return
-    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
-    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
-    price = await md_price(pair)
-    if not price:
-        await interaction.followup.send(f"Couldn't find **{symbol}** on Binance or Bybit.")
-        return
-    base = symbol[:-4] if symbol.endswith("USDT") else symbol
-    if to_coin:
-        qty = amt / price
-        line = f"**${amt:,.2f}** = **{fnum(qty)} {base}** @ ${fnum(price)}"
-    else:
-        usd = amt * price
-        line = f"**{fnum(amt)} {base}** = **${usd:,.2f}** @ ${fnum(price)}"
-    embed = discord.Embed(title="Converter", color=NAVY, description=line)
-    embed.set_footer(text="Scient Lounge - Binance spot")
-    await interaction.followup.send(embed=embed)
-
-
-QUIZ_BANK = [
-    {"q": "In the AMD cycle, what phase comes right after Accumulation?", "opts": ["Distribution", "Manipulation", "Markup", "Re-accumulation"], "a": 1},
-    {"q": "On a Fixed Range Volume Profile, the POC is...", "opts": ["The highest price in the range", "The price with the most traded volume", "The midpoint of the range", "The lowest volume node"], "a": 1},
-    {"q": "A sweep of the range low followed by a fast reclaim usually sets up...", "opts": ["A short", "A long", "Nothing - it's random", "A breakout short"], "a": 1},
-    {"q": "BOS (Break of Structure) in an uptrend signals...", "opts": ["Trend reversal", "Trend continuation", "Ranging market", "Low liquidity"], "a": 1},
-    {"q": "Bearish RSI divergence means...", "opts": ["Price makes higher high, RSI makes lower high", "Price and RSI both make higher highs", "Price makes lower low, RSI makes higher low", "RSI crosses above 70"], "a": 0},
-    {"q": "A Wyckoff spring typically appears in which phase?", "opts": ["Distribution", "Markup", "Accumulation", "Markdown"], "a": 2},
-    {"q": "Your position size should be calculated from...", "opts": ["Gut feeling and leverage", "Account risk % and SL distance", "How confident you are", "The max your margin allows"], "a": 1},
-    {"q": "A three drives pattern into a level with RSI divergence usually signals...", "opts": ["Continuation", "Exhaustion / potential reversal", "Increased volatility only", "Nothing tradeable"], "a": 1},
-    {"q": "Positive funding rate means...", "opts": ["Shorts pay longs", "Longs pay shorts", "Exchange pays traders", "Volume is increasing"], "a": 1},
-    {"q": "Moving your SL to entry makes the trade...", "opts": ["More profitable", "Risk-free", "Higher R:R", "Invalid"], "a": 1},
-    {"q": "VAH and VAL are the boundaries of...", "opts": ["The full range", "The value area (~70% of volume)", "The weekly candle", "The liquidation zone"], "a": 1},
-    {"q": "Equal highs (EQH) on a chart usually sit right below...", "opts": ["Support", "Resting liquidity", "The POC", "A fair value gap"], "a": 1},
-    {"q": "MSS (Market Structure Shift) differs from BOS because it signals...", "opts": ["Continuation", "A potential reversal", "Higher volume", "A new range"], "a": 1},
-    {"q": "A Fair Value Gap (FVG) is...", "opts": ["A gap between exchanges", "An imbalance where price moved too fast to fill orders", "The spread between bid and ask", "A weekend CME gap only"], "a": 1},
-    {"q": "In Wyckoff, a UTAD (Upthrust After Distribution) is...", "opts": ["A bullish breakout", "A failed push above the range before markdown", "An accumulation event", "A volume spike at support"], "a": 1},
-    {"q": "If your risk is 1% and your SL is 4% away, your position size is...", "opts": ["4x your account", "25% of your account", "1% of your account", "You can't calculate it"], "a": 1},
-    {"q": "A trade with 40% win rate and 3R average winner is...", "opts": ["A losing system", "Breakeven at best", "A profitable system", "Impossible to judge"], "a": 2},
-    {"q": "A deviation below the range low that closes back inside is often...", "opts": ["Confirmation of breakdown", "A long trigger (sweep + reclaim)", "A short trigger", "Meaningless noise"], "a": 1},
-    {"q": "The 'M' in AMD stands for...", "opts": ["Markup", "Momentum", "Manipulation", "Margin"], "a": 2},
-    {"q": "High Volume Nodes (HVN) on a volume profile act as...", "opts": ["Magnets that repel price", "Areas price moves through quickly", "Areas of acceptance where price tends to slow down", "Guaranteed reversal zones"], "a": 2},
-    {"q": "Low Volume Nodes (LVN) tend to...", "opts": ["Hold price for weeks", "Let price move through quickly", "Mark the POC", "Only appear on weekly charts"], "a": 1},
-    {"q": "A CHoCH (Change of Character) is...", "opts": ["The first sign structure may be reversing", "A confirmed trend continuation", "A type of candlestick", "An exchange listing event"], "a": 0},
-    {"q": "An order block in ICT terms is...", "opts": ["A large limit order on the book", "The last opposing candle before a strong impulsive move", "A blocked exchange account", "The daily open"], "a": 1},
-    {"q": "Liquidity in trading usually rests...", "opts": ["At round numbers only", "Above equal highs and below equal lows", "At the POC", "In low volume nodes"], "a": 1},
-    {"q": "Revenge trading after a loss usually leads to...", "opts": ["Faster recovery", "Bigger losses from emotional decisions", "Better focus", "Higher win rate"], "a": 1},
-    {"q": "If price breaks the range high and immediately reverses back inside, it's called...", "opts": ["A clean breakout", "A deviation / fakeout", "A BOS", "An FVG"], "a": 1},
-    {"q": "The safest general place for a stop loss is...", "opts": ["A fixed 2% from entry always", "Beyond the level that invalidates your idea", "At the round number", "As tight as possible"], "a": 1},
-    {"q": "OI rising while price rises usually means...", "opts": ["Shorts covering", "New money entering the trend", "The trend is ending", "Low liquidity"], "a": 1},
-    {"q": "OI falling while price rises usually means...", "opts": ["New longs opening", "Short covering driving the move", "Distribution", "Nothing"], "a": 1},
-    {"q": "Wyckoff's 'Sign of Strength' (SOS) appears...", "opts": ["During markdown", "After the spring, breaking out of accumulation", "At the UTAD", "Only on weekly charts"], "a": 1},
-    {"q": "Trading a smaller size after a losing streak is an example of...", "opts": ["Fear-based trading", "Sound risk management", "Revenge trading", "Overtrading"], "a": 1},
-    {"q": "A 'premium' zone in ICT terms is...", "opts": ["Below the 50% of the range - discount", "Above the 50% of the range - where shorts are favored", "The POC", "The weekly open"], "a": 1},
-    {"q": "Buying in the 'discount' zone of a range means buying...", "opts": ["Above the midpoint", "Below the midpoint (equilibrium)", "At resistance", "At the high"], "a": 1},
-    {"q": "The main purpose of a trading journal is...", "opts": ["Bragging rights", "Finding and fixing patterns in your own behavior", "Tax reporting", "Copying other traders"], "a": 1},
-    {"q": "If BTC dominance is rising during a market dip, alts usually...", "opts": ["Outperform BTC", "Bleed harder than BTC", "Stay flat", "Pump"], "a": 1},
-    {"q": "A doji candle at a key level after a long trend suggests...", "opts": ["Strong continuation", "Indecision - possible exhaustion", "Guaranteed reversal", "Low volume only"], "a": 1},
-    {"q": "Risk:Reward of 1:3 means...", "opts": ["You risk 3 to make 1", "You risk 1 to make 3", "You need 3 wins to break even", "3% account risk"], "a": 1},
-    {"q": "The 'spring' in Wyckoff accumulation is designed to...", "opts": ["Confirm the breakdown", "Grab liquidity below support before markup", "Mark the top", "Fill the FVG"], "a": 1},
-    {"q": "Averaging into a loser WITHOUT a plan is called...", "opts": ["DCA strategy", "Martingale / hope trading", "Scaling in", "Hedging"], "a": 1},
-    {"q": "The best time to size up your risk per trade is...", "opts": ["During a losing streak to recover", "After proving consistency over many trades", "When you feel confident", "When leverage is cheap"], "a": 1},
-    {"q": "A green (bullish) candle means...", "opts": ["Price closed below its open", "Price closed above its open", "Volume was high", "Buyers are guaranteed to win next candle"], "a": 1},
-    {"q": "The wick (shadow) of a candle shows...", "opts": ["The open and close", "The highest and lowest prices reached", "The volume traded", "The funding rate"], "a": 1},
-    {"q": "Support is a zone where...", "opts": ["Price tends to find sellers", "Price tends to find buyers", "Volume is always low", "The trend must reverse"], "a": 1},
-    {"q": "Resistance is a zone where...", "opts": ["Price tends to find buyers", "Price tends to find sellers", "Liquidations happen", "The chart ends"], "a": 1},
-    {"q": "When strong support finally breaks, it often...", "opts": ["Becomes resistance", "Disappears forever", "Becomes the new POC", "Doubles in strength"], "a": 0},
-    {"q": "An uptrend is defined by...", "opts": ["Higher highs and higher lows", "Lower highs and lower lows", "Equal highs", "High volume only"], "a": 0},
-    {"q": "A market order...", "opts": ["Waits at your chosen price", "Executes immediately at the best available price", "Never pays fees", "Can't be filled in a fast market"], "a": 1},
-    {"q": "A limit order...", "opts": ["Executes immediately", "Rests at your chosen price until filled", "Guarantees a fill", "Only works on spot"], "a": 1},
-    {"q": "10x leverage on a position means...", "opts": ["Profits only are multiplied by 10", "Both profits AND losses move 10x faster", "Your risk stays the same", "You can't get liquidated"], "a": 1},
-    {"q": "Liquidation happens when...", "opts": ["You close a trade in profit", "Your margin can no longer cover the position's loss", "The exchange goes offline", "Funding turns negative"], "a": 1},
-    {"q": "The main difference between spot and futures is...", "opts": ["Spot has more leverage", "In spot you own the asset; futures are contracts", "Futures can't be shorted", "Spot has funding fees"], "a": 1},
-    {"q": "'Shorting' means...", "opts": ["Buying and holding", "Profiting when price goes down", "Trading small size", "Selling only at a loss"], "a": 1},
-    {"q": "Market cap of a coin is...", "opts": ["Its price", "Price multiplied by circulating supply", "Total volume traded", "The exchange's valuation"], "a": 1},
-    {"q": "A coin at $0.10 is cheaper than a coin at $100...", "opts": ["Always true", "Not necessarily - market cap matters, not unit price", "True if volume is high", "True only for memecoins"], "a": 1},
-    {"q": "High trading volume on a breakout usually means...", "opts": ["The breakout is more likely to be real", "The breakout will fail", "Nothing", "Fees will be higher"], "a": 0},
-    {"q": "A higher timeframe (like 1D or 1W) generally gives...", "opts": ["More noise", "More reliable levels than lower timeframes", "Faster signals", "Worse data"], "a": 1},
-    {"q": "FOMO (fear of missing out) usually makes traders...", "opts": ["Enter early with a plan", "Buy late into extended moves without a plan", "Reduce their size", "Wait for confirmation"], "a": 1},
-    {"q": "A stablecoin like USDT is designed to...", "opts": ["Grow 10% a year", "Stay pegged to $1", "Track Bitcoin's price", "Pay staking rewards always"], "a": 1},
-    {"q": "If you risk $100 to potentially make $300, your R:R is...", "opts": ["1:3", "3:1", "1:1", "0.3"], "a": 0},
-    {"q": "'DYOR' stands for...", "opts": ["Daily yield on returns", "Do your own research", "Don't yield on resistance", "Dollar yearly output rate"], "a": 1},
-    {"q": "A moving average smooths out...", "opts": ["Volume", "Price data over a set number of candles", "Funding rates", "Order book depth"], "a": 1},
-    {"q": "Price trading above a rising 200 EMA generally suggests...", "opts": ["A downtrend", "A long-term uptrend context", "A range", "Nothing at all"], "a": 1},
-    {"q": "'Buy the rumor, sell the news' refers to...", "opts": ["Buying after news drops", "Price often running up before an event and dumping on it", "Only trading news coins", "Avoiding all news"], "a": 1},
-    {"q": "Slippage is...", "opts": ["A type of chart pattern", "The difference between expected and actual fill price", "An exchange fee", "A stop loss error"], "a": 1},
-    {"q": "The order book shows...", "opts": ["Past trades only", "Resting buy and sell limit orders", "Liquidation levels", "Whale wallets"], "a": 1},
-    {"q": "Dollar-cost averaging (DCA) means...", "opts": ["Going all-in at one price", "Buying in planned portions over time or a price zone", "Doubling down on losers randomly", "Only buying dips"], "a": 1},
-    {"q": "Keeping most long-term holdings in self-custody protects you from...", "opts": ["Price drops", "Exchange failures and hacks", "Taxes", "Funding fees"], "a": 1},
-    {"q": "Overtrading usually results in...", "opts": ["More profit from more chances", "Fees and emotional mistakes eating your edge", "Better discipline", "Faster learning only"], "a": 1},
-    {"q": "A trading plan should be written...", "opts": ["After the trade closes", "Before entering the trade", "Only for big positions", "Never - stay flexible"], "a": 1},
-    {"q": "If a trade setup invalidates before entry, the correct move is...", "opts": ["Enter anyway at a worse price", "Skip it - no setup, no trade", "Double the size", "Flip direction randomly"], "a": 1},
-    {"q": "Paper trading is...", "opts": ["Trading with fake money to practice", "Trading paper industry stocks", "A scam", "Only for beginners with no value"], "a": 0},
-    {"q": "Portfolio diversification helps because...", "opts": ["Every coin pumps together", "It reduces the damage any single asset can do", "It guarantees profit", "Exchanges require it"], "a": 1},
-    {"q": "ATH stands for...", "opts": ["Average trading hours", "All-time high", "Automated trade handler", "Above the high"], "a": 1},
-    {"q": "A 50% loss on your account requires what gain to recover?", "opts": ["50%", "75%", "100%", "25%"], "a": 2},
-]
-
-
-def _quiz_pick(used: set = None):
-    import random as _r
-    if used is None:
-        used = set()
-    pool = [i for i in range(len(QUIZ_BANK)) if i not in used]
-    if not pool:
-        used.clear()
-        pool = list(range(len(QUIZ_BANK)))
-    idx = _r.choice(pool)
-    used.add(idx)
-    return QUIZ_BANK[idx], used
-
-
-def _quiz_embed(q, score=None, answered=None):
-    desc = f"**{q['q']}**"
-    if score is not None:
-        desc += f"\n\n*Streak score: {score}/{answered} this session*"
-    embed = discord.Embed(title="\U0001F9E0 TA Quiz", description=desc, color=NAVY)
-    embed.set_footer(text="Scient Lounge - setups, not signals")
-    return embed
-
-
-def _result_embed(correct: bool, right_letter: str, score: int, answered: int):
-    if correct:
-        title = "\u2705 Correct! Nice read."
-        color = GREEN
-    else:
-        title = f"\u274C Not quite - the answer was {right_letter}."
-        color = RED
-    embed = discord.Embed(title=title, description=f"*Score: {score}/{answered} this session*", color=color)
-    embed.set_footer(text="Scient Lounge - keep going")
-    return embed
-
-
-class QuizNextView(View):
-    def __init__(self, score: int, answered: int, used: set = None):
-        super().__init__(timeout=3600)
-        self.score = score
-        self.answered = answered
-        self.used = used if used is not None else set()
-        btn = Button(label="Next question \u25B6", style=discord.ButtonStyle.primary)
-        btn.callback = self.next_q
-        self.add_item(btn)
-
-    async def next_q(self, interaction: discord.Interaction):
-        q, used = _quiz_pick(self.used)
-        await interaction.response.edit_message(embed=_quiz_embed(q, self.score, self.answered), view=QuizSessionView(q, self.score, self.answered, used))
-
-
-class QuizSessionView(View):
-    def __init__(self, q: dict, score: int, answered: int, used: set = None):
-        super().__init__(timeout=3600)
-        self.q = q
-        self.score = score
-        self.answered = answered
-        self.used = used if used is not None else set()
-        for i, opt in enumerate(q["opts"]):
-            self.add_item(QuizSessionButton(i, opt, self))
-
-
-class QuizSessionButton(Button):
-    def __init__(self, idx: int, label: str, sview: "QuizSessionView"):
-        super().__init__(label=f"{chr(65 + idx)}. {label}"[:80], style=discord.ButtonStyle.secondary)
-        self.idx = idx
-        self.sview = sview
-
-    async def callback(self, interaction: discord.Interaction):
-        correct = self.idx == self.sview.q["a"]
-        score = self.sview.score + (1 if correct else 0)
-        answered = self.sview.answered + 1
-        right = chr(65 + self.sview.q["a"])
-        await interaction.response.edit_message(embed=_result_embed(correct, right, score, answered), view=QuizNextView(score, answered, self.sview.used))
-
-
-class QuizView(View):
-    def __init__(self, q: dict, message=None):
-        super().__init__(timeout=3600)
-        self.q = q
-        self.correct = q["a"]
-        self.answered = set()
-        self.message = message
-        for i, opt in enumerate(q["opts"]):
-            self.add_item(QuizButton(i, opt, self))
-
-    async def on_timeout(self):
-        for item in self.children:
-            item.disabled = True
-        if self.message:
-            try:
-                await self.message.edit(view=self)
-            except Exception:
-                pass
-
-
-class QuizButton(Button):
-    def __init__(self, idx: int, label: str, qview: "QuizView"):
-        super().__init__(label=f"{chr(65 + idx)}. {label}"[:80], style=discord.ButtonStyle.secondary)
-        self.idx = idx
-        self.qview = qview
-
-    async def callback(self, interaction: discord.Interaction):
-        if interaction.user.id in self.qview.answered:
-            await interaction.response.send_message("You already answered this one - hit Next question on your result to keep going.", ephemeral=True)
-            return
-        self.qview.answered.add(interaction.user.id)
-        correct = self.idx == self.qview.correct
-        score = 1 if correct else 0
-        right = chr(65 + self.qview.correct)
-        await interaction.response.send_message(embed=_result_embed(correct, right, score, 1), view=QuizNextView(score, 1, {QUIZ_BANK.index(self.qview.q)} if self.qview.q in QUIZ_BANK else set()), ephemeral=True)
-
-
 @bot.tree.command(name="quiz", description="Random TA quiz question - test yourself")
 async def quiz(interaction: discord.Interaction):
     q, _ = _quiz_pick()
@@ -3823,6 +3595,170 @@ async def before_backup():
     await bot.wait_until_ready()
 
 
+@bot.tree.command(name="stables", description="Stablecoin supply - is dry powder flowing in or out?")
+async def stables_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        async with aiohttp.ClientSession() as s:
+            d = await _get_json(s, "https://stablecoins.llama.fi/stablecoincharts/all", None, 20)
+    except Exception:
+        d = None
+    if not d or not isinstance(d, list) or len(d) < 31:
+        await interaction.followup.send("Stablecoin data unavailable right now.")
+        return
+    def _tot(row):
+        try:
+            return float(row["totalCirculating"]["peggedUSD"])
+        except Exception:
+            return None
+    now = _tot(d[-1])
+    d7 = _tot(d[-8])
+    d30 = _tot(d[-31])
+    if not now:
+        await interaction.followup.send("Couldn't parse stablecoin data.")
+        return
+    chg7 = (now - d7) / d7 * 100 if d7 else 0
+    chg30 = (now - d30) / d30 * 100 if d30 else 0
+    if chg7 >= 0.75:
+        read = "Supply expanding - fresh dry powder entering. Liquidity tailwind."
+    elif chg7 <= -0.75:
+        read = "Supply contracting - capital leaving the system. Liquidity headwind."
+    else:
+        read = "Supply flat - no strong liquidity signal either way."
+    arrow7 = "\U0001F7E2" if chg7 >= 0 else "\U0001F534"
+    arrow30 = "\U0001F7E2" if chg30 >= 0 else "\U0001F534"
+    embed = discord.Embed(title="\U0001F4B5 Stablecoin Supply", color=NAVY, timestamp=datetime.now(timezone.utc))
+    embed.description = (
+        f"**Total supply:** ${now/1e9:.1f}B\n"
+        f"**7d:** {arrow7} {chg7:+.2f}% | **30d:** {arrow30} {chg30:+.2f}%\n"
+        f"**Read:** {read}"
+    )
+    embed.set_footer(text="Scient Lounge - DefiLlama data · stablecoin supply leads price")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="agg", description="Aggregated OI + funding across Binance, Bybit and OKX")
+@app_commands.describe(coin="Coin symbol, e.g. BTC")
+async def agg_cmd(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    pair = f"{base}USDT"
+    rows = []
+    async with aiohttp.ClientSession() as s:
+        # Binance
+        try:
+            oi_d = await _get_json(s, "https://fapi.binance.com/fapi/v1/openInterest", {"symbol": pair}, 15)
+            px_d = await _get_json(s, "https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol": pair}, 15)
+            if oi_d and px_d:
+                mark = float(px_d["markPrice"])
+                rows.append(("Binance", float(oi_d["openInterest"]) * mark, float(px_d["lastFundingRate"]) * 100))
+        except Exception:
+            pass
+        # Bybit
+        try:
+            bb = await _get_json(s, "https://api.bybit.com/v5/market/tickers", {"category": "linear", "symbol": pair}, 15)
+            t = bb["result"]["list"][0]
+            rows.append(("Bybit", float(t["openInterestValue"]), float(t["fundingRate"]) * 100))
+        except Exception:
+            pass
+        # OKX
+        try:
+            inst = f"{base}-USDT-SWAP"
+            oi_o = await _get_json(s, "https://www.okx.com/api/v5/public/open-interest", {"instId": inst}, 15)
+            fr_o = await _get_json(s, "https://www.okx.com/api/v5/public/funding-rate", {"instId": inst}, 15)
+            oi_usd = float(oi_o["data"][0]["oiUsd"]) if oi_o and oi_o.get("data") else None
+            fr = float(fr_o["data"][0]["fundingRate"]) * 100 if fr_o and fr_o.get("data") else None
+            if oi_usd is not None and fr is not None:
+                rows.append(("OKX", oi_usd, fr))
+        except Exception:
+            pass
+    if not rows:
+        await interaction.followup.send(f"No perp data found for **{base}** on any tracked exchange.")
+        return
+    total_oi = sum(r[1] for r in rows)
+    lines = []
+    for name, oi_usd, fr in rows:
+        share = oi_usd / total_oi * 100 if total_oi else 0
+        lines.append(f"**{name}:** ${oi_usd/1e9:.2f}B OI ({share:.0f}%) | funding {fr:+.4f}%")
+    avg_fr = sum(r[2] * r[1] for r in rows) / total_oi if total_oi else 0
+    lines.append("")
+    lines.append(f"**Total OI:** ${total_oi/1e9:.2f}B | **OI-weighted funding:** {avg_fr:+.4f}%")
+    if avg_fr >= 0.03:
+        lines.append("**Read:** Longs paying heavily across venues - crowded.")
+    elif avg_fr <= -0.01:
+        lines.append("**Read:** Shorts paying across venues - squeeze fuel.")
+    else:
+        lines.append("**Read:** Funding balanced across venues.")
+    embed = discord.Embed(title=f"\U0001F310 Aggregated Derivatives - {base}", color=NAVY, timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Scient Lounge - Binance + Bybit + OKX")
+    await interaction.followup.send(embed=embed)
+
+
+LIQ_HISTORY_FILE = Path(__file__).with_name("liq_history.json")
+
+
+def _liq_hist_append(base: str, liq_type: str, notional: float, price: float):
+    try:
+        hist = _load(LIQ_HISTORY_FILE)
+        arr = hist.get("events", [])
+        arr.append({"b": base, "t": liq_type, "n": round(notional), "p": price,
+                    "ts": int(datetime.now(timezone.utc).timestamp())})
+        cutoff = int(datetime.now(timezone.utc).timestamp()) - 7 * 86400
+        arr = [e for e in arr if e["ts"] >= cutoff][-5000:]
+        hist["events"] = arr
+        _save(LIQ_HISTORY_FILE, hist)
+    except Exception as e:
+        print(f"[liq] history save error: {e}", flush=True)
+
+
+@bot.tree.command(name="liqmap", description="Where have liquidations clustered this week? (from our live feed)")
+@app_commands.describe(coin="Coin symbol, e.g. BTC")
+async def liqmap_cmd(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    base = re.sub(r"[^A-Za-z0-9]", "", coin).upper().replace("USDT", "")
+    hist = _load(LIQ_HISTORY_FILE)
+    events = [e for e in hist.get("events", []) if e.get("b") == base]
+    if len(events) < 5:
+        await interaction.followup.send(
+            f"Not enough **{base}** liquidations recorded yet ({len(events)} so far). "
+            f"The map builds from our live feed - give it a few days of data."
+        )
+        return
+    prices = [e["p"] for e in events]
+    lo, hi = min(prices), max(prices)
+    if hi <= lo:
+        await interaction.followup.send("Price range too narrow to map.")
+        return
+    buckets = 12
+    step = (hi - lo) / buckets
+    agg = {}
+    for e in events:
+        k = min(int((e["p"] - lo) / step), buckets - 1)
+        agg.setdefault(k, [0.0, 0.0])
+        if e["t"] == "Long":
+            agg[k][0] += e["n"]
+        else:
+            agg[k][1] += e["n"]
+    max_v = max(l + s for l, s in agg.values())
+    lines = []
+    for k in sorted(agg.keys(), reverse=True):
+        l_usd, s_usd = agg[k]
+        tot = l_usd + s_usd
+        bar = "\u2588" * max(1, int(tot / max_v * 14))
+        px = lo + (k + 0.5) * step
+        tag = "\U0001F534" if l_usd > s_usd else "\U0001F7E2"
+        lines.append(f"`${fnum(px)}` {tag} {bar} ${tot/1e6:.1f}M")
+    total = sum(e["n"] for e in events)
+    days = max(1, (events[-1]["ts"] - events[0]["ts"]) / 86400)
+    embed = discord.Embed(title=f"\U0001F5FA Liquidation Map - {base} (last {days:.0f}d)", color=NAVY,
+                          timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines) + f"\n\n**{len(events)} events | ${total/1e6:.0f}M total** \U0001F534 long-heavy \U0001F7E2 short-heavy"
+    embed.set_footer(text="Scient Lounge - real recorded liquidations, not estimates")
+    await interaction.followup.send(embed=embed)
+
+
 @bot.tree.command(name="whale", description="Large individual trades in the last hour - what are whales doing?")
 @app_commands.describe(coin="Coin symbol, e.g. BTC", min_usd="Minimum trade size in USD (default 500000)")
 async def whale_cmd(interaction: discord.Interaction, coin: str, min_usd: int = 500000):
@@ -4145,68 +4081,47 @@ def make_compare_image(sym1: str, sym2: str, closes1: list, closes2: list, dates
     return buf
 
 
-@bot.tree.command(name="compare", description="Compare 30-day performance of two coins")
-@app_commands.describe(coin1="First coin, e.g. BTC", coin2="Second coin, e.g. ETH")
-async def compare(interaction: discord.Interaction, coin1: str, coin2: str):
-    await interaction.response.defer()
-    syms = []
-    for c in (coin1, coin2):
-        s = re.sub(r"[^A-Za-z0-9]", "", c).upper()
-        syms.append(s if s.endswith("USDT") else f"{s}USDT")
-    results = []
-    for pair in syms:
-        kl = await md_klines(pair, "1d", 30)
-        if not kl:
-            await interaction.followup.send(f"Couldn't find **{pair[:-4]}** on Binance or Bybit.")
-            return
-        results.append(kl)
-    n = min(len(results[0]), len(results[1]))
-    if n < 5:
-        await interaction.followup.send("Not enough data to compare.")
-        return
-    k1, k2 = results[0][-n:], results[1][-n:]
-    closes1 = [float(k[4]) for k in k1]
-    closes2 = [float(k[4]) for k in k2]
-    from datetime import datetime as _dt
-    dates = [_dt.fromtimestamp(k[0] / 1000) for k in k1]
-    s1, s2 = syms[0][:-4], syms[1][:-4]
-    try:
-        buf = await asyncio.to_thread(make_compare_image, s1, s2, closes1, closes2, dates)
-    except Exception as e:
-        await interaction.followup.send(f"Chart rendering failed: {e}")
-        return
-    p1 = (closes1[-1] / closes1[0] - 1) * 100
-    p2 = (closes2[-1] / closes2[0] - 1) * 100
-    winner = s1 if p1 > p2 else s2
-    f = discord.File(buf, filename=f"{s1}_vs_{s2}.png")
-    await interaction.followup.send(content=f"**{s1}** {p1:+.1f}% vs **{s2}** {p2:+.1f}% (30d) - **{winner}** leading", file=f)
-
-
 def build_help_embed() -> discord.Embed:
-    embed = discord.Embed(title="Quant - Command Guide", color=NAVY)
-    embed.description = "Everything you can do with the bot. All replies marked *private* are visible only to you."
+    embed = discord.Embed(
+        title="\U0001F916 Quant Terminal - Command Guide",
+        description="Everything the bot can do, grouped by what you need. All replies to market commands are public; anything marked *(private)* is visible only to you.",
+        color=NAVY,
+    )
     embed.add_field(
-        name="\U0001F4CA Market Tools",
+        name="\U0001F4CA Market Data",
         value=(
-            "`/price` - live price, 24h change, high/low\n"
-            "`/chart` - candlestick chart with EMAs (15m to 1W)\n"
-            "`/funding` - perp funding rate + market lean\n"
-            "`/oi` - open interest + 24h change\n"
-            "`/cvd` - spot vs perp CVD + OI + funding, who's driving the move\n"
+            "`/price` - live price, 24h range (crypto + SPX/GOLD/DXY)\n"
             "`/snapshot` - full market check in one command\n"
-            "`/orderbook` - bid/ask walls and imbalance\n"
-            "`/whale` - large trades in the last hour\n"
-            "`/lsr` - long/short ratio of top traders\n"
-            "`/rvol` - volatility regime, compressed or wild\n"
-            "`/gainers` / `/losers` - top 5 movers of the day\n"
-            "`/heatmap` - 24h market heatmap image\n"
-            "`/levels` - auto support & resistance levels\n"
-            "`/vol` - volatility snapshot (ATR, daily range)\n"
-            "`/dominance` - BTC dominance + market cap\n"
-            "`/compare` - 30d performance, coin vs coin\n"
-            "`/convert` - coin to USD (or USD to coin)\n"
+            "`/chart` - candlestick chart with EMAs\n"
+            "`/heatmap` - whole market at a glance\n"
+            "`/gainers` `/losers` - top movers (24h)\n"
+            "`/dominance` - BTC dominance\n"
             "`/fear` - Fear & Greed index\n"
-            "`/calendar` - upcoming CPI / FOMC events"
+            "`/calendar` - CPI / FOMC dates\n"
+            "`/stables` - stablecoin supply, liquidity in or out"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F52C Derivatives & Flow",
+        value=(
+            "`/funding` - funding rate, who's paying\n"
+            "`/oi` - open interest + 24h change\n"
+            "`/agg` - OI + funding across Binance/Bybit/OKX\n"
+            "`/cvd` - spot vs perp CVD, who's driving the move\n"
+            "`/lsr` - long/short ratio of top traders\n"
+            "`/whale` - large trades in the last hour\n"
+            "`/orderbook` - bid/ask walls and imbalance\n"
+            "`/liqmap` - where liquidations clustered this week"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F4C9 Volatility & Levels",
+        value=(
+            "`/levels` - auto support/resistance with strength\n"
+            "`/vol` - current volatility snapshot (for SL sizing)\n"
+            "`/rvol` - volatility regime, compressed or wild"
         ),
         inline=False,
     )
@@ -4214,47 +4129,39 @@ def build_help_embed() -> discord.Embed:
         name="\U0001F9EE Calculators *(private)*",
         value=(
             "`/pnl` - position size from account, risk %, entry, SL\n"
-            "`/liq` - estimated liquidation price for any leverage"
+            "`/liq` - liquidation price for any entry and leverage"
         ),
         inline=False,
     )
     embed.add_field(
-        name="\U0001F4BC Tracking *(private)*",
+        name="\U0001F440 Tracking & Alerts *(private)*",
         value=(
-            "`/watch` - your personal coin watchlist with live prices\n"
-            "`/alert` `/alerts` - price alerts, DM'd when they trigger"
+            "`/watch` - your watchlist, crypto + stocks/gold, live prices\n"
+            "`/alert` - price alert, DM when it triggers\n"
+            "`/alerts` - view and manage your alerts"
         ),
         inline=False,
     )
     embed.add_field(
-        name="\U0001F4C8 Trades & Results *(private)*",
+        name="\U0001F4C8 Trade Journal",
         value=(
-            "`/open` - all live positions (futures + spot)\n"
+            "`/open` - every live position right now\n"
             "`/recent` - latest closed trades with results\n"
-            "`/stats` - any analyst's futures scorecard\n"
-            "`/spot_stats` - any analyst's spot scorecard"
+            "`/stats` - analyst scorecard + CSV download *(private)*\n"
+            "`/spot_stats` - spot journal scorecard *(private)*"
         ),
         inline=False,
     )
     embed.add_field(
-        name="\U0001F3B2 Fun & Learning",
+        name="\U0001F514 Pings & Learning",
         value=(
-            "`/quiz` - random TA question, test yourself\n"
-            "`/coinflip` - flip a coin, learn about win rates"
+            "`/follow` `/unfollow` - analyst trade pings\n"
+            "Or use the buttons in #select-analyst-alerts\n"
+            "`/quiz` - trading quizzes, basics to advanced"
         ),
         inline=False,
     )
-    embed.add_field(
-        name="\U0001F514 Alerts",
-        value=(
-            "`/alert` - set a price alert, DM when it triggers\n"
-            "`/alerts` - view and manage your alerts\n"
-            "`/follow` / `/unfollow` - get pinged when an analyst posts\n"
-            "Or use the buttons in #select-analyst-alerts"
-        ),
-        inline=False,
-    )
-    embed.set_footer(text="Scient Lounge - Quant")
+    embed.set_footer(text="Scient Lounge - Quant Terminal")
     return embed
 
 
@@ -4488,41 +4395,6 @@ async def spot_stats(interaction: discord.Interaction, analyst: discord.Member =
     embed.add_field(name="Results", value=(", ".join(results[:10]) if results else "-"), inline=False)
     embed.set_footer(text="Scient Lounge - Spot Journal")
     await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-@bot.tree.command(name="xtest", description="(Admin) Test the X auto-feed connection")
-async def xtest(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Admins only.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    if not TWITTERAPIS_KEY:
-        await interaction.followup.send("TWITTERAPIS_KEY not set in .env.", ephemeral=True)
-        return
-    query = f"from:{X_AUTO_USERNAME} -filter:replies -filter:retweets"
-    url = "https://api.twitterapis.com/twitter/tweet/advanced_search"
-    params = {"query": query, "product": "Latest"}
-    headers = {"Authorization": f"Bearer {TWITTERAPIS_KEY}"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers, timeout=30) as resp:
-                status = resp.status
-                data = await resp.json()
-    except Exception as e:
-        await interaction.followup.send(f"Error: {e}", ephemeral=True)
-        return
-    if status != 200:
-        await interaction.followup.send(f"API returned {status}: {str(data)[:400]}", ephemeral=True)
-        return
-    tweets = data.get("tweets", []) or []
-    if not tweets:
-        await interaction.followup.send("Connected OK, but no tweets returned for that query.", ephemeral=True)
-        return
-    latest = tweets[0]
-    await interaction.followup.send(
-        f"Connected. Latest tweet from @{X_AUTO_USERNAME}:\nID: {latest.get('id')}\nText: {str(latest.get('text'))[:200]}",
-        ephemeral=True,
-    )
 
 
 bot.run(BOT_TOKEN)
