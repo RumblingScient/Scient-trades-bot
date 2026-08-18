@@ -173,6 +173,22 @@ def member_is_pro(member) -> bool:
         return False
 
 
+def parse_sl(text):
+    """Smart SL parser. '63000' -> ('63000', None). '4h close below 63000' -> ('63000', '4h close below').
+    Takes the LAST standalone number as the level; the rest becomes the condition."""
+    if not text:
+        return None, None
+    s = str(text).strip()
+    matches = list(re.finditer(r"(?<![\w.])(\d[\d,]*\.?\d*)(?![\w])", s))
+    if not matches:
+        return None, None
+    last = matches[-1]
+    num = last.group(1).replace(",", "")
+    cond = (s[:last.start()] + s[last.end():]).strip(" -:@")
+    cond = re.sub(r"\s+", " ", cond).strip()[:60]
+    return num, (cond or None)
+
+
 def is_analyst(interaction: discord.Interaction) -> bool:
     if interaction.user.guild_permissions.administrator:
         return True
@@ -2175,6 +2191,11 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     if channel is None:
         await interaction.followup.send("Trades channel not found - check TRADES_CHANNEL_ID.", ephemeral=True)
         return
+    sl_num, sl_cond = parse_sl(stop_loss)
+    if sl_num is None:
+        await interaction.followup.send("Couldn't find a price in the SL - e.g. `63000` or `4h close below 63000`.", ephemeral=True)
+        return
+    stop_loss = sl_num
     etype = entry_type.value
     if etype == "DCA" and not entry2:
         await interaction.followup.send("Limit - Range/DCA needs **entry2** (the second entry price).", ephemeral=True)
@@ -2185,7 +2206,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     akey, acfg = resolve_analyst(interaction.user)
     frameworks = [f.value for f in (framework, framework2) if f]
     t = {
-        "sl_condition": (sl_condition or "").strip()[:60] or None,
+        "sl_condition": sl_cond,
         "analyst_id": interaction.user.id, "analyst_name": interaction.user.display_name,
         "analyst_avatar": interaction.user.display_avatar.url, "analyst_key": akey,
         "analyst_color": analyst_color_hex(interaction.user),
@@ -2555,7 +2576,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     ],
 )
 @app_commands.autocomplete(trade=editable_any_ac)
-async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, stop_loss: str = None, sl_condition: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
+async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, stop_loss: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -2603,11 +2624,11 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
         if entry2 is not None:
             t["entry2"] = entry2; changes.append("entry 2")
         if stop_loss is not None:
-            t["sl"] = stop_loss; changes.append("SL")
-        if sl_condition is not None:
-            cond = sl_condition.strip()[:60]
-            t["sl_condition"] = cond or None
-            changes.append("SL condition" if cond else "SL condition removed")
+            e_num, e_cond = parse_sl(stop_loss)
+            if e_num:
+                t["sl"] = e_num
+                t["sl_condition"] = e_cond
+                changes.append("SL")
         if risk is not None:
             t["risk"] = risk; changes.append("risk")
         if entry_type is not None:
@@ -2680,8 +2701,8 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     trade="Pick an open trade",
     event="What happened",
     size_pct="TP/Partial TP only - % of position closed (e.g. 25). Skip for other events",
-    price="Partial TP, Closed, SL Updated - the price. Required on SL Hit if the trade has a soft SL",
-    sl_condition="SL Updated only - new soft condition e.g. 4H close below (empty = hard SL)",
+    price="Partial TP, Closed - exit price. Required on SL Hit if the trade has a soft SL",
+    new_sl="SL Updated only - number for hard (64000) or full condition (4h close below 64000)",
     note="Optional note",
 )
 @app_commands.choices(event=[
@@ -2698,7 +2719,7 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     app_commands.Choice(name="Invalidated (never triggered)", value="CI"),
 ])
 @app_commands.autocomplete(trade=open_trades_ac)
-async def update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str], size_pct: str = None, price: str = None, sl_condition: str = None, note: str = None):
+async def update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str], size_pct: str = None, price: str = None, new_sl: str = None, note: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -2770,14 +2791,15 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         t["be"] = True
         desc = "SL moved to entry - trade is risk-free"
     elif ev == "SLU":
-        if px is None:
-            await interaction.followup.send("**price is required** - what is the new SL level?", ephemeral=True)
+        raw = new_sl if new_sl else (str(px) if px is not None else None)
+        s_num, s_cond = parse_sl(raw) if raw else (None, None)
+        if s_num is None:
+            await interaction.followup.send("**new_sl is required** - e.g. `64000` or `4h close below 64000`.", ephemeral=True)
             return
-        t["sl"] = f"{px:g}"
-        cond = (sl_condition or "").strip()[:60]
-        t["sl_condition"] = cond or None
+        t["sl"] = s_num
+        t["sl_condition"] = s_cond
         t["be"] = False
-        shown = (cond + " " if cond else "") + f"{px:g}"
+        shown = (s_cond + " " if s_cond else "") + s_num
         desc = "SL updated -> " + shown
     elif ev == "SL":
         if t.get("sl_condition") and px is None and not t.get("be"):
