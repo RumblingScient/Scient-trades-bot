@@ -25,6 +25,13 @@ X_FEED_CHANNEL_ID = 1525862152076923020
 SPOT_CHANNEL_ID = 1533876035462889482
 # Pro roles that unlock full access (either one triggers the Pro welcome DM)
 PRO_ROLE_IDS = {1500476858477576374, 1484576832362905630}  # Scient Pass (referral), Scient Pro (payment)
+SUB_ROLE_ID = 1484576832362905630  # role granted/removed by the subscription system (Scient Pro)
+SUB_PLANS = {
+    "1month":  {"days": 30,  "price": 50,  "label": "Scient Pro - 1 Month ($50)"},
+    "3months": {"days": 90,  "price": 140, "label": "Scient Pro - 3 Months ($140)"},
+    "6months": {"days": 180, "price": 250, "label": "Scient Pro - 6 Months ($250)"},
+}
+SUB_REMINDER_DAYS = 3  # DM a renewal reminder this many days before expiry
 FREE_ALERT_LIMIT = 5      # max active alerts for non-pro members
 ALERT_CHECK_MIN = 3       # how often (minutes) to check alert prices
 LIQ_CHANNEL_ID = 1535755722678341733  # #liquidations feed
@@ -158,6 +165,9 @@ def save_xseen(d: dict): _save(XSEEN_FILE, d)
 DIGEST_FILE = Path(__file__).with_name("news_digest.json")
 def load_digest() -> dict: return _load(DIGEST_FILE)
 def save_digest(d: dict): _save(DIGEST_FILE, d)
+SUBS_FILE = Path(__file__).with_name("subscriptions.json")
+def load_subs() -> dict: return _load(SUBS_FILE)
+def save_subs(d: dict): _save(SUBS_FILE, d)
 ALERTS_FILE = Path(__file__).with_name("alerts.json")
 def load_alerts() -> dict: return _load(ALERTS_FILE)
 def save_alerts(d: dict): _save(ALERTS_FILE, d)
@@ -2054,6 +2064,8 @@ async def on_ready():
         alert_check_loop.start()
     if not backup_loop.is_running():
         backup_loop.start()
+    if not subs_check_loop.is_running():
+        subs_check_loop.start()
     if not tg_digest_loop.is_running():
         tg_digest_loop.start()
     if TG_NEWS_CHANNELS and not tg_sources_loop.is_running():
@@ -3939,63 +3951,103 @@ async def lsr_cmd(interaction: discord.Interaction, coin: str):
     await interaction.followup.send(embed=embed)
 
 
-@bot.tree.command(name="orderbook", description="Bid/ask walls and imbalance - where is the liquidity?")
+def make_liqzones_image(symbol: str, price: float, zones: list) -> io.BytesIO:
+    """zones: list of dicts {price, intensity(0..1), side('long'/'short'), lev}"""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap
+    fig, ax = plt.subplots(figsize=(12, 6.5), facecolor="#131722")
+    ax.set_facecolor("#0e1015")
+    # coinglass-style colormap: dark purple -> blue -> green -> yellow
+    cmap = LinearSegmentedColormap.from_list("liq", ["#1a1035", "#3b1f6e", "#2b6cb0", "#26a269", "#f5c211", "#ffe066"])
+    zones_sorted = sorted(zones, key=lambda z: z["price"])
+    prices = [z["price"] for z in zones_sorted]
+    for z in zones_sorted:
+        color = cmap(z["intensity"])
+        ax.barh(z["price"], z["intensity"], height=(price * 0.004),
+                color=color, edgecolor="none", alpha=0.95)
+    ax.axhline(price, color="#EAECEF", linewidth=1.4, linestyle="-")
+    ax.text(1.0, price, f"  price ${fnum(price)}", color="#EAECEF", fontsize=9, va="center", ha="left")
+    ax.set_xlim(0, 1.15)
+    ax.set_ylabel("Price", color="#B2B5BE", fontsize=9)
+    ax.set_title(f"{symbol}  |  Liquidation Zones (estimated intensity)", color="#EAECEF", fontsize=13, loc="left", pad=12)
+    ax.grid(color="#1E222D", linewidth=0.5, axis="y")
+    for sp in ax.spines.values():
+        sp.set_color("#2A2E39")
+    ax.tick_params(colors="#B2B5BE", labelsize=8)
+    ax.set_xticks([])
+    ax.yaxis.set_major_formatter(lambda x, _: f"${fnum(x)}")
+    # annotate the two heaviest zones as magnet zones
+    top = sorted(zones, key=lambda z: -z["intensity"])[:2]
+    for z in top:
+        ax.text(z["intensity"] + 0.02, z["price"], f"{z['lev']}x {z['side']}",
+                color="#ffe066", fontsize=8, va="center")
+    plt.tight_layout()
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="liqzones", description="Estimated liquidation heatmap - where leverage gets flushed")
 @app_commands.describe(coin="Coin symbol, e.g. BTC")
-async def orderbook_cmd(interaction: discord.Interaction, coin: str):
+async def liqzones_cmd(interaction: discord.Interaction, coin: str):
     await interaction.response.defer()
     symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
-    pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    pair = f"{base}USDT"
+    price = await md_price(pair)
+    od = await md_oi(pair)
+    if price is None or price <= 0:
+        await interaction.followup.send(f"Couldn't price **{base}** - liqzones needs a Binance/Bybit perp.")
+        return
+    # long/short skew from LSR (fallback 1.0 balanced)
+    ls_ratio = 1.0
     try:
         async with aiohttp.ClientSession() as s:
-            d = await _get_json(s, "https://api.binance.com/api/v3/depth", {"symbol": pair, "limit": 1000}, 15)
+            acct = await _get_json(s, "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
+                                   {"symbol": pair, "period": "1h", "limit": 1}, 15)
+        if acct and isinstance(acct, list):
+            ls_ratio = float(acct[0]["longShortRatio"])
     except Exception:
-        d = None
-    if not d or "bids" not in d:
-        await interaction.followup.send(f"No orderbook data for **{symbol}** (Binance spot only).")
-        return
+        pass
+    long_share = ls_ratio / (1 + ls_ratio)
+    short_share = 1 - long_share
+    oi_usd = (od["oi"] * price) if od else None
+    # maintenance margin approx per tier (Binance-like): higher lev -> tighter
+    LEV_TIERS = [(10, 0.005), (25, 0.01), (50, 0.02), (100, 0.005)]
+    # typical position-count weighting across tiers (assumed distribution; higher lev = more retail positions)
+    TIER_WEIGHT = {10: 0.30, 25: 0.30, 50: 0.25, 100: 0.15}
+    zones = []
+    for lev, mmr in LEV_TIERS:
+        # long liquidation below price, short liquidation above
+        long_liq = price * (1 - 1/lev + mmr)
+        short_liq = price * (1 + 1/lev - mmr)
+        w = TIER_WEIGHT[lev]
+        zones.append({"price": long_liq, "side": "long", "lev": lev, "raw": w * long_share})
+        zones.append({"price": short_liq, "side": "short", "lev": lev, "raw": w * short_share})
+    max_raw = max(z["raw"] for z in zones)
+    for z in zones:
+        z["intensity"] = max(0.12, z["raw"] / max_raw)
     try:
-        best_bid = float(d["bids"][0][0])
-        best_ask = float(d["asks"][0][0])
-        mid = (best_bid + best_ask) / 2
-        spread_pct = (best_ask - best_bid) / mid * 100
-        lo, hi = mid * 0.98, mid * 1.02
-        bids = [(float(p), float(q)) for p, q in d["bids"] if float(p) >= lo]
-        asks = [(float(p), float(q)) for p, q in d["asks"] if float(p) <= hi]
-    except Exception:
-        await interaction.followup.send("Couldn't parse orderbook.")
+        buf = await asyncio.to_thread(make_liqzones_image, f"{base}/USDT", price, zones)
+    except Exception as e:
+        await interaction.followup.send(f"Heatmap render failed: {e}")
         return
-    def _walls(levels, n=3):
-        # cluster into 0.25% buckets and pick the heaviest
-        buckets = {}
-        for p, q in levels:
-            key = round(p / (mid * 0.0025))
-            buckets.setdefault(key, [0.0, 0.0])
-            buckets[key][0] += p * q
-            buckets[key][1] += q
-        top = sorted(buckets.items(), key=lambda kv: -kv[1][0])[:n]
-        out = []
-        for key, (usd, qty) in sorted(top, key=lambda kv: kv[0]):
-            out.append((key * mid * 0.0025, usd))
-        return out
-    bid_usd = sum(p * q for p, q in bids)
-    ask_usd = sum(p * q for p, q in asks)
-    bid_walls = _walls(bids)
-    ask_walls = _walls(asks)
-    lines = [f"**Mid:** ${fnum(mid)} | **Spread:** {spread_pct:.3f}%", ""]
-    lines.append("**Ask walls (+/-2%):**")
-    for p, usd in sorted(ask_walls, key=lambda x: x[0]):
-        lines.append(f"\U0001F534 ${fnum(p)} (${usd/1e6:.1f}M)")
-    lines.append("**Bid walls:**")
-    for p, usd in sorted(bid_walls, key=lambda x: -x[0]):
-        lines.append(f"\U0001F7E2 ${fnum(p)} (${usd/1e6:.1f}M)")
-    if bid_usd + ask_usd > 0:
-        bid_pct = bid_usd / (bid_usd + ask_usd) * 100
-        lines.append("")
-        lines.append(f"**Imbalance (+/-2%):** Bids {bid_pct:.0f}% / Asks {100-bid_pct:.0f}%")
-    embed = discord.Embed(title=f"\U0001F4DA Orderbook - {symbol}", color=NAVY, timestamp=datetime.now(timezone.utc))
-    embed.description = "\n".join(lines)
-    embed.set_footer(text="Walls move - context, not gospel · Binance spot")
-    await interaction.followup.send(embed=embed)
+    # magnet zones summary
+    top = sorted(zones, key=lambda z: -z["intensity"])[:3]
+    lines = [f"**Price:** ${fnum(price)}" + (f" | **OI:** ${oi_usd/1e9:.2f}B" if oi_usd else "")]
+    lines.append(f"**Positioning:** {long_share*100:.0f}% long / {short_share*100:.0f}% short")
+    lines.append("**Magnet zones (heaviest estimated liquidations):**")
+    for z in top:
+        dist = (z["price"] - price) / price * 100
+        arrow = "\U0001F53A" if z["side"] == "short" else "\U0001F53B"
+        lines.append(f"{arrow} ${fnum(z['price'])} ({dist:+.1f}%) - {z['lev']}x {z['side']}s")
+    lines.append("*Modeled from OI + positioning, not exchange-confirmed. Relative intensity, not absolute. Best on BTC/ETH.*")
+    f = discord.File(buf, filename=f"{base}_liqzones.png")
+    await interaction.followup.send(content="\n".join(lines), file=f)
 
 
 @bot.tree.command(name="levels", description="Auto-detected support & resistance levels")
@@ -4177,7 +4229,7 @@ def build_help_embed() -> discord.Embed:
             "`/cvd` - spot vs perp CVD, who's driving the move\n"
             "`/lsr` - long/short ratio of top traders\n"
             "`/whale` - large trades in the last hour\n"
-            "`/orderbook` - bid/ask walls and imbalance\n"
+            "`/liqzones` - estimated liquidation heatmap (magnet zones)\n"
             "`/liqmap` - where liquidations clustered this week"
         ),
         inline=False,
@@ -4229,6 +4281,207 @@ def build_help_embed() -> discord.Embed:
     )
     embed.set_footer(text="Scient Lounge - Quant Terminal")
     return embed
+
+
+PLAN_CHOICES = [app_commands.Choice(name=v["label"], value=k) for k, v in SUB_PLANS.items()]
+
+
+async def _sub_grant_role(guild: discord.Guild, uid: int) -> bool:
+    try:
+        member = guild.get_member(uid) or await guild.fetch_member(uid)
+        role = guild.get_role(SUB_ROLE_ID)
+        if member and role and role not in member.roles:
+            await member.add_roles(role, reason="Subscription granted")
+        return True
+    except Exception as e:
+        print(f"[subs] grant role error {uid}: {e}", flush=True)
+        return False
+
+
+async def _sub_remove_role(guild: discord.Guild, uid: int) -> bool:
+    try:
+        member = guild.get_member(uid) or await guild.fetch_member(uid)
+        role = guild.get_role(SUB_ROLE_ID)
+        if member and role and role in member.roles:
+            await member.remove_roles(role, reason="Subscription expired/revoked")
+        return True
+    except Exception as e:
+        print(f"[subs] remove role error {uid}: {e}", flush=True)
+        return False
+
+
+@bot.tree.command(name="grant", description="(Admin) Grant or extend a Pro subscription")
+@app_commands.describe(member="Who gets Pro", plan="Which plan", note="Optional note, e.g. tx hash or payment ref")
+@app_commands.choices(plan=PLAN_CHOICES)
+async def grant_cmd(interaction: discord.Interaction, member: discord.Member, plan: app_commands.Choice[str], note: str = None):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    p = SUB_PLANS[plan.value]
+    subs = load_subs()
+    uid = str(member.id)
+    now = datetime.now(timezone.utc)
+    existing = subs.get(uid)
+    if existing and existing.get("expires"):
+        try:
+            cur_exp = datetime.fromisoformat(existing["expires"])
+            base = max(cur_exp, now)  # extend from current expiry if still active
+        except Exception:
+            base = now
+    else:
+        base = now
+    expires = base + timedelta(days=p["days"])
+    subs[uid] = {
+        "name": member.display_name,
+        "plan": plan.value,
+        "price": p["price"],
+        "started": existing.get("started") if existing else now.isoformat(),
+        "expires": expires.isoformat(),
+        "reminded": False,
+        "note": (note or "")[:120],
+        "history": (existing.get("history", []) if existing else []) + [
+            {"plan": plan.value, "price": p["price"], "at": now.isoformat(), "by": interaction.user.display_name}
+        ],
+    }
+    save_subs(subs)
+    ok = await _sub_grant_role(interaction.guild, member.id)
+    try:
+        dm = discord.Embed(
+            title="Scient Pro activated \U0001F389",
+            description=(
+                f"Your **{p['label']}** is live.\n"
+                f"**Access until:** {expires.strftime('%d %b %Y')}\n\n"
+                f"You'll get a renewal reminder {SUB_REMINDER_DAYS} days before it ends."
+            ),
+            color=GOLD,
+        )
+        await member.send(embed=dm)
+    except Exception:
+        pass
+    await interaction.followup.send(
+        f"\u2705 **{member.display_name}** -> {p['label']}\n"
+        f"Expires: **{expires.strftime('%d %b %Y')}** | role {'granted' if ok else 'FAILED - check manually'}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="revoke", description="(Admin) Revoke a Pro subscription")
+@app_commands.describe(member="Whose subscription to revoke")
+async def revoke_cmd(interaction: discord.Interaction, member: discord.Member):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    subs = load_subs()
+    if str(member.id) not in subs:
+        await interaction.followup.send("No subscription on record for that member.", ephemeral=True)
+        return
+    subs.pop(str(member.id), None)
+    save_subs(subs)
+    await _sub_remove_role(interaction.guild, member.id)
+    await interaction.followup.send(f"Subscription revoked for **{member.display_name}** - role removed.", ephemeral=True)
+
+
+@bot.tree.command(name="subs", description="(Admin) Active subscriptions overview")
+async def subs_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    subs = load_subs()
+    if not subs:
+        await interaction.followup.send("No active subscriptions on record.", ephemeral=True)
+        return
+    now = datetime.now(timezone.utc)
+    rows = []
+    total_rev = 0
+    for uid, s in subs.items():
+        try:
+            exp = datetime.fromisoformat(s["expires"])
+            days_left = (exp - now).days
+        except Exception:
+            days_left = -1
+        total_rev += sum(h.get("price", 0) for h in s.get("history", []))
+        flag = "\U0001F7E2" if days_left > SUB_REMINDER_DAYS else ("\U0001F7E1" if days_left >= 0 else "\U0001F534")
+        rows.append((days_left, f"{flag} **{s.get('name','?')}** - {SUB_PLANS.get(s.get('plan'), {}).get('label', s.get('plan'))} - {days_left}d left"))
+    rows.sort(key=lambda r: r[0])
+    embed = discord.Embed(title="\U0001F4B3 Subscriptions", color=NAVY, timestamp=now)
+    embed.description = "\n".join(r[1] for r in rows[:30])
+    embed.add_field(name="Total", value=f"{len(subs)} active | ${total_rev} lifetime recorded", inline=False)
+    embed.set_footer(text="Scient Lounge - subscription system")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="mysub", description="Check your Pro subscription status")
+async def mysub_cmd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    subs = load_subs()
+    s = subs.get(str(interaction.user.id))
+    if not s:
+        await interaction.followup.send("No subscription on record. If you have Pro via referral (Scient Pass), that's managed separately.", ephemeral=True)
+        return
+    try:
+        exp = datetime.fromisoformat(s["expires"])
+        days_left = (exp - datetime.now(timezone.utc)).days
+        await interaction.followup.send(
+            f"**{SUB_PLANS.get(s.get('plan'), {}).get('label', 'Pro')}**\n"
+            f"Expires: **{exp.strftime('%d %b %Y')}** ({days_left} days left)",
+            ephemeral=True,
+        )
+    except Exception:
+        await interaction.followup.send("Couldn't read your subscription record - ping an admin.", ephemeral=True)
+
+
+@tasks.loop(time=dt_time(hour=4, minute=30, tzinfo=timezone.utc))  # 10:00 AM IST daily
+async def subs_check_loop():
+    subs = load_subs()
+    if not subs:
+        return
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return
+    now = datetime.now(timezone.utc)
+    changed = False
+    for uid, s in list(subs.items()):
+        try:
+            exp = datetime.fromisoformat(s["expires"])
+        except Exception:
+            continue
+        days_left = (exp - now).days
+        if exp <= now:
+            # expired: remove role, DM, drop record
+            await _sub_remove_role(guild, int(uid))
+            try:
+                user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
+                await user.send(
+                    "Your **Scient Pro** access has ended. It's been great having you in the full lounge - "
+                    "renew any time via the payment options in the server to jump back in. \U0001F91D"
+                )
+            except Exception:
+                pass
+            subs.pop(uid, None)
+            changed = True
+            print(f"[subs] expired + removed: {s.get('name')} ({uid})", flush=True)
+        elif days_left <= SUB_REMINDER_DAYS and not s.get("reminded"):
+            try:
+                user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
+                await user.send(
+                    f"Heads up - your **Scient Pro** expires in **{max(days_left,0)} day(s)** "
+                    f"({exp.strftime('%d %b %Y')}). Renew via the payment options in the server to keep uninterrupted access. \U0001F514"
+                )
+            except Exception:
+                pass
+            s["reminded"] = True
+            changed = True
+            print(f"[subs] reminder sent: {s.get('name')} ({uid})", flush=True)
+    if changed:
+        save_subs(subs)
+
+
+@subs_check_loop.before_loop
+async def before_subs_check():
+    await bot.wait_until_ready()
 
 
 @bot.tree.command(name="setup_help_panel", description="(Admin) Post the public command guide in this channel and pin it")
