@@ -3952,40 +3952,61 @@ async def lsr_cmd(interaction: discord.Interaction, coin: str):
 
 
 def make_liqzones_image(symbol: str, price: float, zones: list) -> io.BytesIO:
-    """zones: list of dicts {price, intensity(0..1), side('long'/'short'), lev}"""
+    """Dense Coinglass-style heatmap. zones: [{price, intensity, side, lev}]
+    We spread each zone's intensity into a fine price grid with a gaussian bloom,
+    so the result reads as a continuous heat column instead of a few thin bars."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import numpy as np
     from matplotlib.colors import LinearSegmentedColormap
-    fig, ax = plt.subplots(figsize=(12, 6.5), facecolor="#131722")
-    ax.set_facecolor("#0e1015")
-    # coinglass-style colormap: dark purple -> blue -> green -> yellow
-    cmap = LinearSegmentedColormap.from_list("liq", ["#1a1035", "#3b1f6e", "#2b6cb0", "#26a269", "#f5c211", "#ffe066"])
-    zones_sorted = sorted(zones, key=lambda z: z["price"])
-    prices = [z["price"] for z in zones_sorted]
-    for z in zones_sorted:
-        color = cmap(z["intensity"])
-        ax.barh(z["price"], z["intensity"], height=(price * 0.004),
-                color=color, edgecolor="none", alpha=0.95)
-    ax.axhline(price, color="#EAECEF", linewidth=1.4, linestyle="-")
-    ax.text(1.0, price, f"  price ${fnum(price)}", color="#EAECEF", fontsize=9, va="center", ha="left")
-    ax.set_xlim(0, 1.15)
-    ax.set_ylabel("Price", color="#B2B5BE", fontsize=9)
-    ax.set_title(f"{symbol}  |  Liquidation Zones (estimated intensity)", color="#EAECEF", fontsize=13, loc="left", pad=12)
-    ax.grid(color="#1E222D", linewidth=0.5, axis="y")
-    for sp in ax.spines.values():
-        sp.set_color("#2A2E39")
-    ax.tick_params(colors="#B2B5BE", labelsize=8)
+
+    lo = price * 0.68
+    hi = price * 1.32
+    N = 600
+    grid = np.linspace(lo, hi, N)
+    heat = np.zeros(N)
+    for z in zones:
+        if not (lo <= z["price"] <= hi):
+            continue
+        sigma = price * 0.006  # bloom width
+        heat += z["intensity"] * np.exp(-((grid - z["price"]) ** 2) / (2 * sigma ** 2))
+    if heat.max() > 0:
+        heat /= heat.max()
+
+    cmap = LinearSegmentedColormap.from_list(
+        "liq", ["#0e1015", "#161447", "#3b1f8f", "#7b2ea8", "#d13b6e", "#f5a11b", "#ffe066"])
+
+    fig, ax = plt.subplots(figsize=(12, 7), facecolor="#0b0d12")
+    ax.set_facecolor("#0b0d12")
+    # render as a 2D image column (heat repeated across x) for a smooth glow
+    img = np.tile(heat.reshape(-1, 1), (1, 60))
+    ax.imshow(img, aspect="auto", origin="lower", cmap=cmap,
+              extent=[0, 1, lo, hi], vmin=0, vmax=1, interpolation="bilinear")
+
+    ax.axhline(price, color="#FFFFFF", linewidth=1.3)
+    ax.text(1.01, price, f" ${fnum(price)}", color="#FFFFFF", fontsize=9, va="center", ha="left",
+            transform=ax.get_yaxis_transform())
+
+    # mark the heaviest zones on the side
+    for z in sorted(zones, key=lambda z: -z["intensity"])[:4]:
+        if lo <= z["price"] <= hi:
+            dist = (z["price"] - price) / price * 100
+            ax.text(1.01, z["price"], f" {z['lev']}x {z['side']}  {dist:+.0f}%",
+                    color="#ffe066", fontsize=8, va="center", ha="left",
+                    transform=ax.get_yaxis_transform())
+
+    ax.set_title(f"{symbol}   Liquidation Heatmap  (estimated intensity)",
+                 color="#EAECEF", fontsize=13, loc="left", pad=12)
     ax.set_xticks([])
+    ax.set_xlim(0, 1)
+    ax.tick_params(colors="#8A8F9C", labelsize=8)
     ax.yaxis.set_major_formatter(lambda x, _: f"${fnum(x)}")
-    # annotate the two heaviest zones as magnet zones
-    top = sorted(zones, key=lambda z: -z["intensity"])[:2]
-    for z in top:
-        ax.text(z["intensity"] + 0.02, z["price"], f"{z['lev']}x {z['side']}",
-                color="#ffe066", fontsize=8, va="center")
+    for sp in ax.spines.values():
+        sp.set_color("#20242E")
     plt.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    fig.savefig(buf, dpi=130, facecolor="#0b0d12", bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -4017,12 +4038,13 @@ async def liqzones_cmd(interaction: discord.Interaction, coin: str):
     short_share = 1 - long_share
     oi_usd = (od["oi"] * price) if od else None
     # maintenance margin approx per tier (Binance-like): higher lev -> tighter
-    LEV_TIERS = [(10, 0.005), (25, 0.01), (50, 0.02), (100, 0.005)]
-    # typical position-count weighting across tiers (assumed distribution; higher lev = more retail positions)
-    TIER_WEIGHT = {10: 0.30, 25: 0.30, 50: 0.25, 100: 0.15}
+    LEV_TIERS = [(5, 0.004), (10, 0.005), (20, 0.008), (25, 0.01), (40, 0.015),
+                 (50, 0.02), (75, 0.025), (100, 0.005), (125, 0.004)]
+    # assumed position-count weighting: mid leverage most populated, extremes lighter
+    TIER_WEIGHT = {5: 0.10, 10: 0.16, 20: 0.15, 25: 0.15, 40: 0.10,
+                   50: 0.13, 75: 0.08, 100: 0.09, 125: 0.04}
     zones = []
     for lev, mmr in LEV_TIERS:
-        # long liquidation below price, short liquidation above
         long_liq = price * (1 - 1/lev + mmr)
         short_liq = price * (1 + 1/lev - mmr)
         w = TIER_WEIGHT[lev]
