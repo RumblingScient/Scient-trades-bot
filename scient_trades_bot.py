@@ -623,39 +623,41 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
 
     sl_mark = " (hit)" if t.get("sl_hit") else ""
     type_label = "Market" if t.get("entry_type") == "MARKET" else "Limit"
-    line1 = (
-        f"**Entry ({type_label}):** {entry_display(t)}"
-        f" | **SL:** {(t.get('sl_condition') + ' ' ) if t.get('sl_condition') else ''}{t['sl']}{sl_mark}"
-        f" | **Risk:** {fmt_risk(t.get('risk')) or '-'}"
-        f" | **R:R:** {display_rr(t) or '-'}"
-    )
+    sl_val = f"{(t.get('sl_condition') + ' ') if t.get('sl_condition') else ''}{t['sl']}{sl_mark}"
 
+    # Row 1: three inline columns - Entry | Stop Loss | Risk / R:R
+    embed.add_field(name=f"Entry ({type_label})", value=entry_display(t) or "-", inline=True)
+    embed.add_field(name="Stop Loss", value=sl_val, inline=True)
+    rr = display_rr(t)
+    risk_rr = fmt_risk(t.get("risk")) or "-"
+    if rr:
+        risk_rr += f"  ·  R:R {rr}"
+    embed.add_field(name="Risk", value=risk_rr, inline=True)
+
+    # Targets (full width)
     tps = []
     for key, hit in (("tp1", "tp1_hit"), ("tp2", "tp2_hit"), ("tp3", "tp3_hit")):
         if t.get(key):
             r = signed_r(t, first_num(t[key]))
             rtxt = f" ({r:.1f}R)" if r is not None else ""
             tps.append(f"{t[key]}{rtxt}" + (" \u2705" if t.get(hit) else ""))
-    line2 = f"**TP:** {' / '.join(tps)}" if tps else None
+    if tps:
+        embed.add_field(name="Targets", value=" · ".join(tps), inline=False)
 
+    # Setup (full width)
     fw = fmt_frameworks(t)
     if t.get("setup_detail"):
         fw = f"{fw} - {t['setup_detail']}"
-    line3 = f"**Setup:** {fw}" if fw != "-" else None
+    if fw and fw != "-":
+        embed.add_field(name="Setup", value=fw[:1020], inline=False)
 
-    line4 = f"**Status:** {full_status(t)}"
+    # Status (full width)
+    embed.add_field(name="Status", value=full_status(t), inline=False)
 
-    lines = [line1]
-    if line2:
-        lines.append(line2)
-    if line3:
-        lines.append(line3)
-    lines.append(line4)
     if closed and t.get("avg_exit") is not None:
-        lines.append(f"**Avg Exit:** {fnum(t['avg_exit'])}")
+        embed.add_field(name="Avg Exit", value=fnum(t["avg_exit"]), inline=True)
     if closed and t.get("close_note"):
-        lines.append(f"**Note:** {t['close_note'][:300]}")
-    embed.description = "\n".join(lines)
+        embed.add_field(name="Note", value=t["close_note"][:1020], inline=False)
 
     embed.set_author(name=t["analyst_name"], icon_url=t.get("analyst_avatar") or None)
     embed.set_footer(text=footer_with_edit(t, "Journal entry, not financial advice · Risk % = portfolio risked · Never risk more than you can afford to lose"))
@@ -677,34 +679,30 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
     title = f"{prefix}\U0001F7E2 SPOT | {p['pair'].upper()}"
     embed = discord.Embed(title=title, color=color)
 
-    lines = []
     if closed:
-        l1 = f"**Avg Entry:** {p.get('avg_entry') or '-'}"
+        embed.add_field(name="Avg Entry", value=str(p.get("avg_entry") or "-"), inline=True)
         if p.get("avg_exit"):
-            l1 += f" | **Avg Exit:** {p['avg_exit']}"
-        lines.append(l1)
+            embed.add_field(name="Avg Exit", value=str(p["avg_exit"]), inline=True)
         if p.get("result_pct"):
-            lines.append(f"**Result:** {p['result_pct']}")
+            embed.add_field(name="Result", value=str(p["result_pct"]), inline=True)
     else:
         zone_mark = " (filled)" if p.get("zone_filled") else ""
-        l1 = f"**DCA Zone:** {p['dca_zone']}{zone_mark}"
+        embed.add_field(name="DCA Zone", value=f"{p['dca_zone']}{zone_mark}", inline=True)
         if p.get("allocation"):
-            l1 += f" | **Allocation:** {fmt_risk(p['allocation'])}"
-        lines.append(l1)
+            embed.add_field(name="Allocation", value=fmt_risk(p["allocation"]) or "-", inline=True)
         if p.get("avg_entry"):
-            lines.append(f"**Avg Entry:** {p['avg_entry']}")
+            embed.add_field(name="Avg Entry", value=str(p["avg_entry"]), inline=True)
         tgs = []
         for key, hit in (("t1", "t1_hit"), ("t2", "t2_hit"), ("t3", "t3_hit")):
             if p.get(key):
                 tgs.append(f"{p[key]}" + (" \u2705" if p.get(hit) else ""))
         if tgs:
-            lines.append(f"**Targets:** {' / '.join(tgs)}")
+            embed.add_field(name="Targets", value=" · ".join(tgs), inline=False)
         if p.get("invalidation"):
-            lines.append(f"**Invalidation:** {p['invalidation']}")
-    lines.append(f"**Status:** {spot_status_line(p)}")
+            embed.add_field(name="Invalidation", value=str(p["invalidation"]), inline=False)
+    embed.add_field(name="Status", value=spot_status_line(p), inline=False)
     if closed and p.get("close_note"):
-        lines.append(f"**Note:** {p['close_note'][:300]}")
-    embed.description = "\n".join(lines)
+        embed.add_field(name="Note", value=p["close_note"][:1020], inline=False)
 
     embed.set_author(name=p["analyst_name"], icon_url=p.get("analyst_avatar") or None)
     embed.set_footer(text=footer_with_edit(p, "Spot journal entry, not financial advice · Never risk more than you can afford to lose"))
