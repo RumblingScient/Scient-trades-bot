@@ -2578,7 +2578,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     pair="Corrected pair (optional)",
     direction="Corrected direction - futures only (optional)",
     entry="Corrected entry / DCA zone (optional)",
-    entry2="Corrected second DCA entry - futures only (optional)",
+    entry_split="DCA size split e.g. 20/80 (space to clear)", entry2="Corrected second DCA entry - futures only (optional)",
     stop_loss="Corrected SL / invalidation (optional)",
     risk="Corrected risk / allocation (optional)",
     entry_type="Corrected entry type - futures only (optional)",
@@ -2602,7 +2602,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     ],
 )
 @app_commands.autocomplete(trade=editable_any_ac)
-async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, stop_loss: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
+async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, entry_split: str = None, stop_loss: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -2649,6 +2649,16 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
             t["entry"] = entry; changes.append("entry")
         if entry2 is not None:
             t["entry2"] = entry2; changes.append("entry 2")
+        if entry_split is not None:
+            raw = entry_split.strip()
+            if not raw:
+                t["entry_split"] = None; changes.append("split removed")
+            else:
+                nums = re.findall(r"\d+(?:\.\d+)?", raw)
+                if len(nums) >= 2 and (float(nums[0]) + float(nums[1])) > 0:
+                    a, b = float(nums[0]), float(nums[1])
+                    a_pct = round(a / (a + b) * 100)
+                    t["entry_split"] = f"{a_pct}% / {100 - a_pct}%"; changes.append("entry split")
         if stop_loss is not None:
             e_num, e_cond = parse_sl(stop_loss)
             if e_num:
