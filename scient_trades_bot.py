@@ -486,11 +486,13 @@ def entry_display(t: dict, marks: bool = True) -> str:
         if marks and not closed:
             s += " (filled)" if t.get("entry1_filled") else " (pending)"
         return s
+    split = t.get("entry_split")
+    split_txt = f" [{split}]" if split else ""
     if marks and not closed:
         m1 = " \u2713" if t.get("entry1_filled") else ""
         m2 = " \u2713" if t.get("entry2_filled") else ""
-        return f"{e1}{m1} / {e2}{m2} (DCA)"
-    return f"{e1} / {e2} (DCA)"
+        return f"{e1}{m1} / {e2}{m2} (DCA{split_txt})"
+    return f"{e1} / {e2} (DCA{split_txt})"
 
 
 def display_rr(t: dict):
@@ -2173,6 +2175,7 @@ async def setup_follow_panel(interaction: discord.Interaction):
     sl_condition="Optional soft SL, e.g. 4H close below - shows as a condition, not a hard stop",
     risk="Account risk (just a number = %, e.g. 1 shows as 1%)",
     entry2="Second DCA entry price (only for Limit DCA)",
+    entry_split="DCA size split, e.g. 20/80 (Entry 1 gets 20%, Entry 2 gets 80%). Optional",
     framework="Setup framework (optional)",
     framework2="Second framework (optional)",
     chart="Chart image (optional)",
@@ -2193,7 +2196,7 @@ async def setup_follow_panel(interaction: discord.Interaction):
         app_commands.Choice(name="Limit - Range/DCA (two entries)", value="DCA"),
     ],
 )
-async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry_type: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, sl_condition: str = None, entry2: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
+async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry_type: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, sl_condition: str = None, entry2: str = None, entry_split: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message(f"Only members with the **{ANALYST_ROLE_NAME}** role can post setups.", ephemeral=True)
         return
@@ -2213,6 +2216,18 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
         return
     if etype != "DCA":
         entry2 = None
+        entry_split = None
+    split_disp = None
+    if etype == "DCA" and entry_split:
+        nums = re.findall(r"\d+(?:\.\d+)?", entry_split)
+        if len(nums) >= 2:
+            a, b = float(nums[0]), float(nums[1])
+            if a + b > 0:
+                a_pct = round(a / (a + b) * 100)
+                split_disp = f"{a_pct}% / {100 - a_pct}%"
+        if split_disp is None:
+            await interaction.followup.send("Couldn't read the split - use a format like `20/80`.", ephemeral=True)
+            return
     is_market = etype == "MARKET"
     akey, acfg = resolve_analyst(interaction.user)
     frameworks = [f.value for f in (framework, framework2) if f]
@@ -2223,7 +2238,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
         "analyst_color": analyst_color_hex(interaction.user),
         "pair": pair, "direction": direction.value, "timeframe": timeframe,
         "framework": frameworks[0] if frameworks else None, "frameworks": frameworks, "setup_detail": setup_detail,
-        "entry": entry, "entry2": entry2, "sl": stop_loss, "entry_type": "MARKET" if is_market else "LIMIT",
+        "entry": entry, "entry2": entry2, "entry_split": split_disp, "sl": stop_loss, "entry_type": "MARKET" if is_market else "LIMIT",
         "tp1": tp1, "tp2": tp2, "tp3": tp3, "risk": risk, "notes": notes,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "entry1_filled": bool(is_market), "entry2_filled": False,
