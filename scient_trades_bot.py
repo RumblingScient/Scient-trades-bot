@@ -129,7 +129,7 @@ FRAMEWORKS = [
     "BOS / MSS", "Fib Pocket (0.75/0.786)", "Range (sweep-reclaim)",
     "Three Drives", "Deviation Reclaim", "EMA Cross", "Other",
 ]
-SPOT_STATUSES = ["ACCUMULATING", "HOLDING", "DISTRIBUTING"]
+SPOT_STATUSES = ["WATCHING", "ACCUMULATING", "HOLDING", "TRIMMED", "DISTRIBUTING"]
 ANALYST_CHOICES = [app_commands.Choice(name=k.capitalize(), value=k) for k in ANALYSTS.keys()]
 
 intents = discord.Intents.default()
@@ -545,6 +545,48 @@ def short_status(t: dict) -> str:
     return "Pending"
 
 
+def spot_num(x):
+    try:
+        return float(str(x).replace(",", "").replace("$", "").strip())
+    except Exception:
+        return None
+
+
+def spot_ref_entry(p: dict):
+    """Reference entry for % math: avg_entry if numeric, else DCA-zone midpoint."""
+    v = spot_num(p.get("avg_entry"))
+    if v:
+        return v
+    nums = [spot_num(x) for x in re.findall(r"\d[\d,]*\.?\d*", str(p.get("dca_zone", "")))]
+    nums = [n for n in nums if n]
+    if not nums:
+        return None
+    return sum(nums[:2]) / min(2, len(nums))
+
+
+def spot_pct_text(p: dict, target) -> str:
+    ref = spot_ref_entry(p)
+    t = spot_num(target)
+    if ref and t and ref > 0:
+        return f" ({(t - ref) / ref * 100:+.0f}%)"
+    return ""
+
+
+def spot_sells_summary(p: dict) -> str:
+    sells = p.get("sells") or []
+    if not sells:
+        return ""
+    return " · ".join(f"{s['pct']:g}% @ {s['price']:g}" for s in sells)
+
+
+def spot_weighted_exit(p: dict):
+    sells = p.get("sells") or []
+    tot = sum(s["pct"] for s in sells)
+    if tot <= 0:
+        return None
+    return sum(s["pct"] * s["price"] for s in sells) / tot
+
+
 def spot_status_line(p: dict) -> str:
     if p.get("closed"):
         res = p.get("result_pct")
@@ -697,9 +739,11 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
         tgs = []
         for key, hit in (("t1", "t1_hit"), ("t2", "t2_hit"), ("t3", "t3_hit")):
             if p.get(key):
-                tgs.append(f"{p[key]}" + (" \u2705" if p.get(hit) else ""))
+                tgs.append(f"{p[key]}{spot_pct_text(p, p[key])}" + (" \u2705" if p.get(hit) else ""))
         if tgs:
             embed.add_field(name="Targets", value=" · ".join(tgs), inline=False)
+        if p.get("sells"):
+            embed.add_field(name="Sold", value=spot_sells_summary(p), inline=False)
         if p.get("invalidation"):
             embed.add_field(name="Invalidation", value=str(p["invalidation"]), inline=False)
     embed.add_field(name="Status", value=spot_status_line(p), inline=False)
@@ -2496,6 +2540,8 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
     avg_entry="New average entry after DCA (optional)",
     status="New phase (optional)",
     target_hit="Mark a target as reached (optional)",
+    sold_pct="Partial sell - % of the bag sold (e.g. 30). Pair with sell_price",
+    sell_price="Partial sell - price sold at (required with sold_pct)",
     zone_filled="Mark DCA zone fully filled (optional)",
     note="Update note (optional)",
 )
@@ -2509,7 +2555,7 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
     zone_filled=[app_commands.Choice(name="Yes", value="yes")],
 )
 @app_commands.autocomplete(play=open_spot_ac)
-async def spot_update(interaction: discord.Interaction, play: str, avg_entry: str = None, status: app_commands.Choice[str] = None, target_hit: app_commands.Choice[str] = None, zone_filled: app_commands.Choice[str] = None, note: str = None):
+async def spot_update(interaction: discord.Interaction, play: str, avg_entry: str = None, status: app_commands.Choice[str] = None, target_hit: app_commands.Choice[str] = None, sold_pct: str = None, sell_price: str = None, zone_filled: app_commands.Choice[str] = None, note: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -2528,6 +2574,21 @@ async def spot_update(interaction: discord.Interaction, play: str, avg_entry: st
         p[f"{target_hit.value}_hit"] = True; changes.append(f"{target_hit.name} hit")
     if zone_filled is not None:
         p["zone_filled"] = True; changes.append("zone filled")
+    if sold_pct is not None or sell_price is not None:
+        sp = spot_num(sold_pct)
+        px = spot_num(sell_price)
+        if sp is None or px is None:
+            await interaction.followup.send("Partial sell needs **both** `sold_pct` and `sell_price`.", ephemeral=True)
+            return
+        if sp <= 0 or sp > 100:
+            await interaction.followup.send("sold_pct must be between 0 and 100.", ephemeral=True)
+            return
+        already = sum(s["pct"] for s in (p.get("sells") or []))
+        if already + sp > 100.01:
+            await interaction.followup.send(f"That totals {already + sp:g}% sold - only {100 - already:g}% of the bag is left.", ephemeral=True)
+            return
+        p.setdefault("sells", []).append({"pct": round(sp, 1), "price": px})
+        changes.append(f"sold {sp:g}% @ {px:g}")
     if not changes and not note:
         await interaction.followup.send("Nothing to update - fill at least one field.", ephemeral=True)
         return
@@ -2544,7 +2605,7 @@ async def spot_update(interaction: discord.Interaction, play: str, avg_entry: st
 
 
 @bot.tree.command(name="spot_close", description="Close a spot play")
-@app_commands.describe(play="Pick an active spot play", result="Outcome", result_pct="Result in % e.g. +190%", avg_exit="Average exit price (optional)", note="Closing note (optional)")
+@app_commands.describe(play="Pick an active spot play", result="Outcome", result_pct="Manual override - auto-calculated from entry/exit if blank", avg_exit="Average exit price (auto from partial sells if blank)", note="Closing note (optional)")
 @app_commands.choices(result=[
     app_commands.Choice(name="Win", value="WIN"),
     app_commands.Choice(name="Loss", value="LOSS"),
@@ -2562,6 +2623,22 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     if not p:
         await interaction.followup.send("Play not found.", ephemeral=True)
         return
+    # auto avg_exit from recorded partial sells if not given
+    if avg_exit is None and spot_weighted_exit(p):
+        avg_exit = f"{spot_weighted_exit(p):g}"
+    had_position = bool(spot_num(p.get("avg_entry")) or p.get("zone_filled") or (p.get("sells") or []))
+    if result.value == "INVALID" and had_position and spot_num(avg_exit) is None:
+        await interaction.followup.send(
+            "This play had fills - **avg_exit is required** on invalidation so the journal records where you cut.",
+            ephemeral=True,
+        )
+        return
+    # auto result % from entry vs exit when not manually given
+    if result_pct is None:
+        ref = spot_ref_entry(p)
+        ex = spot_num(avg_exit)
+        if ref and ex and ref > 0:
+            result_pct = f"{(ex - ref) / ref * 100:+.1f}%"
     p["closed"] = True
     p["result"] = result.value
     p["result_pct"] = result_pct
