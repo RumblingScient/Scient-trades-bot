@@ -636,11 +636,13 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
 
     # Targets (full width)
     tps = []
-    for key, hit in (("tp1", "tp1_hit"), ("tp2", "tp2_hit"), ("tp3", "tp3_hit")):
+    plan = t.get("tp_split") or []
+    for idx, (key, hit) in enumerate((("tp1", "tp1_hit"), ("tp2", "tp2_hit"), ("tp3", "tp3_hit"))):
         if t.get(key):
             r = signed_r(t, first_num(t[key]))
             rtxt = f" ({r:.1f}R)" if r is not None else ""
-            tps.append(f"{t[key]}{rtxt}" + (" \u2705" if t.get(hit) else ""))
+            ptxt = f" [{plan[idx]:g}%]" if idx < len(plan) else ""
+            tps.append(f"{t[key]}{rtxt}{ptxt}" + (" \u2705" if t.get(hit) else ""))
     if tps:
         embed.add_field(name="Targets", value=" · ".join(tps), inline=False)
 
@@ -2174,6 +2176,7 @@ async def setup_follow_panel(interaction: discord.Interaction):
     risk="Account risk (just a number = %, e.g. 1 shows as 1%)",
     entry2="Second DCA entry price (only for Limit DCA)",
     entry_split="DCA size split, e.g. 20/80 (Entry 1 gets 20%, Entry 2 gets 80%). Optional",
+    tp_split="Planned TP sizes, e.g. 25/50/25 (TP1/TP2/TP3). TP updates then default to these. Optional",
     framework="Setup framework (optional)",
     framework2="Second framework (optional)",
     chart="Chart image (optional)",
@@ -2194,7 +2197,7 @@ async def setup_follow_panel(interaction: discord.Interaction):
         app_commands.Choice(name="Limit - Range/DCA (two entries)", value="DCA"),
     ],
 )
-async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry_type: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, sl_condition: str = None, entry2: str = None, entry_split: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
+async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry_type: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, sl_condition: str = None, entry2: str = None, entry_split: str = None, tp_split: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message(f"Only members with the **{ANALYST_ROLE_NAME}** role can post setups.", ephemeral=True)
         return
@@ -2226,6 +2229,21 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
         if split_disp is None:
             await interaction.followup.send("Couldn't read the split - use a format like `20/80`.", ephemeral=True)
             return
+    tp_plan = None
+    if tp_split:
+        nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", tp_split)]
+        n_tps = sum(1 for x in (tp1, tp2, tp3) if x)
+        if not nums or len(nums) != n_tps:
+            await interaction.followup.send(
+                f"tp_split has {len(nums)} number(s) but you set {n_tps} TP level(s) - they must match (e.g. `25/50/25` for 3 TPs).",
+                ephemeral=True,
+            )
+            return
+        total = sum(nums)
+        if total <= 0 or total > 100.5:
+            await interaction.followup.send("tp_split must add up to 100 or less (the rest rides).", ephemeral=True)
+            return
+        tp_plan = [round(x, 1) for x in nums]
     is_market = etype == "MARKET"
     akey, acfg = resolve_analyst(interaction.user)
     frameworks = [f.value for f in (framework, framework2) if f]
@@ -2236,7 +2254,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
         "analyst_color": analyst_color_hex(interaction.user),
         "pair": pair, "direction": direction.value, "timeframe": timeframe,
         "framework": frameworks[0] if frameworks else None, "frameworks": frameworks, "setup_detail": setup_detail,
-        "entry": entry, "entry2": entry2, "entry_split": split_disp, "sl": stop_loss, "entry_type": "MARKET" if is_market else "LIMIT",
+        "entry": entry, "entry2": entry2, "entry_split": split_disp, "tp_split": tp_plan, "sl": stop_loss, "entry_type": "MARKET" if is_market else "LIMIT",
         "tp1": tp1, "tp2": tp2, "tp3": tp3, "risk": risk, "notes": notes,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "entry1_filled": bool(is_market), "entry2_filled": False,
@@ -2576,7 +2594,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     pair="Corrected pair (optional)",
     direction="Corrected direction - futures only (optional)",
     entry="Corrected entry / DCA zone (optional)",
-    entry_split="DCA size split e.g. 20/80 (space to clear)", entry2="Corrected second DCA entry - futures only (optional)",
+    tp_split="Planned TP sizes e.g. 25/50/25 (space to clear)", entry_split="DCA size split e.g. 20/80 (space to clear)", entry2="Corrected second DCA entry - futures only (optional)",
     stop_loss="Corrected SL / invalidation (optional)",
     risk="Corrected risk / allocation (optional)",
     entry_type="Corrected entry type - futures only (optional)",
@@ -2600,7 +2618,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     ],
 )
 @app_commands.autocomplete(trade=editable_any_ac)
-async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, entry_split: str = None, stop_loss: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
+async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, entry_split: str = None, tp_split: str = None, stop_loss: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -2657,6 +2675,15 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
                     a, b = float(nums[0]), float(nums[1])
                     a_pct = round(a / (a + b) * 100)
                     t["entry_split"] = f"{a_pct}% / {100 - a_pct}%"; changes.append("entry split")
+        if tp_split is not None:
+            raw = tp_split.strip()
+            if not raw:
+                t["tp_split"] = None; changes.append("TP split removed")
+            else:
+                nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", raw)]
+                n_tps = sum(1 for k2 in ("tp1", "tp2", "tp3") if t.get(k2))
+                if nums and len(nums) == n_tps and 0 < sum(nums) <= 100.5:
+                    t["tp_split"] = [round(x, 1) for x in nums]; changes.append("TP split")
         if stop_loss is not None:
             e_num, e_cond = parse_sl(stop_loss)
             if e_num:
@@ -2772,6 +2799,11 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
     px = parse_num(price)
 
     if ev in ("TP1", "TP2", "TP3", "PTP"):
+        if pct is None and ev != "PTP":
+            plan = t.get("tp_split") or []
+            idx = {"TP1": 0, "TP2": 1, "TP3": 2}[ev]
+            if idx < len(plan):
+                pct = float(plan[idx])  # planned size from the trade card
         if pct is None:
             await interaction.followup.send("**size_pct is required** - how much of the position was closed at this level? (e.g. 25)", ephemeral=True)
             return
