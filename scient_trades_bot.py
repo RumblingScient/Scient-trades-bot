@@ -4806,4 +4806,387 @@ async def spot_stats(interaction: discord.Interaction, analyst: discord.Member =
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SIGMA RESULTS BOARD
+#  - watches trades.json / spot plays for newly closed entries, posts each to
+#    #results-board as a permanent card with original Posted/Closed timestamps
+#  - maintains a pinned summary embed (combined + per-analyst)
+#  - weekly recap image every Monday 10:00 IST -> #monthly-recap
+#  - first run backfills the entire DB chronologically (rate-limit safe)
+# ═══════════════════════════════════════════════════════════════════════════
+
+RESULTS_CHANNEL_ID = 1540681895812005928       # results-board
+INVALIDATIONS_CHANNEL_ID = 0                   # off (feature cut)
+RECAP_CHANNEL_ID = 1500920688515616922         # monthly-recap
+RESULTS_POLL_MIN = 2
+RECAP_DAY = 0                                  # Monday
+RECAP_UTC = dt_time(hour=4, minute=30, tzinfo=timezone.utc)  # 10:00 IST
+
+SIGMA_BG = "#0A0C10"; SIGMA_CARD = "#141A22"; SIGMA_SLATE = "#2A3644"
+SIGMA_CYAN = "#22D3C5"; SIGMA_AMBER = "#E8590C"; SIGMA_PAPER = "#EEF3F8"
+SIGMA_ASH = "#8593A6"; SIGMA_GREEN = "#16C784"; SIGMA_RED = "#EA3943"
+SIGMA_EMBED_CYAN = discord.Color.from_str(SIGMA_CYAN)
+
+RESULTS_FILE = Path(__file__).with_name("results_board.json")
+def load_results() -> dict: return _load(RESULTS_FILE)
+def save_results(d: dict): _save(RESULTS_FILE, d)
+
+
+def _res_ts(iso) -> int:
+    try:
+        return int(datetime.fromisoformat(iso).timestamp())
+    except Exception:
+        return int(datetime.now(timezone.utc).timestamp())
+
+
+def _res_all_closed():
+    out = []
+    for mid, t in load_trades().items():
+        if t.get("closed"):
+            out.append(("fut", mid, t))
+    for mid, p in load_spot().items():
+        if p.get("closed"):
+            out.append(("spot", mid, p))
+    out.sort(key=lambda x: x[2].get("closed_at") or x[2].get("created_at") or "")
+    return out
+
+
+def sigma_tracking_since():
+    dates = [t.get("created_at") for t in load_trades().values() if t.get("created_at")]
+    dates += [p.get("created_at") for p in load_spot().values() if p.get("created_at")]
+    return min(dates) if dates else None
+
+
+def _res_totals(entries):
+    rs = [t.get("result_r") for k, _, t in entries
+          if k == "fut" and isinstance(t.get("result_r"), (int, float))]
+    wins = sum(1 for _, _, t in entries if t.get("result") == "WIN")
+    losses = sum(1 for _, _, t in entries if t.get("result") == "LOSS")
+    be = sum(1 for _, _, t in entries if t.get("result") == "BE")
+    inv = sum(1 for _, _, t in entries if t.get("result") == "INVALID")
+    decided = wins + losses
+    return {"n": len(entries), "wins": wins, "losses": losses, "be": be, "inv": inv,
+            "wr": (wins / decided * 100) if decided else 0,
+            "total_r": sum(rs) if rs else 0.0, "graded": len(rs),
+            "best": max(rs) if rs else None, "worst": min(rs) if rs else None}
+
+
+def build_results_summary_embed() -> discord.Embed:
+    entries = _res_all_closed()
+    tot = _res_totals(entries)
+    since = sigma_tracking_since()
+    embed = discord.Embed(title="Results Board - Full Log", color=SIGMA_EMBED_CYAN,
+                          timestamp=datetime.now(timezone.utc))
+    head = []
+    if since:
+        head.append(f"**Tracking since:** <t:{_res_ts(since)}:D>")
+    head.append("Every entry below was logged by the bot **at the moment the call was "
+                "posted** - the `Posted` timestamp on each card is the original, not added later.")
+    embed.description = "\n".join(head)
+    embed.add_field(name="Calls closed", value=str(tot["n"]), inline=True)
+    embed.add_field(name="Win rate", value=f"{tot['wr']:.0f}% ({tot['wins']}W / {tot['losses']}L)", inline=True)
+    embed.add_field(name="Net result", value=f"{tot['total_r']:+.2f}R ({tot['graded']} graded)", inline=True)
+    embed.add_field(name="Breakeven / Invalidated", value=f"{tot['be']} / {tot['inv']}", inline=True)
+    if tot["best"] is not None:
+        embed.add_field(name="Best / Worst", value=f"{tot['best']:+g}R / {tot['worst']:+g}R", inline=True)
+    per = {}
+    for k, mid, t in entries:
+        per.setdefault(t.get("analyst_name", "?"), []).append((k, mid, t))
+    lines = []
+    for name, ent in sorted(per.items()):
+        s = _res_totals(ent)
+        lines.append(f"**{name}** - {s['n']} closed - {s['wr']:.0f}% WR - {s['total_r']:+.2f}R")
+    if lines:
+        embed.add_field(name="By analyst", value="\n".join(lines)[:1024], inline=False)
+    embed.set_footer(text="Sigma Trading - setups, not signals - wins and losses both logged - not financial advice")
+    return embed
+
+
+def build_result_entry_embed(kind: str, t: dict) -> discord.Embed:
+    res = t.get("result", "?")
+    color = {"WIN": GREEN, "LOSS": RED, "BE": GREY, "INVALID": DGREY}.get(res, GREY)
+    if kind == "spot":
+        rtxt = f" {t['result_pct']}" if t.get("result_pct") else ""
+        title = f"[{res}]{rtxt} - SPOT {t.get('pair', '?').upper()}"
+    else:
+        r = t.get("result_r")
+        rtxt = f" {r:+.2f}R" if isinstance(r, (int, float)) else ""
+        d = "LONG" if t.get("direction") == "LONG" else "SHORT"
+        tfs = tf(t)
+        title = f"[{res}]{rtxt} - {d} {t.get('pair', '?').upper()}" + (f" {tfs}" if tfs else "")
+    embed = discord.Embed(title=title, color=color)
+    if kind == "fut":
+        embed.add_field(name="Entry", value=entry_display(t, marks=False) or "-", inline=True)
+        embed.add_field(name="Invalidation", value=str(t.get("sl") or "-"), inline=True)
+        if t.get("avg_exit") is not None:
+            embed.add_field(name="Avg exit", value=fnum(t["avg_exit"]), inline=True)
+    else:
+        embed.add_field(name="DCA zone", value=str(t.get("dca_zone") or "-"), inline=True)
+        if t.get("avg_entry"):
+            embed.add_field(name="Avg entry", value=str(t["avg_entry"]), inline=True)
+        if t.get("avg_exit"):
+            embed.add_field(name="Avg exit", value=str(t["avg_exit"]), inline=True)
+    posted = t.get("created_at")
+    closed = t.get("closed_at") or posted
+    embed.add_field(name="Timeline",
+                    value=f"Posted <t:{_res_ts(posted)}:f>\nClosed <t:{_res_ts(closed)}:f>",
+                    inline=False)
+    embed.set_author(name=t.get("analyst_name", "?"), icon_url=t.get("analyst_avatar") or None)
+    embed.set_footer(text="Sigma Trading - logged at post time - not financial advice")
+    return embed
+
+
+async def refresh_results_summary():
+    if not RESULTS_CHANNEL_ID:
+        return
+    ch = bot.get_channel(RESULTS_CHANNEL_ID)
+    if ch is None:
+        return
+    state = load_results()
+    embed = build_results_summary_embed()
+    msg_id = state.get("summary_message_id")
+    if msg_id:
+        try:
+            msg = await ch.fetch_message(msg_id)
+            await msg.edit(embed=embed)
+            return
+        except (discord.NotFound, discord.HTTPException):
+            pass
+    try:
+        msg = await ch.send(embed=embed)
+    except Exception as e:
+        print(f"[results] summary send error: {e}", flush=True)
+        return
+    try:
+        await msg.pin()
+    except discord.HTTPException:
+        pass
+    state["summary_message_id"] = msg.id
+    save_results(state)
+
+
+@tasks.loop(minutes=RESULTS_POLL_MIN)
+async def results_watch_loop():
+    if not RESULTS_CHANNEL_ID:
+        return
+    ch = bot.get_channel(RESULTS_CHANNEL_ID)
+    if ch is None:
+        return
+    state = load_results()
+    posted = set(state.get("posted", []))
+    new = [(k, mid, t) for k, mid, t in _res_all_closed() if f"{k}:{mid}" not in posted]
+    if not new:
+        return
+    inv_ch = bot.get_channel(INVALIDATIONS_CHANNEL_ID) if INVALIDATIONS_CHANNEL_ID else None
+    for k, mid, t in new:
+        try:
+            await ch.send(embed=build_result_entry_embed(k, t))
+        except Exception as e:
+            print(f"[results] post error {mid}: {e}", flush=True)
+            continue
+        if inv_ch and t.get("result") in ("LOSS", "INVALID"):
+            try:
+                await inv_ch.send(embed=build_result_entry_embed(k, t))
+            except Exception as e:
+                print(f"[results] mirror error: {e}", flush=True)
+        posted.add(f"{k}:{mid}")
+        state["posted"] = list(posted)
+        save_results(state)
+        await asyncio.sleep(1.5)
+    await refresh_results_summary()
+    print(f"[results] posted {len(new)} closed trade(s)", flush=True)
+
+
+@results_watch_loop.before_loop
+async def _before_results_watch():
+    await bot.wait_until_ready()
+
+
+# ---------------- weekly recap image ----------------
+
+def _sigma_fonts():
+    try:
+        from matplotlib import font_manager
+        fdir = Path(__file__).with_name("fonts")
+        fams = {"disp": "DejaVu Sans", "mono": "DejaVu Sans Mono"}
+        if fdir.exists():
+            found = set()
+            for f in fdir.glob("*.ttf"):
+                try:
+                    font_manager.fontManager.addfont(str(f))
+                    for fe in font_manager.fontManager.ttflist:
+                        if str(f) == fe.fname:
+                            found.add(fe.name)
+                except Exception:
+                    continue
+            for name in found:
+                low = name.lower()
+                if "grotesk" in low or "sigmadisplay" in low:
+                    fams["disp"] = name
+                if "jetbrains" in low or "sigmamono" in low:
+                    fams["mono"] = name
+        return fams
+    except Exception:
+        return {"disp": "DejaVu Sans", "mono": "DejaVu Sans Mono"}
+
+
+def make_recap_image(stats: dict) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    fams = _sigma_fonts()
+    fig = plt.figure(figsize=(10.8, 13.5), facecolor=SIGMA_BG)
+    ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 108); ax.set_ylim(0, 135)
+    ax.axis("off"); ax.set_facecolor(SIGMA_BG)
+
+    def box(x, y, w, h, fc=SIGMA_CARD, ec=SIGMA_SLATE):
+        ax.add_patch(mpatches.FancyBboxPatch((x, y), w, h,
+                     boxstyle="round,pad=0,rounding_size=1.4",
+                     facecolor=fc, edgecolor=ec, linewidth=1.2))
+
+    box(7, 122, 9, 9, fc=SIGMA_CYAN, ec=SIGMA_CYAN)
+    ax.plot([14.2, 9.0, 11.8, 9.0, 14.2], [129.2, 129.2, 126.5, 123.8, 123.8],
+            color=SIGMA_BG, linewidth=3.4, solid_capstyle="butt")
+    ax.text(19, 126.8, "SIGMA TRADING", color=SIGMA_PAPER, fontsize=21,
+            fontweight="bold", family=fams["disp"], va="center")
+    ax.text(19, 123.4, stats["range_txt"], color=SIGMA_ASH, fontsize=11,
+            family=fams["mono"], va="center")
+    ax.plot([7, 101], [119.5, 119.5], color=SIGMA_SLATE, linewidth=1.2)
+
+    ax.text(7, 109, "WEEKLY", color=SIGMA_PAPER, fontsize=34, fontweight="bold", family=fams["disp"])
+    ax.text(7, 101, "RECAP", color=SIGMA_CYAN, fontsize=34, fontweight="bold", family=fams["disp"])
+
+    cells = [("CALLS CLOSED", str(stats["n"]), SIGMA_PAPER),
+             ("CLOSED GREEN", str(stats["wins"]), SIGMA_GREEN),
+             ("CLOSED RED", str(stats["losses"]), SIGMA_RED),
+             ("NET", f"{stats['total_r']:+.1f}R", SIGMA_CYAN)]
+    for i, (label, val, col) in enumerate(cells):
+        x = 7 + (i % 2) * 48.5; y = 78 - (i // 2) * 19
+        box(x, y, 45.5, 16)
+        ax.text(x + 3, y + 11.5, label, color=SIGMA_ASH, fontsize=10, family=fams["mono"])
+        ax.text(x + 3, y + 3.5, val, color=col, fontsize=25, fontweight="bold", family=fams["mono"])
+
+    y = 52
+    if stats["best_lines"]:
+        ax.text(7, y, "BEST", color=SIGMA_CYAN, fontsize=10.5, family=fams["mono"]); y -= 4.5
+        for line, r in stats["best_lines"]:
+            ax.text(7, y, line, color=SIGMA_PAPER, fontsize=12.5, family=fams["disp"])
+            ax.text(101, y, r, color=SIGMA_GREEN, fontsize=12.5, family=fams["mono"], ha="right")
+            y -= 4.6
+        y -= 2.5
+    if stats["worst_lines"]:
+        ax.text(7, y, "WORST", color=SIGMA_AMBER, fontsize=10.5, family=fams["mono"]); y -= 4.5
+        for line, r in stats["worst_lines"]:
+            ax.text(7, y, line, color=SIGMA_PAPER, fontsize=12.5, family=fams["disp"])
+            ax.text(101, y, r, color=SIGMA_RED, fontsize=12.5, family=fams["mono"], ha="right")
+            y -= 4.6
+    ax.plot([7, 101], [max(y, 15.5), max(y, 15.5)], color=SIGMA_SLATE, linewidth=1.2)
+    ax.text(7, 11.5, "Every call was posted before it played out.", color=SIGMA_ASH,
+            fontsize=12, family=fams["disp"])
+    ax.text(7, 7.8, "Full log open in #results-board.", color=SIGMA_ASH, fontsize=12, family=fams["disp"])
+    ax.text(7, 3.4, "SETUPS, NOT SIGNALS", color=SIGMA_CYAN, fontsize=10.5, family=fams["mono"])
+
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=100, facecolor=SIGMA_BG)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _sigma_week_stats(days: int = 7) -> dict:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    entries = []
+    for k, mid, t in _res_all_closed():
+        try:
+            if datetime.fromisoformat(t["closed_at"]) >= cutoff:
+                entries.append((k, mid, t))
+        except Exception:
+            continue
+    tot = _res_totals(entries)
+    futs = [(k, m, t) for k, m, t in entries
+            if k == "fut" and isinstance(t.get("result_r"), (int, float))]
+    futs.sort(key=lambda x: x[2]["result_r"], reverse=True)
+
+    def _line(t):
+        d = "long" if t.get("direction") == "LONG" else "short"
+        nm = t.get("analyst_name", "")
+        return f"{t.get('pair', '?').upper()} {d}" + (f", {nm}" if nm else "")
+
+    tot["best_lines"] = [(_line(t), f"{t['result_r']:+.1f}R") for _, _, t in futs[:2]
+                         if t["result_r"] > 0]
+    tot["worst_lines"] = [(_line(t), f"{t['result_r']:+.1f}R") for _, _, t in futs[-2:]
+                          if t["result_r"] < 0]
+    end = datetime.now(IST); start = end - timedelta(days=days)
+    tot["range_txt"] = f"week of {start.strftime('%d')}-{end.strftime('%d %b %Y')}"
+    return tot
+
+
+async def post_weekly_recap() -> bool:
+    stats = _sigma_week_stats(7)
+    if stats["n"] == 0:
+        print("[recap] skipped - no closed trades this week", flush=True)
+        return False
+    ch = bot.get_channel(RECAP_CHANNEL_ID or RESULTS_CHANNEL_ID)
+    if ch is None:
+        return False
+    try:
+        buf = await asyncio.to_thread(make_recap_image, stats)
+    except Exception as e:
+        print(f"[recap] render error: {e}", flush=True)
+        return False
+    content = f"**Weekly Recap** - {stats['n']} calls, {stats['total_r']:+.2f}R net."
+    if RESULTS_CHANNEL_ID:
+        content += f" Full log in <#{RESULTS_CHANNEL_ID}>."
+    try:
+        await ch.send(content=content, file=discord.File(buf, filename="sigma_weekly_recap.png"))
+        return True
+    except Exception as e:
+        print(f"[recap] post error: {e}", flush=True)
+        return False
+
+
+@tasks.loop(time=RECAP_UTC)
+async def sigma_recap_loop():
+    if datetime.now(timezone.utc).weekday() != RECAP_DAY:
+        return
+    await post_weekly_recap()
+
+
+@sigma_recap_loop.before_loop
+async def _before_sigma_recap():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name="results", description="Public results scorecard - every call logged, wins and losses")
+async def results_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    await interaction.followup.send(embed=build_results_summary_embed())
+
+
+@bot.tree.command(name="recap_now", description="(Admin) Post the weekly recap image right now")
+async def recap_now_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok = await post_weekly_recap()
+    await interaction.followup.send("Recap posted." if ok else
+                                    "Recap failed or no closed trades this week - check logs.",
+                                    ephemeral=True)
+
+
+@bot.listen("on_ready")
+async def _sigma_results_on_ready():
+    if RESULTS_CHANNEL_ID and not results_watch_loop.is_running():
+        results_watch_loop.start()
+    if not sigma_recap_loop.is_running():
+        sigma_recap_loop.start()
+    print("[results] board watcher armed", flush=True)
+
+# ═════════════════════════════ END SIGMA RESULTS BOARD ═════════════════════════════
+
+
 bot.run(BOT_TOKEN)
