@@ -5257,7 +5257,7 @@ async def _before_sigma_recap():
 @bot.tree.command(name="results", description="Public results scorecard - every call logged, wins and losses")
 async def results_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
-    await interaction.followup.send(embed=build_results_summary_embed())
+    await interaction.followup.send(embed=build_results_summary_embed(), view=ResultsBoardView())
 
 
 @bot.tree.command(name="recap_now", description="(Admin) Post the weekly recap image right now")
@@ -5425,6 +5425,10 @@ async def _sigma_results_on_ready():
         results_watch_loop.start()
     if not sigma_recap_loop.is_running():
         sigma_recap_loop.start()
+    try:
+        await refresh_results_summary()   # re-attach buttons + fresh numbers on every boot
+    except Exception as e:
+        print(f"[results] startup summary refresh error: {e}", flush=True)
     print("[results] board watcher armed", flush=True)
 
 # ═════════════════════════════ END SIGMA RESULTS BOARD ═════════════════════════════
