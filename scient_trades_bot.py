@@ -4853,13 +4853,17 @@ SIGMA_ASH = "#8593A6"; SIGMA_GREEN = "#16C784"; SIGMA_RED = "#EA3943"
 SIGMA_EMBED_CYAN = discord.Color.from_str(SIGMA_CYAN)
 
 RESULTS_FILE = Path(__file__).with_name("results_board.json")
+_results_lock = asyncio.Lock()
 def load_results() -> dict: return _load(RESULTS_FILE)
 def save_results(d: dict): _save(RESULTS_FILE, d)
 
 
 def _res_ts(iso) -> int:
     try:
-        return int(datetime.fromisoformat(iso).timestamp())
+        d = datetime.fromisoformat(iso)
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return int(d.timestamp())
     except Exception:
         return int(datetime.now(timezone.utc).timestamp())
 
@@ -4912,10 +4916,10 @@ def build_results_summary_embed() -> discord.Embed:
     head = []
     if since:
         head.append(f"**Tracking since:** <t:{_res_ts(since)}:D>")
-    head.append("Every entry below was logged by the bot **at the moment the call was "
+    head.append("Every entry in this channel was logged by the bot **at the moment the setup was "
                 "posted** - the `Posted` timestamp on each card is the original, not added later.")
     embed.description = "\n".join(head)
-    embed.add_field(name="Calls closed", value=str(tot["n"]), inline=True)
+    embed.add_field(name="Setups closed", value=str(tot["n"]), inline=True)
     embed.add_field(name="Win rate", value=f"{tot['wr']:.0f}% ({tot['wins']}W / {tot['losses']}L)", inline=True)
     embed.add_field(name="Net result", value=f"{tot['total_r']:+.2f}R ({tot['graded']} graded)", inline=True)
     embed.add_field(name="Breakeven / Invalidated", value=f"{tot['be']} / {tot['inv']}", inline=True)
@@ -5024,10 +5028,10 @@ class ResultsBoardView(discord.ui.View):
             if start <= c < end:
                 rows.append((k, mid, t))
         if not rows:
-            await interaction.followup.send(f"No closed calls in {pretty}.", ephemeral=True)
+            await interaction.followup.send(f"No closed setups in {pretty}.", ephemeral=True)
             return
         await interaction.followup.send(
-            f"**{pretty}** - {len(rows)} closed calls. Same data as the cards above, machine-readable.",
+            f"**{pretty}** - {len(rows)} closed setups. Same data as the cards above, machine-readable.",
             file=_results_csv(rows, slug), ephemeral=True)
 
     @discord.ui.button(label="Full log (CSV)", style=discord.ButtonStyle.secondary,
@@ -5036,10 +5040,10 @@ class ResultsBoardView(discord.ui.View):
         await interaction.response.defer(ephemeral=True)
         rows = _res_all_closed()
         if not rows:
-            await interaction.followup.send("No closed calls yet.", ephemeral=True)
+            await interaction.followup.send("No closed setups yet.", ephemeral=True)
             return
         await interaction.followup.send(
-            f"**Full log** - {len(rows)} closed calls since tracking began. "
+            f"**Full log** - {len(rows)} closed setups since tracking began. "
             "Every row matches a card in this channel.",
             file=_results_csv(rows, "full_log"), ephemeral=True)
 
@@ -5090,11 +5094,23 @@ async def _results_watch_error(*args):
     print("[results] watcher crashed - restarting in 60s", flush=True)
     traceback.print_exc()
     await asyncio.sleep(60)
-    if not results_watch_loop.is_running():
-        results_watch_loop.restart()
+    try:
+        if not results_watch_loop.is_running():
+            results_watch_loop.start()
+    except Exception:
+        pass
 
 
 async def _results_watch_tick():
+    if not RESULTS_CHANNEL_ID:
+        return
+    if _results_lock.locked():
+        return          # a tick is already in flight - never double-post
+    async with _results_lock:
+        await _results_watch_tick_inner()
+
+
+async def _results_watch_tick_inner():
     if not RESULTS_CHANNEL_ID:
         return
     ch = bot.get_channel(RESULTS_CHANNEL_ID)
@@ -5158,6 +5174,8 @@ def _sigma_fonts():
                     fams["disp"] = name
                 if "jetbrains" in low or "sigmamono" in low:
                     fams["mono"] = name
+                if "inter" in low or "sigmatext" in low:
+                    fams["txt"] = name
         return fams
     except Exception:
         return {"disp": "DejaVu Sans", "mono": "DejaVu Sans Mono"}
@@ -5190,7 +5208,7 @@ def make_recap_image(stats: dict) -> io.BytesIO:
     ax.text(7, 109, "WEEKLY", color=SIGMA_PAPER, fontsize=34, fontweight="bold", family=fams["disp"])
     ax.text(7, 101, "RECAP", color=SIGMA_CYAN, fontsize=34, fontweight="bold", family=fams["disp"])
 
-    cells = [("CALLS CLOSED", str(stats["n"]), SIGMA_PAPER),
+    cells = [("SETUPS CLOSED", str(stats["n"]), SIGMA_PAPER),
              ("CLOSED GREEN", str(stats["wins"]), SIGMA_GREEN),
              ("CLOSED RED", str(stats["losses"]), SIGMA_RED),
              ("NET", f"{stats['total_r']:+.1f}R", SIGMA_CYAN)]
@@ -5215,7 +5233,7 @@ def make_recap_image(stats: dict) -> io.BytesIO:
             ax.text(101, y, r, color=SIGMA_RED, fontsize=12.5, family=fams["mono"], ha="right")
             y -= 4.6
     ax.plot([7, 101], [max(y, 15.5), max(y, 15.5)], color=SIGMA_SLATE, linewidth=1.2)
-    ax.text(7, 11.5, "Every call was posted before it played out.", color=SIGMA_ASH,
+    ax.text(7, 11.5, "Every setup was posted before it played out.", color=SIGMA_ASH,
             fontsize=12, family=fams["disp"])
     ax.text(7, 7.8, "Full log open in #results-board.", color=SIGMA_ASH, fontsize=12, family=fams["disp"])
     ax.text(7, 3.4, "SETUPS, NOT SIGNALS", color=SIGMA_CYAN, fontsize=10.5, family=fams["mono"])
@@ -5232,7 +5250,10 @@ def _sigma_week_stats(days: int = 7) -> dict:
     entries = []
     for k, mid, t in _res_all_closed():
         try:
-            if datetime.fromisoformat(t["closed_at"]) >= cutoff:
+            d = datetime.fromisoformat(t["closed_at"])
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            if d >= cutoff:
                 entries.append((k, mid, t))
         except Exception:
             continue
@@ -5251,8 +5272,139 @@ def _sigma_week_stats(days: int = 7) -> dict:
     tot["worst_lines"] = [(_line(t), f"{t['result_r']:+.1f}R") for _, _, t in futs[-2:]
                           if t["result_r"] < 0]
     end = datetime.now(IST); start = end - timedelta(days=days)
-    tot["range_txt"] = f"week of {start.strftime('%d')}-{end.strftime('%d %b %Y')}"
+    if days == 7:
+        tot["range_txt"] = f"week of {start.strftime('%d')}-{end.strftime('%d %b %Y')}"
+    else:
+        tot["range_txt"] = f"last {days} days \u00b7 to {end.strftime('%d %b %Y')}"
     return tot
+
+
+def _sigma_range_stats(start, end):
+    """Per-analyst + totals for closed setups inside [start, end) - IST datetimes."""
+    entries = []
+    for k, mid, t in _res_all_closed():
+        try:
+            d = datetime.fromisoformat(t["closed_at"])
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            if start <= d.astimezone(IST) < end:
+                entries.append((k, mid, t))
+        except Exception:
+            continue
+    tot = _res_totals(entries)
+    per = {}
+    for k, mid, t in entries:
+        per.setdefault(t.get("analyst_name", "?"), []).append((k, mid, t))
+    rows = []
+    for name, ent in per.items():
+        s = _res_totals(ent)
+        rows.append({"name": name, "n": s["n"], "w": s["wins"], "l": s["losses"],
+                     "wr": s["wr"], "r": s["total_r"]})
+    # fixed order: Scient first, Owais second, then everyone else by net R
+    _rank = {"scient": 0, "owais": 1}
+    rows.sort(key=lambda r: (_rank.get(r["name"].strip().lower(), 2), -r["r"]))
+    tot["rows"] = rows
+    return tot
+
+
+def make_monthly_recap_image(stats: dict) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    fams = _sigma_fonts()
+    DISP, MONO = fams["disp"], fams["mono"]
+    fig = plt.figure(figsize=(16, 9), facecolor=SIGMA_BG)
+    ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 160); ax.set_ylim(0, 90); ax.axis("off")
+
+    def box(x, y, w, h, fc=SIGMA_CARD, ec=SIGMA_SLATE):
+        ax.add_patch(mpatches.FancyBboxPatch((x, y), w, h,
+                     boxstyle="round,pad=0,rounding_size=1.6",
+                     facecolor=fc, edgecolor=ec, linewidth=1.4))
+
+    box(6, 80, 6.5, 6.5, fc=SIGMA_CYAN, ec=SIGMA_CYAN)
+    ax.plot([11.2, 7.5, 9.5, 7.5, 11.2], [85.2, 85.2, 83.25, 81.3, 81.3],
+            color=SIGMA_BG, lw=3.0, solid_capstyle="butt")
+    ax.text(14.5, 84.6, "SIGMA TRADING", color=SIGMA_PAPER, fontsize=17, family=DISP, va="center")
+    ax.text(14.5, 81.9, "setups, not signals", color=SIGMA_ASH, fontsize=9.5, family=MONO, va="center")
+    ax.text(154, 85.2, stats["month"].upper(), color=SIGMA_CYAN, fontsize=21, family=DISP, ha="right", va="center")
+    ax.text(154, 81.7, "MONTHLY RECAP", color=SIGMA_PAPER, fontsize=11, family=MONO, ha="right", va="center")
+
+    box(6, 14, 98, 60)
+    for name, x, al in [("ANALYST", 10, "left"), ("SETUPS", 42, "center"), ("WINS", 56, "center"),
+                        ("LOSS", 68, "center"), ("WR", 81, "center"), ("NET", 96, "right")]:
+        ax.text(x, 68.5, name, color=SIGMA_CYAN, fontsize=10.5, family=MONO, ha=al)
+    ax.plot([10, 100], [66, 66], color=SIGMA_SLATE, lw=1.2)
+    y = 60
+    for r in stats["rows"][:5]:
+        ax.text(10, y, r["name"], color=SIGMA_PAPER, fontsize=14, family=DISP, va="center")
+        ax.text(42, y, str(r["n"]), color=SIGMA_PAPER, fontsize=13.5, family=MONO, ha="center", va="center")
+        ax.text(56, y, str(r["w"]), color=SIGMA_GREEN, fontsize=13.5, family=MONO, ha="center", va="center")
+        ax.text(68, y, str(r["l"]), color=SIGMA_RED, fontsize=13.5, family=MONO, ha="center", va="center")
+        ax.text(81, y, f"{r['wr']:.0f}%", color=SIGMA_PAPER, fontsize=13.5, family=MONO, ha="center", va="center")
+        col = SIGMA_GREEN if r["r"] >= 0 else SIGMA_RED
+        ax.text(96, y, f"{r['r']:+.2f}R", color=col, fontsize=13.5, family=MONO, ha="right", va="center")
+        y -= 9.2
+    ax.text(10, 17.5, "BE / invalidated setups excluded from W-L \u00b7 every entry timestamped at post time",
+            color=SIGMA_ASH, fontsize=8.5, family=fams.get("txt", MONO))
+
+    box(110, 14, 44, 60)
+    ax.text(114, 68, stats["month"].split()[0].upper(), color=SIGMA_CYAN, fontsize=16, family=DISP)
+    ax.text(114, 63.5, "TRADING RECAP", color=SIGMA_PAPER, fontsize=11, family=DISP)
+    ax.plot([114, 150], [60.5, 60.5], color=SIGMA_SLATE, lw=1.2)
+    ax.text(114, 55, "SETUPS", color=SIGMA_ASH, fontsize=9, family=MONO)
+    ax.text(114, 50, str(stats["n"]), color=SIGMA_PAPER, fontsize=22, family=MONO)
+    ax.text(134, 55, "WIN RATE", color=SIGMA_ASH, fontsize=9, family=MONO)
+    ax.text(134, 50, f"{stats['wr']:.0f}%", color=SIGMA_PAPER, fontsize=22, family=MONO)
+    ax.text(114, 41, "NET", color=SIGMA_ASH, fontsize=9, family=MONO)
+    ncol = SIGMA_GREEN if stats["total_r"] >= 0 else SIGMA_RED
+    ax.text(114, 34.5, f"{stats['total_r']:+.2f}R", color=ncol, fontsize=30, family=MONO)
+    ax.text(114, 26, "BE / INVALIDATED", color=SIGMA_ASH, fontsize=9, family=MONO)
+    ax.text(114, 21.5, f"{stats['be']} / {stats['inv']}", color=SIGMA_PAPER, fontsize=16, family=MONO)
+
+    ax.text(80, 7, "wins and losses both logged \u00b7 the log is public in results-board \u00b7 not financial advice",
+            color=SIGMA_ASH, fontsize=10, family=fams.get("txt", MONO), ha="center")
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor=SIGMA_BG)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+async def post_monthly_recap(start=None, end=None, label=None) -> bool:
+    if start is None:
+        start, end, _slug, label = _last_complete_month_range()
+    stats = _sigma_range_stats(start, end)
+    if stats["n"] == 0:
+        print("[recap] monthly skipped - no closed setups in range", flush=True)
+        return False
+    stats["month"] = label or start.strftime("%B %Y")
+    ch = bot.get_channel(RECAP_CHANNEL_ID or RESULTS_CHANNEL_ID)
+    if ch is None:
+        return False
+    try:
+        buf = await asyncio.to_thread(make_monthly_recap_image, stats)
+        content = f"**{stats['month']} - Monthly Recap** \u00b7 {stats['n']} setups, {stats['total_r']:+.2f}R net."
+        if RESULTS_CHANNEL_ID:
+            content += f" Full log in <#{RESULTS_CHANNEL_ID}>."
+        await ch.send(content=content, file=discord.File(buf, filename="sigma_monthly_recap.png"))
+        return True
+    except Exception as e:
+        print(f"[recap] monthly error: {e}", flush=True)
+        return False
+
+
+@tasks.loop(time=RECAP_UTC)
+async def sigma_monthly_loop():
+    # runs daily at 10:00 IST; posts only on the 1st, for the month just ended
+    if datetime.now(IST).day != 1:
+        return
+    await post_monthly_recap()
+
+
+@sigma_monthly_loop.before_loop
+async def _before_sigma_monthly():
+    await bot.wait_until_ready()
 
 
 async def post_weekly_recap() -> bool:
@@ -5268,7 +5420,7 @@ async def post_weekly_recap() -> bool:
     except Exception as e:
         print(f"[recap] render error: {e}", flush=True)
         return False
-    content = f"**Weekly Recap** - {stats['n']} calls, {stats['total_r']:+.2f}R net."
+    content = f"**Weekly Recap** - {stats['n']} setups, {stats['total_r']:+.2f}R net."
     if RESULTS_CHANNEL_ID:
         content += f" Full log in <#{RESULTS_CHANNEL_ID}>."
     try:
@@ -5291,7 +5443,7 @@ async def _before_sigma_recap():
     await bot.wait_until_ready()
 
 
-@bot.tree.command(name="results", description="Public results scorecard - every call logged, wins and losses")
+@bot.tree.command(name="results", description="Public results scorecard - every setup logged, wins and losses")
 async def results_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     await interaction.followup.send(embed=build_results_summary_embed(), view=ResultsBoardView())
@@ -5526,30 +5678,29 @@ async def recap_month_cmd(interaction: discord.Interaction, days: int = 30):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    stats = _sigma_week_stats(max(1, min(days, 365)))
-    if stats["n"] == 0:
-        await interaction.followup.send(f"No closed setups in the last {days} days.", ephemeral=True)
-        return
-    ch = bot.get_channel(RECAP_CHANNEL_ID or RESULTS_CHANNEL_ID)
-    if ch is None:
-        await interaction.followup.send("Recap channel not found.", ephemeral=True)
-        return
-    try:
-        buf = await asyncio.to_thread(make_recap_image, stats)
-        await ch.send(content=f"**Recap** - last {days} days · {stats['n']} setups, {stats['total_r']:+.2f}R net.",
-                      file=discord.File(buf, filename="sigma_recap.png"))
-        await interaction.followup.send("Recap posted.", ephemeral=True)
-    except Exception as e:
-        await interaction.followup.send(f"Failed: `{e}`", ephemeral=True)
+    days = max(1, min(days, 365))
+    end = datetime.now(IST)
+    start = end - timedelta(days=days)
+    label = _last_complete_month_range()[3] if days == 30 else f"Last {days} days"
+    ok = await post_monthly_recap(start, end, label if days != 30 else None)
+    await interaction.followup.send("Recap posted." if ok else
+                                    f"No closed setups in the last {days} days.", ephemeral=True)
 
+
+_sigma_view_registered = False
 
 @bot.listen("on_ready")
 async def _sigma_results_on_ready():
-    bot.add_view(ResultsBoardView())
+    global _sigma_view_registered
+    if not _sigma_view_registered:
+        bot.add_view(ResultsBoardView())
+        _sigma_view_registered = True
     if RESULTS_CHANNEL_ID and not results_watch_loop.is_running():
         results_watch_loop.start()
     if not sigma_recap_loop.is_running():
         sigma_recap_loop.start()
+    if not sigma_monthly_loop.is_running():
+        sigma_monthly_loop.start()
     try:
         await refresh_results_summary()   # re-attach buttons + fresh numbers on every boot
     except Exception as e:
