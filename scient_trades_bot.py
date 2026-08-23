@@ -5048,7 +5048,10 @@ class ResultsBoardView(discord.ui.View):
             file=_results_csv(rows, "full_log"), ephemeral=True)
 
 
-async def refresh_results_summary():
+async def refresh_results_summary(repost: bool = False):
+    """repost=False: edit the existing summary in place.
+    repost=True: delete the old summary and send a fresh one so it is always
+    the LAST message in the channel (result cards stack above it)."""
     if not RESULTS_CHANNEL_ID:
         return
     ch = bot.get_channel(RESULTS_CHANNEL_ID)
@@ -5057,11 +5060,17 @@ async def refresh_results_summary():
     state = load_results()
     embed = build_results_summary_embed()
     msg_id = state.get("summary_message_id")
-    if msg_id:
+    if msg_id and not repost:
         try:
             msg = await ch.fetch_message(msg_id)
             await msg.edit(embed=embed, view=ResultsBoardView())
             return
+        except (discord.NotFound, discord.HTTPException):
+            pass
+    if msg_id and repost:
+        try:
+            old_msg = await ch.fetch_message(msg_id)
+            await old_msg.delete()
         except (discord.NotFound, discord.HTTPException):
             pass
     try:
@@ -5071,6 +5080,14 @@ async def refresh_results_summary():
         return
     try:
         await msg.pin()
+        # delete the "Quant pinned a message" system notification to keep the channel clean
+        async for m in ch.history(limit=5):
+            if m.type == discord.MessageType.pins_add and m.author.id == bot.user.id:
+                try:
+                    await m.delete()
+                except discord.HTTPException:
+                    pass
+                break
     except discord.HTTPException:
         pass
     state["summary_message_id"] = msg.id
@@ -5142,7 +5159,7 @@ async def _results_watch_tick_inner():
         state["posted_msgs"] = posted_msgs
         save_results(state)
         await asyncio.sleep(1.5)
-    await refresh_results_summary()
+    await refresh_results_summary(repost=True)
     print(f"[results] posted {len(new)} closed trade(s)", flush=True)
 
 
