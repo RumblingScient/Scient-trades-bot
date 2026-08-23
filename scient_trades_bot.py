@@ -4,7 +4,7 @@ from discord import app_commands
 from discord.ext import commands
 from discord.ui import View, Button
 from discord.ext import tasks
-import os, json, re, hashlib, aiohttp, io, asyncio
+import os, json, re, hashlib, aiohttp, io, asyncio, csv
 from pathlib import Path
 from datetime import datetime, timezone, timedelta, time as dt_time
 
@@ -4821,6 +4821,742 @@ async def spot_stats(interaction: discord.Interaction, analyst: discord.Member =
     embed.add_field(name="Results", value=(", ".join(results[:10]) if results else "-"), inline=False)
     embed.set_footer(text="Scient Lounge - Spot Journal")
     await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SIGMA RESULTS BOARD
+#  - watches trades.json / spot plays for newly closed entries, posts each to
+#    #results-board as a permanent card with original Posted/Closed timestamps
+#  - maintains a pinned summary embed (combined + per-analyst)
+#  - weekly recap image every Monday 10:00 IST -> #monthly-recap
+#  - first run backfills the entire DB chronologically (rate-limit safe)
+# ═══════════════════════════════════════════════════════════════════════════
+
+RESULTS_CHANNEL_ID = 1540681895812005928       # results-board
+INVALIDATIONS_CHANNEL_ID = 0                   # off (feature cut)
+RECAP_CHANNEL_ID = 1500920688515616922         # monthly-recap
+RESULTS_POLL_MIN = 2
+RECAP_DAY = 0                                  # Monday
+RECAP_UTC = dt_time(hour=4, minute=30, tzinfo=timezone.utc)  # 10:00 IST
+
+# Only these analysts appear on the public results board (quant/Terminal entries
+# in trades.json are excluded). Empty set = allow everyone.
+RESULTS_ANALYST_IDS = {
+    249880856993202187,   # Scient
+    1120017600026513468,  # Owais
+    1268246432197120090,  # 94
+}
+
+SIGMA_BG = "#0A0C10"; SIGMA_CARD = "#141A22"; SIGMA_SLATE = "#2A3644"
+SIGMA_CYAN = "#22D3C5"; SIGMA_AMBER = "#E8590C"; SIGMA_PAPER = "#EEF3F8"
+SIGMA_ASH = "#8593A6"; SIGMA_GREEN = "#16C784"; SIGMA_RED = "#EA3943"
+SIGMA_EMBED_CYAN = discord.Color.from_str(SIGMA_CYAN)
+
+RESULTS_FILE = Path(__file__).with_name("results_board.json")
+def load_results() -> dict: return _load(RESULTS_FILE)
+def save_results(d: dict): _save(RESULTS_FILE, d)
+
+
+def _res_ts(iso) -> int:
+    try:
+        return int(datetime.fromisoformat(iso).timestamp())
+    except Exception:
+        return int(datetime.now(timezone.utc).timestamp())
+
+
+def _res_all_closed():
+    def _ok(rec):
+        if not RESULTS_ANALYST_IDS:
+            return True
+        return rec.get("analyst_id") in RESULTS_ANALYST_IDS
+
+    out = []
+    for mid, t in load_trades().items():
+        if t.get("closed") and _ok(t):
+            out.append(("fut", mid, t))
+    for mid, p in load_spot().items():
+        if p.get("closed") and _ok(p):
+            out.append(("spot", mid, p))
+    out.sort(key=lambda x: x[2].get("closed_at") or x[2].get("created_at") or "")
+    return out
+
+
+def sigma_tracking_since():
+    def _ok(rec):
+        return not RESULTS_ANALYST_IDS or rec.get("analyst_id") in RESULTS_ANALYST_IDS
+    dates = [t.get("created_at") for t in load_trades().values() if t.get("created_at") and _ok(t)]
+    dates += [p.get("created_at") for p in load_spot().values() if p.get("created_at") and _ok(p)]
+    return min(dates) if dates else None
+
+
+def _res_totals(entries):
+    rs = [t.get("result_r") for k, _, t in entries
+          if k == "fut" and isinstance(t.get("result_r"), (int, float))]
+    wins = sum(1 for _, _, t in entries if t.get("result") == "WIN")
+    losses = sum(1 for _, _, t in entries if t.get("result") == "LOSS")
+    be = sum(1 for _, _, t in entries if t.get("result") == "BE")
+    inv = sum(1 for _, _, t in entries if t.get("result") == "INVALID")
+    decided = wins + losses
+    return {"n": len(entries), "wins": wins, "losses": losses, "be": be, "inv": inv,
+            "wr": (wins / decided * 100) if decided else 0,
+            "total_r": sum(rs) if rs else 0.0, "graded": len(rs),
+            "best": max(rs) if rs else None, "worst": min(rs) if rs else None}
+
+
+def build_results_summary_embed() -> discord.Embed:
+    entries = _res_all_closed()
+    tot = _res_totals(entries)
+    since = sigma_tracking_since()
+    embed = discord.Embed(title="Results Board - Full Log", color=SIGMA_EMBED_CYAN,
+                          timestamp=datetime.now(timezone.utc))
+    head = []
+    if since:
+        head.append(f"**Tracking since:** <t:{_res_ts(since)}:D>")
+    head.append("Every entry below was logged by the bot **at the moment the call was "
+                "posted** - the `Posted` timestamp on each card is the original, not added later.")
+    embed.description = "\n".join(head)
+    embed.add_field(name="Calls closed", value=str(tot["n"]), inline=True)
+    embed.add_field(name="Win rate", value=f"{tot['wr']:.0f}% ({tot['wins']}W / {tot['losses']}L)", inline=True)
+    embed.add_field(name="Net result", value=f"{tot['total_r']:+.2f}R ({tot['graded']} graded)", inline=True)
+    embed.add_field(name="Breakeven / Invalidated", value=f"{tot['be']} / {tot['inv']}", inline=True)
+    if tot["best"] is not None:
+        embed.add_field(name="Best / Worst", value=f"{tot['best']:+g}R / {tot['worst']:+g}R", inline=True)
+    per = {}
+    for k, mid, t in entries:
+        per.setdefault(t.get("analyst_name", "?"), []).append((k, mid, t))
+    lines = []
+    for name, ent in sorted(per.items()):
+        s = _res_totals(ent)
+        lines.append(f"**{name}** - {s['n']} closed - {s['wr']:.0f}% WR - {s['total_r']:+.2f}R")
+    if lines:
+        embed.add_field(name="By analyst", value="\n".join(lines)[:1024], inline=False)
+    embed.set_footer(text="Sigma Trading - setups, not signals - wins and losses both logged - not financial advice")
+    return embed
+
+
+def build_result_entry_embed(kind: str, t: dict) -> discord.Embed:
+    res = t.get("result", "?")
+    color = {"WIN": GREEN, "LOSS": RED, "BE": GREY, "INVALID": DGREY}.get(res, GREY)
+    if kind == "spot":
+        rtxt = f" {t['result_pct']}" if t.get("result_pct") else ""
+        title = f"[{res}]{rtxt} - SPOT {t.get('pair', '?').upper()}"
+    else:
+        r = t.get("result_r")
+        rtxt = f" {r:+.2f}R" if isinstance(r, (int, float)) else ""
+        d = "LONG" if t.get("direction") == "LONG" else "SHORT"
+        tfs = tf(t)
+        title = f"[{res}]{rtxt} - {d} {t.get('pair', '?').upper()}" + (f" {tfs}" if tfs else "")
+    embed = discord.Embed(title=title, color=color)
+    if kind == "fut":
+        embed.add_field(name="Entry", value=entry_display(t, marks=False) or "-", inline=True)
+        embed.add_field(name="Invalidation", value=str(t.get("sl") or "-"), inline=True)
+        if t.get("avg_exit") is not None:
+            embed.add_field(name="Avg exit", value=fnum(t["avg_exit"]), inline=True)
+    else:
+        embed.add_field(name="DCA zone", value=str(t.get("dca_zone") or "-"), inline=True)
+        if t.get("avg_entry"):
+            embed.add_field(name="Avg entry", value=str(t["avg_entry"]), inline=True)
+        if t.get("avg_exit"):
+            embed.add_field(name="Avg exit", value=str(t["avg_exit"]), inline=True)
+    posted = t.get("created_at")
+    closed = t.get("closed_at") or posted
+    embed.add_field(name="Timeline",
+                    value=f"Posted <t:{_res_ts(posted)}:f>\nClosed <t:{_res_ts(closed)}:f>",
+                    inline=False)
+    ov = t.get("override")
+    if ov:
+        val = f"<t:{_res_ts(ov.get('at'))}:f> by {ov.get('by', 'owner')}"
+        if ov.get("note"):
+            val += f"\n{ov['note']}"
+        embed.add_field(name="Corrected", value=val[:1024], inline=False)
+    embed.set_author(name=t.get("analyst_name", "?"), icon_url=t.get("analyst_avatar") or None)
+    embed.set_footer(text="Sigma Trading - logged at post time - not financial advice")
+    return embed
+
+
+def _results_csv(entries, label: str) -> discord.File:
+    buf = io.StringIO()
+    w = csv.writer(buf)
+    w.writerow(["closed_at_utc", "posted_at_utc", "analyst", "kind", "pair", "direction",
+                "timeframe", "entry", "invalidation", "avg_exit", "result", "result_r",
+                "result_pct", "corrected"])
+    for k, mid, t in entries:
+        if k == "fut":
+            w.writerow([t.get("closed_at", ""), t.get("created_at", ""),
+                        t.get("analyst_name", ""), "futures", t.get("pair", "").upper(),
+                        t.get("direction", ""), tf(t) or "",
+                        entry_display(t, marks=False) or "", t.get("sl", ""),
+                        t.get("avg_exit", ""), t.get("result", ""),
+                        t.get("result_r", ""), "", "yes" if t.get("override") else ""])
+        else:
+            w.writerow([t.get("closed_at", ""), t.get("created_at", ""),
+                        t.get("analyst_name", ""), "spot", t.get("pair", "").upper(),
+                        "", "", t.get("dca_zone", ""), "", t.get("avg_exit", ""),
+                        t.get("result", ""), "", t.get("result_pct", ""),
+                        "yes" if t.get("override") else ""])
+    data = buf.getvalue().encode("utf-8")
+    return discord.File(io.BytesIO(data), filename=f"sigma_results_{label}.csv")
+
+
+def _last_complete_month_range():
+    now = datetime.now(IST)
+    first_this = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    last_prev = first_this - timedelta(seconds=1)
+    first_prev = last_prev.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return first_prev, first_this, first_prev.strftime("%b_%Y").lower(), first_prev.strftime("%B %Y")
+
+
+class ResultsBoardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="Last month (CSV)", style=discord.ButtonStyle.secondary,
+                       custom_id="sigma_results_csv_month")
+    async def csv_month(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        start, end, slug, pretty = _last_complete_month_range()
+        rows = []
+        for k, mid, t in _res_all_closed():
+            try:
+                c = datetime.fromisoformat(t["closed_at"]).astimezone(IST)
+            except Exception:
+                continue
+            if start <= c < end:
+                rows.append((k, mid, t))
+        if not rows:
+            await interaction.followup.send(f"No closed calls in {pretty}.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"**{pretty}** - {len(rows)} closed calls. Same data as the cards above, machine-readable.",
+            file=_results_csv(rows, slug), ephemeral=True)
+
+    @discord.ui.button(label="Full log (CSV)", style=discord.ButtonStyle.secondary,
+                       custom_id="sigma_results_csv_all")
+    async def csv_all(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.defer(ephemeral=True)
+        rows = _res_all_closed()
+        if not rows:
+            await interaction.followup.send("No closed calls yet.", ephemeral=True)
+            return
+        await interaction.followup.send(
+            f"**Full log** - {len(rows)} closed calls since tracking began. "
+            "Every row matches a card in this channel.",
+            file=_results_csv(rows, "full_log"), ephemeral=True)
+
+
+async def refresh_results_summary():
+    if not RESULTS_CHANNEL_ID:
+        return
+    ch = bot.get_channel(RESULTS_CHANNEL_ID)
+    if ch is None:
+        return
+    state = load_results()
+    embed = build_results_summary_embed()
+    msg_id = state.get("summary_message_id")
+    if msg_id:
+        try:
+            msg = await ch.fetch_message(msg_id)
+            await msg.edit(embed=embed, view=ResultsBoardView())
+            return
+        except (discord.NotFound, discord.HTTPException):
+            pass
+    try:
+        msg = await ch.send(embed=embed, view=ResultsBoardView())
+    except Exception as e:
+        print(f"[results] summary send error: {e}", flush=True)
+        return
+    try:
+        await msg.pin()
+    except discord.HTTPException:
+        pass
+    state["summary_message_id"] = msg.id
+    save_results(state)
+
+
+@tasks.loop(minutes=RESULTS_POLL_MIN)
+async def results_watch_loop():
+    """Never let an exception kill this loop - a dead loop silently stops the board."""
+    try:
+        await _results_watch_tick()
+    except Exception as e:
+        import traceback
+        print(f"[results] watcher tick error: {e}", flush=True)
+        traceback.print_exc()
+
+
+@results_watch_loop.error
+async def _results_watch_error(*args):
+    import traceback
+    print("[results] watcher crashed - restarting in 60s", flush=True)
+    traceback.print_exc()
+    await asyncio.sleep(60)
+    if not results_watch_loop.is_running():
+        results_watch_loop.restart()
+
+
+async def _results_watch_tick():
+    if not RESULTS_CHANNEL_ID:
+        return
+    ch = bot.get_channel(RESULTS_CHANNEL_ID)
+    if ch is None:
+        return
+    state = load_results()
+    posted = set(state.get("posted", []))
+    new = [(k, mid, t) for k, mid, t in _res_all_closed() if f"{k}:{mid}" not in posted]
+    if not new:
+        return
+    inv_ch = bot.get_channel(INVALIDATIONS_CHANNEL_ID) if INVALIDATIONS_CHANNEL_ID else None
+    posted_msgs = state.get("posted_msgs", {})
+    for k, mid, t in new:
+        try:
+            _m = await ch.send(embed=build_result_entry_embed(k, t))
+            posted_msgs[f"{k}:{mid}"] = _m.id
+        except Exception as e:
+            import traceback
+            print(f"[results] post error {mid} ({t.get('pair')}): {e}", flush=True)
+            traceback.print_exc()
+            continue
+        if inv_ch and t.get("result") in ("LOSS", "INVALID"):
+            try:
+                await inv_ch.send(embed=build_result_entry_embed(k, t))
+            except Exception as e:
+                print(f"[results] mirror error: {e}", flush=True)
+        posted.add(f"{k}:{mid}")
+        state["posted"] = list(posted)
+        state["posted_msgs"] = posted_msgs
+        save_results(state)
+        await asyncio.sleep(1.5)
+    await refresh_results_summary()
+    print(f"[results] posted {len(new)} closed trade(s)", flush=True)
+
+
+@results_watch_loop.before_loop
+async def _before_results_watch():
+    await bot.wait_until_ready()
+
+
+# ---------------- weekly recap image ----------------
+
+def _sigma_fonts():
+    try:
+        from matplotlib import font_manager
+        fdir = Path(__file__).with_name("fonts")
+        fams = {"disp": "DejaVu Sans", "mono": "DejaVu Sans Mono"}
+        if fdir.exists():
+            found = set()
+            for f in fdir.glob("*.ttf"):
+                try:
+                    font_manager.fontManager.addfont(str(f))
+                    for fe in font_manager.fontManager.ttflist:
+                        if str(f) == fe.fname:
+                            found.add(fe.name)
+                except Exception:
+                    continue
+            for name in found:
+                low = name.lower()
+                if "grotesk" in low or "sigmadisplay" in low:
+                    fams["disp"] = name
+                if "jetbrains" in low or "sigmamono" in low:
+                    fams["mono"] = name
+        return fams
+    except Exception:
+        return {"disp": "DejaVu Sans", "mono": "DejaVu Sans Mono"}
+
+
+def make_recap_image(stats: dict) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    fams = _sigma_fonts()
+    fig = plt.figure(figsize=(10.8, 13.5), facecolor=SIGMA_BG)
+    ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 108); ax.set_ylim(0, 135)
+    ax.axis("off"); ax.set_facecolor(SIGMA_BG)
+
+    def box(x, y, w, h, fc=SIGMA_CARD, ec=SIGMA_SLATE):
+        ax.add_patch(mpatches.FancyBboxPatch((x, y), w, h,
+                     boxstyle="round,pad=0,rounding_size=1.4",
+                     facecolor=fc, edgecolor=ec, linewidth=1.2))
+
+    box(7, 122, 9, 9, fc=SIGMA_CYAN, ec=SIGMA_CYAN)
+    ax.plot([14.2, 9.0, 11.8, 9.0, 14.2], [129.2, 129.2, 126.5, 123.8, 123.8],
+            color=SIGMA_BG, linewidth=3.4, solid_capstyle="butt")
+    ax.text(19, 126.8, "SIGMA TRADING", color=SIGMA_PAPER, fontsize=21,
+            fontweight="bold", family=fams["disp"], va="center")
+    ax.text(19, 123.4, stats["range_txt"], color=SIGMA_ASH, fontsize=11,
+            family=fams["mono"], va="center")
+    ax.plot([7, 101], [119.5, 119.5], color=SIGMA_SLATE, linewidth=1.2)
+
+    ax.text(7, 109, "WEEKLY", color=SIGMA_PAPER, fontsize=34, fontweight="bold", family=fams["disp"])
+    ax.text(7, 101, "RECAP", color=SIGMA_CYAN, fontsize=34, fontweight="bold", family=fams["disp"])
+
+    cells = [("CALLS CLOSED", str(stats["n"]), SIGMA_PAPER),
+             ("CLOSED GREEN", str(stats["wins"]), SIGMA_GREEN),
+             ("CLOSED RED", str(stats["losses"]), SIGMA_RED),
+             ("NET", f"{stats['total_r']:+.1f}R", SIGMA_CYAN)]
+    for i, (label, val, col) in enumerate(cells):
+        x = 7 + (i % 2) * 48.5; y = 78 - (i // 2) * 19
+        box(x, y, 45.5, 16)
+        ax.text(x + 3, y + 11.5, label, color=SIGMA_ASH, fontsize=10, family=fams["mono"])
+        ax.text(x + 3, y + 3.5, val, color=col, fontsize=25, fontweight="bold", family=fams["mono"])
+
+    y = 52
+    if stats["best_lines"]:
+        ax.text(7, y, "BEST", color=SIGMA_CYAN, fontsize=10.5, family=fams["mono"]); y -= 4.5
+        for line, r in stats["best_lines"]:
+            ax.text(7, y, line, color=SIGMA_PAPER, fontsize=12.5, family=fams["disp"])
+            ax.text(101, y, r, color=SIGMA_GREEN, fontsize=12.5, family=fams["mono"], ha="right")
+            y -= 4.6
+        y -= 2.5
+    if stats["worst_lines"]:
+        ax.text(7, y, "WORST", color=SIGMA_AMBER, fontsize=10.5, family=fams["mono"]); y -= 4.5
+        for line, r in stats["worst_lines"]:
+            ax.text(7, y, line, color=SIGMA_PAPER, fontsize=12.5, family=fams["disp"])
+            ax.text(101, y, r, color=SIGMA_RED, fontsize=12.5, family=fams["mono"], ha="right")
+            y -= 4.6
+    ax.plot([7, 101], [max(y, 15.5), max(y, 15.5)], color=SIGMA_SLATE, linewidth=1.2)
+    ax.text(7, 11.5, "Every call was posted before it played out.", color=SIGMA_ASH,
+            fontsize=12, family=fams["disp"])
+    ax.text(7, 7.8, "Full log open in #results-board.", color=SIGMA_ASH, fontsize=12, family=fams["disp"])
+    ax.text(7, 3.4, "SETUPS, NOT SIGNALS", color=SIGMA_CYAN, fontsize=10.5, family=fams["mono"])
+
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=100, facecolor=SIGMA_BG)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+def _sigma_week_stats(days: int = 7) -> dict:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+    entries = []
+    for k, mid, t in _res_all_closed():
+        try:
+            if datetime.fromisoformat(t["closed_at"]) >= cutoff:
+                entries.append((k, mid, t))
+        except Exception:
+            continue
+    tot = _res_totals(entries)
+    futs = [(k, m, t) for k, m, t in entries
+            if k == "fut" and isinstance(t.get("result_r"), (int, float))]
+    futs.sort(key=lambda x: x[2]["result_r"], reverse=True)
+
+    def _line(t):
+        d = "long" if t.get("direction") == "LONG" else "short"
+        nm = t.get("analyst_name", "")
+        return f"{t.get('pair', '?').upper()} {d}" + (f", {nm}" if nm else "")
+
+    tot["best_lines"] = [(_line(t), f"{t['result_r']:+.1f}R") for _, _, t in futs[:2]
+                         if t["result_r"] > 0]
+    tot["worst_lines"] = [(_line(t), f"{t['result_r']:+.1f}R") for _, _, t in futs[-2:]
+                          if t["result_r"] < 0]
+    end = datetime.now(IST); start = end - timedelta(days=days)
+    tot["range_txt"] = f"week of {start.strftime('%d')}-{end.strftime('%d %b %Y')}"
+    return tot
+
+
+async def post_weekly_recap() -> bool:
+    stats = _sigma_week_stats(7)
+    if stats["n"] == 0:
+        print("[recap] skipped - no closed trades this week", flush=True)
+        return False
+    ch = bot.get_channel(RECAP_CHANNEL_ID or RESULTS_CHANNEL_ID)
+    if ch is None:
+        return False
+    try:
+        buf = await asyncio.to_thread(make_recap_image, stats)
+    except Exception as e:
+        print(f"[recap] render error: {e}", flush=True)
+        return False
+    content = f"**Weekly Recap** - {stats['n']} calls, {stats['total_r']:+.2f}R net."
+    if RESULTS_CHANNEL_ID:
+        content += f" Full log in <#{RESULTS_CHANNEL_ID}>."
+    try:
+        await ch.send(content=content, file=discord.File(buf, filename="sigma_weekly_recap.png"))
+        return True
+    except Exception as e:
+        print(f"[recap] post error: {e}", flush=True)
+        return False
+
+
+@tasks.loop(time=RECAP_UTC)
+async def sigma_recap_loop():
+    if datetime.now(timezone.utc).weekday() != RECAP_DAY:
+        return
+    await post_weekly_recap()
+
+
+@sigma_recap_loop.before_loop
+async def _before_sigma_recap():
+    await bot.wait_until_ready()
+
+
+@bot.tree.command(name="results", description="Public results scorecard - every call logged, wins and losses")
+async def results_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    await interaction.followup.send(embed=build_results_summary_embed(), view=ResultsBoardView())
+
+
+@bot.tree.command(name="recap_now", description="(Admin) Post the weekly recap image right now")
+async def recap_now_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ok = await post_weekly_recap()
+    await interaction.followup.send("Recap posted." if ok else
+                                    "Recap failed or no closed trades this week - check logs.",
+                                    ephemeral=True)
+
+
+@bot.tree.command(name="results_rebuild",
+                  description="(Admin) Wipe the results board and re-post the full filtered log")
+async def results_rebuild_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    ch = bot.get_channel(RESULTS_CHANNEL_ID)
+    if ch is None:
+        await interaction.followup.send("Results channel not found.", ephemeral=True)
+        return
+    # delete every message the bot posted in this channel (incl. the bad backfill)
+    deleted = 0
+    try:
+        async for msg in ch.history(limit=1000):
+            if msg.author.id == bot.user.id:
+                try:
+                    await msg.delete()
+                    deleted += 1
+                    await asyncio.sleep(0.6)
+                except discord.HTTPException:
+                    continue
+    except Exception as e:
+        print(f"[results] rebuild purge error: {e}", flush=True)
+    save_results({})  # reset state -> watcher re-backfills with the analyst filter
+    await interaction.followup.send(
+        f"Cleared {deleted} messages. Filtered re-backfill starts within "
+        f"{RESULTS_POLL_MIN} min (analyst calls only).", ephemeral=True)
+    print(f"[results] rebuild: purged {deleted}, state reset", flush=True)
+
+
+async def closed_any_ac(interaction: discord.Interaction, current: str):
+    """Admin autocomplete over CLOSED trades (fut + spot), newest close first."""
+    if not interaction.user.guild_permissions.administrator:
+        return []
+    rows = []
+    for mid, t in load_trades().items():
+        if t.get("closed"):
+            rows.append((t.get("closed_at") or "", _ac_label(t), f"f:{mid}"))
+    for mid, p in load_spot().items():
+        if p.get("closed"):
+            rows.append((p.get("closed_at") or "", _ac_label(p, spot=True), f"s:{mid}"))
+    rows.sort(key=lambda r: r[0], reverse=True)
+    cur = current.lower()
+    out = [app_commands.Choice(name=label[:100], value=val)
+           for _, label, val in rows if cur in label.lower()]
+    return out[:25]
+
+
+@bot.tree.command(name="results_override",
+                  description="(Owner) Fix a wrongly closed trade - journal, original card and board all update")
+@app_commands.describe(trade="Which closed trade to correct",
+                       result="Corrected result",
+                       result_r="Corrected R (futures), e.g. -1 or 2.4",
+                       avg_exit="Corrected average exit price",
+                       result_pct="Corrected % (spot), e.g. +12%",
+                       note="Why it was corrected (shown publicly on the card)")
+@app_commands.choices(result=[
+    app_commands.Choice(name="WIN", value="WIN"),
+    app_commands.Choice(name="LOSS", value="LOSS"),
+    app_commands.Choice(name="BE", value="BE"),
+    app_commands.Choice(name="INVALID", value="INVALID"),
+])
+@app_commands.autocomplete(trade=closed_any_ac)
+async def results_override_cmd(interaction: discord.Interaction, trade: str,
+                               result: str = None, result_r: float = None,
+                               avg_exit: float = None, result_pct: str = None,
+                               note: str = None):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Owner/admin only.", ephemeral=True)
+        return
+    if result is None and result_r is None and avg_exit is None and result_pct is None:
+        await interaction.response.send_message(
+            "Nothing to change - pass at least one of result / result_r / avg_exit / result_pct.",
+            ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+
+    kind, _, mid = trade.partition(":")
+    spot = kind == "s"
+    data = load_spot() if spot else load_trades()
+    t = data.get(mid)
+    if not t or not t.get("closed"):
+        await interaction.followup.send("Closed trade not found - pick it from the autocomplete.", ephemeral=True)
+        return
+
+    prev = {f: t.get(f) for f in ("result", "result_r", "avg_exit", "result_pct")}
+    if result is not None:
+        t["result"] = result
+    if result_r is not None and not spot:
+        t["result_r"] = round(result_r, 2)
+    if avg_exit is not None:
+        t["avg_exit"] = avg_exit
+    if result_pct is not None and spot:
+        t["result_pct"] = result_pct
+    t["override"] = {"by": interaction.user.display_name,
+                     "at": datetime.now(timezone.utc).isoformat(),
+                     "prev": prev, "note": note}
+    data[mid] = t
+    (save_spot if spot else save_trades)(data)
+
+    # original trade card in the trades channel
+    orig = "ok"
+    try:
+        await refresh_and_edit(t, spot_mode=spot)
+    except Exception as e:
+        orig = f"failed ({e})"
+        print(f"[results] override: original card edit failed: {e}", flush=True)
+
+    # results-board card: edit in place if we know the message, else post corrected
+    board = "no board channel"
+    ch = bot.get_channel(RESULTS_CHANNEL_ID) if RESULTS_CHANNEL_ID else None
+    if ch is not None:
+        key = f"{'spot' if spot else 'fut'}:{mid}"
+        state = load_results()
+        posted_msgs = state.get("posted_msgs", {})
+        embed = build_result_entry_embed("spot" if spot else "fut", t)
+        msg_id = posted_msgs.get(key)
+        board = "card updated"
+        try:
+            if msg_id:
+                m = await ch.fetch_message(msg_id)
+                await m.edit(embed=embed)
+            else:
+                m = await ch.send(embed=embed)
+                posted_msgs[key] = m.id
+                state["posted"] = list(set(state.get("posted", [])) | {key})
+                state["posted_msgs"] = posted_msgs
+                board = "corrected card posted (original pre-dated tracking of card ids)"
+            save_results(state)
+        except Exception as e:
+            board = f"failed ({e})"
+            print(f"[results] override: board edit failed: {e}", flush=True)
+        await refresh_results_summary()
+
+    changed = []
+    for f in ("result", "result_r", "avg_exit", "result_pct"):
+        if t.get(f) != prev.get(f):
+            changed.append(f"{f}: {prev.get(f)} -> {t.get(f)}")
+    await interaction.followup.send(
+        "Override applied.\n" + ("\n".join(changed) if changed else "(values unchanged)") +
+        f"\nOriginal card: {orig}\nResults board: {board}\n"
+        "The board card now shows a public 'Corrected' timestamp - silent edits would cost more trust than the mistake.",
+        ephemeral=True)
+
+
+@bot.tree.command(name="results_debug",
+                  description="(Admin) Why isn't the board updating? Health check.")
+async def results_debug_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    state = load_results()
+    posted = set(state.get("posted", []))
+    all_closed = _res_all_closed()
+    pending = [(k, m, t) for k, m, t in all_closed if f"{k}:{m}" not in posted]
+
+    # closed trades that the allowlist is filtering out
+    filtered = []
+    for mid, t in load_trades().items():
+        if t.get("closed") and RESULTS_ANALYST_IDS and t.get("analyst_id") not in RESULTS_ANALYST_IDS:
+            filtered.append(f"{t.get('pair')} ({t.get('analyst_name')})")
+
+    ch = bot.get_channel(RESULTS_CHANNEL_ID)
+    perms = "channel not found"
+    if ch is not None:
+        p = ch.permissions_for(interaction.guild.me)
+        perms = (f"view={p.view_channel} send={p.send_messages} "
+                 f"embed={p.embed_links} manage={p.manage_messages}")
+    rch = bot.get_channel(RECAP_CHANNEL_ID) if RECAP_CHANNEL_ID else None
+    rperms = "not set"
+    if rch is not None:
+        rp = rch.permissions_for(interaction.guild.me)
+        rperms = f"send={rp.send_messages} attach={rp.attach_files}"
+
+    lines = [
+        f"**Watcher running:** {'yes' if results_watch_loop.is_running() else '**NO - this is the problem**'}",
+        f"**Recap loop running:** {'yes' if sigma_recap_loop.is_running() else 'no'}",
+        f"**Closed trades visible to board:** {len(all_closed)}",
+        f"**Already posted:** {len(posted)}",
+        f"**Pending (should post within {RESULTS_POLL_MIN} min):** {len(pending)}",
+    ]
+    if pending:
+        lines.append("  " + ", ".join(f"{t.get('pair')}" for _, _, t in pending[:8]))
+    if filtered:
+        lines.append(f"**Filtered out by analyst allowlist:** {len(filtered)}")
+        lines.append("  " + ", ".join(filtered[:8]))
+    lines.append(f"**results-board perms:** {perms}")
+    lines.append(f"**recap channel perms:** {rperms}")
+    lines.append(f"**This week's closed trades (recap needs >0):** {_sigma_week_stats(7)['n']}")
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+@bot.tree.command(name="results_sync", description="(Admin) Force-post any closed trades the board missed")
+async def results_sync_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if not results_watch_loop.is_running():
+        results_watch_loop.start()
+    try:
+        await _results_watch_tick()
+        await refresh_results_summary()
+        await interaction.followup.send("Sync done - board and summary are current.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Sync failed: `{e}`\nCheck journalctl for the traceback.", ephemeral=True)
+
+
+@bot.tree.command(name="recap_month", description="(Admin) Post a recap for the last N days (default 30)")
+@app_commands.describe(days="How many days back to include (default 30)")
+async def recap_month_cmd(interaction: discord.Interaction, days: int = 30):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    stats = _sigma_week_stats(max(1, min(days, 365)))
+    if stats["n"] == 0:
+        await interaction.followup.send(f"No closed setups in the last {days} days.", ephemeral=True)
+        return
+    ch = bot.get_channel(RECAP_CHANNEL_ID or RESULTS_CHANNEL_ID)
+    if ch is None:
+        await interaction.followup.send("Recap channel not found.", ephemeral=True)
+        return
+    try:
+        buf = await asyncio.to_thread(make_recap_image, stats)
+        await ch.send(content=f"**Recap** - last {days} days · {stats['n']} setups, {stats['total_r']:+.2f}R net.",
+                      file=discord.File(buf, filename="sigma_recap.png"))
+        await interaction.followup.send("Recap posted.", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"Failed: `{e}`", ephemeral=True)
+
+
+@bot.listen("on_ready")
+async def _sigma_results_on_ready():
+    bot.add_view(ResultsBoardView())
+    if RESULTS_CHANNEL_ID and not results_watch_loop.is_running():
+        results_watch_loop.start()
+    if not sigma_recap_loop.is_running():
+        sigma_recap_loop.start()
+    try:
+        await refresh_results_summary()   # re-attach buttons + fresh numbers on every boot
+    except Exception as e:
+        print(f"[results] startup summary refresh error: {e}", flush=True)
+    print("[results] board watcher armed", flush=True)
+
+# ═════════════════════════════ END SIGMA RESULTS BOARD ═════════════════════════════
 
 
 bot.run(BOT_TOKEN)
