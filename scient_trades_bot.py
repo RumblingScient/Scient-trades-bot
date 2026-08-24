@@ -82,7 +82,7 @@ NEWS_SOURCE_BLACKLIST = ("cointelegraph", "wu blockchain", "wublockchain")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHANNEL = "@scientclub"
 TG_ENABLED = True
-DISCORD_INVITE = "https://discord.gg/scientlounge"
+DISCORD_INVITE = "https://discord.gg/SigmaTrading"
 TG_BRIEF_UTC_HOUR = 6   # 12:00 PM IST = 06:30 UTC
 TG_BRIEF_UTC_MIN = 30
 TG_MACRO_CORE = ("sec", "etf", "fed", "fomc", "cpi", "rate cut", "rate hike")
@@ -778,7 +778,7 @@ def build_board_embed() -> discord.Embed:
     data = load_trades()
     open_trades = [t for t in data.values() if not t.get("closed")]
     embed = discord.Embed(title="Open Positions - Live Board", color=NAVY, timestamp=datetime.now(timezone.utc))
-    embed.set_footer(text=f"Scient Lounge - {len(open_trades)} open - auto-updates")
+    embed.set_footer(text=f"Sigma Trading - {len(open_trades)} open - auto-updates")
     if not open_trades:
         embed.description = "*No open positions right now.*"
         return embed
@@ -807,7 +807,7 @@ def build_spot_board_embed() -> discord.Embed:
     data = load_spot()
     open_plays = [p for p in data.values() if not p.get("closed")]
     embed = discord.Embed(title="Spot Portfolio - Live Board", color=GOLD, timestamp=datetime.now(timezone.utc))
-    embed.set_footer(text=f"Scient Lounge - {len(open_plays)} active plays - auto-updates")
+    embed.set_footer(text=f"Sigma Trading - {len(open_plays)} active plays - auto-updates")
     if not open_plays:
         embed.description = "*No active spot plays right now.*"
         return embed
@@ -892,7 +892,7 @@ async def tg_send(text: str, disable_preview: bool = True) -> bool:
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": disable_preview,
-        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "Join Scient Lounge \u2192", "url": DISCORD_INVITE}]]}),
+        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "Join Sigma Trading \u2192", "url": DISCORD_INVITE}]]}),
     }
     try:
         async with aiohttp.ClientSession() as session:
@@ -915,7 +915,7 @@ async def tg_send_photo(photo: io.BytesIO, caption: str) -> bool:
     form.add_field("chat_id", TG_CHANNEL)
     form.add_field("caption", caption)
     form.add_field("parse_mode", "HTML")
-    form.add_field("reply_markup", json.dumps({"inline_keyboard": [[{"text": "Join Scient Lounge \u2192", "url": DISCORD_INVITE}]]}))
+    form.add_field("reply_markup", json.dumps({"inline_keyboard": [[{"text": "Join Sigma Trading \u2192", "url": DISCORD_INVITE}]]}))
     form.add_field("photo", photo, filename="chart.png", content_type="image/png")
     try:
         async with aiohttp.ClientSession() as session:
@@ -1095,7 +1095,7 @@ async def watch_cmd(interaction: discord.Interaction, action: app_commands.Choic
     lines = [r for r in results if isinstance(r, str)]
     embed = discord.Embed(title="Your Watchlist", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines) if lines else "*Couldn't fetch prices right now.*"
-    embed.set_footer(text="Scient Lounge - 24h change")
+    embed.set_footer(text="Sigma Trading - 24h change")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -1133,7 +1133,7 @@ async def calendar_cmd(interaction: discord.Interaction):
         embed.description = "\n".join(upcoming[:10]) + "\n\n*CPI and FOMC dates move crypto. Manage risk around them.*"
     else:
         embed.description = "No upcoming events on file. Ping an admin to refresh the calendar."
-    embed.set_footer(text="Scient Lounge - official BLS + Federal Reserve schedules")
+    embed.set_footer(text="Sigma Trading - official BLS + Federal Reserve schedules")
     await interaction.followup.send(embed=embed)
 
 
@@ -1168,7 +1168,7 @@ async def alert_check_loop():
                     color=GREEN if a["direction"] == "above" else RED,
                     timestamp=datetime.now(timezone.utc),
                 )
-                embed.set_footer(text="Scient Lounge - Quant alerts")
+                embed.set_footer(text="Sigma Trading - Quant alerts")
                 await user.send(embed=embed)
             except discord.Forbidden:
                 print(f"[alert] DM blocked for {uid}")
@@ -1973,11 +1973,11 @@ class FollowNewsButton(Button):
 
 def build_join_dm() -> discord.Embed:
     embed = discord.Embed(
-        title="Welcome to Scient Lounge \U0001F44B",
+        title="Welcome to Sigma Trading \U0001F44B",
         color=NAVY,
         description=(
-            "Glad to have you here. Scient Lounge is a trading community built around "
-            "**process, not hype** - real setups, real tools, and a market terminal built into the server.\n\n"
+            "Glad to have you here. Sigma Trading is a **trading desk, not a signal service** - "
+            "every setup posted before it plays out, every result logged publicly.\n\n"
             "Here's what you can start using right now, free:"
         ),
     )
@@ -1994,6 +1994,14 @@ def build_join_dm() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
+        name="\U0001F4CB Check us before you trust us",
+        value=(
+            "**#results-board** is the full public log - every setup timestamped at post time, "
+            "wins and losses both, CSV downloadable. No membership needed to read it."
+        ),
+        inline=False,
+    )
+    embed.add_field(
         name="\U0001F513 Want the full picture?",
         value=(
             "Members with **full access** get live analyst trade setups, entry/SL/targets, "
@@ -2002,7 +2010,7 @@ def build_join_dm() -> discord.Embed:
         ),
         inline=False,
     )
-    embed.set_footer(text="Scient Lounge - setups, not signals")
+    embed.set_footer(text="Sigma Trading - setups, not signals")
     return embed
 
 
@@ -2011,7 +2019,7 @@ def build_pro_dm() -> discord.Embed:
         title="You're in. Full access unlocked \U0001F680",
         color=GOLD,
         description=(
-            "Welcome to the full Scient Lounge experience. Here's exactly what you now have access to - "
+            "Welcome to the full Sigma Trading experience. Here's exactly what you now have access to - "
             "take two minutes to set yourself up so you don't miss anything."
         ),
     )
@@ -2062,7 +2070,7 @@ def build_pro_dm() -> discord.Embed:
         value="The daily news digest and market brief keep you on top of what matters. Watch **#news-wire**.",
         inline=False,
     )
-    embed.set_footer(text="Scient Lounge - welcome aboard")
+    embed.set_footer(text="Sigma Trading - welcome aboard")
     return embed
 
 
@@ -2216,7 +2224,7 @@ async def setup_follow_panel(interaction: discord.Interaction):
         value="Urgent market events only - hacks, exchange halts, delistings. Rare by design, so it stays worth reading.",
         inline=False,
     )
-    embed.set_footer(text="Scient Lounge - you're in control of your pings")
+    embed.set_footer(text="Sigma Trading - you're in control of your pings")
     await interaction.channel.send(embed=embed, view=FollowPanel())
     await interaction.response.send_message("Follow panel posted.", ephemeral=True)
 
@@ -2528,7 +2536,7 @@ async def thread_note(t: dict, text: str):
             pass
 
 
-async def post_update_feed(t: dict, title: str, color: discord.Color, line: str, footer: str = "Scient Lounge - Trade Updates"):
+async def post_update_feed(t: dict, title: str, color: discord.Color, line: str, footer: str = "Sigma Trading - Trade Updates"):
     if not TRADE_UPDATES_CHANNEL_ID:
         return
     ch = bot.get_channel(TRADE_UPDATES_CHANNEL_ID)
@@ -2611,7 +2619,7 @@ async def spot_update(interaction: discord.Interaction, play: str, avg_entry: st
     line = ", ".join(changes) if changes else "Update"
     if note:
         line += f"\n> {note}"
-    await post_update_feed(p, "Spot Play Update", GOLD, line, footer="Scient Lounge - Spot Plays")
+    await post_update_feed(p, "Spot Play Update", GOLD, line, footer="Sigma Trading - Spot Plays")
     await thread_note(p, f"**Update** - {', '.join(changes) if changes else ''}" + (f" - {note}" if note else ""))
     await interaction.followup.send(f"Play updated: {', '.join(changes) if changes else 'note added'}", ephemeral=True)
 
@@ -2672,7 +2680,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     title, color, line = feed[result.value]
     if note:
         line += f"\n> {note}"
-    await post_update_feed(p, title, color, line, footer="Scient Lounge - Spot Plays")
+    await post_update_feed(p, title, color, line, footer="Sigma Trading - Spot Plays")
     await thread_note(p, f"**Closed - {result.value}{ptxt}**" + (f" - {note}" if note else ""))
     await interaction.followup.send(f"Play closed: {result.value}{ptxt}", ephemeral=True)
 
@@ -3076,7 +3084,7 @@ async def recent(interaction: discord.Interaction, analyst: discord.Member = Non
         embed.add_field(name="Spot", value="\n".join(lines)[:1024], inline=False)
     if not closed and not sclosed:
         embed.description = "*No closed trades yet.*"
-    embed.set_footer(text="Scient Lounge - Journal")
+    embed.set_footer(text="Sigma Trading - Journal")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -3098,7 +3106,7 @@ async def price(interaction: discord.Interaction, coin: str):
         color = GREEN if tf["chg"] >= 0 else RED
         embed = discord.Embed(title=f"{arrow} {symbol}", color=color, timestamp=datetime.now(timezone.utc))
         embed.description = f"**Price:** {tf['price']:,.2f}\n**24h:** {tf['chg']:+.2f}%"
-        embed.set_footer(text="Scient Lounge - traditional markets")
+        embed.set_footer(text="Sigma Trading - traditional markets")
         await interaction.followup.send(embed=embed)
         return
     data = await md_ticker24(pair)
@@ -3117,7 +3125,7 @@ async def price(interaction: discord.Interaction, coin: str):
         f"**24h:** {chg:+.2f}%\n"
         f"**24h High:** ${fnum(high)} | **24h Low:** ${fnum(low)}"
     )
-    embed.set_footer(text="Scient Lounge - Binance spot")
+    embed.set_footer(text="Sigma Trading - Binance spot")
     await interaction.followup.send(embed=embed)
 
 
@@ -3164,7 +3172,7 @@ async def pnl(interaction: discord.Interaction, account: str, risk: str, entry: 
             lines.append(f"**Margin @ {lev:g}x:** ${fnum(margin)} ({margin / acc * 100:.1f}% of account)")
     embed = discord.Embed(title="Position Size Calculator", color=NAVY)
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Scient Lounge - risk first, always")
+    embed.set_footer(text="Sigma Trading - risk first, always")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -3270,7 +3278,7 @@ async def liq(interaction: discord.Interaction, entry: str, leverage: str, direc
         f"**Distance:** {dist:.2f}% against you\n\n"
         f"*Estimate with 0.5% maintenance margin - exact level varies by exchange, position size, and margin mode. Always check your exchange.*"
     )
-    embed.set_footer(text="Scient Lounge - risk first, always")
+    embed.set_footer(text="Sigma Trading - risk first, always")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -3295,7 +3303,7 @@ async def funding(interaction: discord.Interaction, coin: str):
         f"**Lean:** {lean}\n"
         f"**Mark:** ${fnum(mark)} | **Next funding:** <t:{nxt}:R>"
     )
-    embed.set_footer(text="Scient Lounge - Binance perps")
+    embed.set_footer(text="Sigma Trading - Binance perps")
     await interaction.followup.send(embed=embed)
 
 
@@ -3332,7 +3340,7 @@ async def fear(interaction: discord.Interaction):
     chg = f" ({val - prev:+d} vs yesterday)" if prev is not None else ""
     embed = discord.Embed(title=f"{emoji} Fear & Greed: {val} - {label}", color=color, timestamp=datetime.now(timezone.utc))
     embed.description = f"`{bar}` {val}/100{chg}\n\n*Extreme fear = others panicking. Extreme greed = time to be careful.*"
-    embed.set_footer(text="Scient Lounge - alternative.me")
+    embed.set_footer(text="Sigma Trading - alternative.me")
     await interaction.followup.send(embed=embed)
 
 
@@ -3364,7 +3372,7 @@ async def oi(interaction: discord.Interaction, coin: str):
     usd_txt = f" (${oi_usd / 1e9:.2f}B)" if oi_usd and oi_usd >= 1e9 else (f" (${oi_usd / 1e6:.1f}M)" if oi_usd else "")
     embed = discord.Embed(title=f"Open Interest - {symbol} Perp", color=color, timestamp=datetime.now(timezone.utc))
     embed.description = f"**OI:** {fnum(oi_now)} {symbol}{usd_txt}{chg_txt}"
-    embed.set_footer(text="Scient Lounge - Binance perps")
+    embed.set_footer(text="Sigma Trading - Binance perps")
     await interaction.followup.send(embed=embed)
 
 
@@ -3404,7 +3412,7 @@ async def _movers(interaction: discord.Interaction, top: bool):
         lines.append(f"**{i}. {sym}** {chg:+.2f}% - ${fnum(last)} - vol {vol}")
     embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines) + "\n\n*USDT pairs, min $10M volume*"
-    embed.set_footer(text="Scient Lounge - Binance spot")
+    embed.set_footer(text="Sigma Trading - Binance spot")
     await interaction.followup.send(embed=embed)
 
 
@@ -3445,7 +3453,7 @@ async def dominance(interaction: discord.Interaction):
         f"**Total market cap:** ${mcap / 1e12:.2f}T {arrow} {mcap_chg:+.2f}% (24h)\n\n"
         f"*BTC dominance rising = money rotating to BTC. Falling = alts catching bids.*"
     )
-    embed.set_footer(text="Scient Lounge - CoinGecko")
+    embed.set_footer(text="Sigma Trading - CoinGecko")
     await interaction.followup.send(embed=embed)
 
 
@@ -3486,7 +3494,7 @@ async def vol(interaction: discord.Interaction, coin: str):
         f"**Volatility:** {rating}\n\n"
         f"*Rule of thumb: your SL should live outside the noise - tighter than ATR usually means getting wicked out.*"
     )
-    embed.set_footer(text="Scient Lounge - Binance")
+    embed.set_footer(text="Sigma Trading - Binance")
     await interaction.followup.send(embed=embed)
 
 
@@ -3772,7 +3780,7 @@ async def snapshot_cmd(interaction: discord.Interaction, coin: str):
         lines.append(fg_line)
     embed = discord.Embed(title=f"\U0001F4F8 {symbol} Snapshot", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Scient Lounge - morning check, one command")
+    embed.set_footer(text="Sigma Trading - morning check, one command")
     await interaction.followup.send(embed=embed)
 
 
@@ -3841,7 +3849,7 @@ async def stables_cmd(interaction: discord.Interaction):
         f"**7d:** {arrow7} {chg7:+.2f}% | **30d:** {arrow30} {chg30:+.2f}%\n"
         f"**Read:** {read}"
     )
-    embed.set_footer(text="Scient Lounge - DefiLlama data · stablecoin supply leads price")
+    embed.set_footer(text="Sigma Trading - DefiLlama data · stablecoin supply leads price")
     await interaction.followup.send(embed=embed)
 
 
@@ -3900,7 +3908,7 @@ async def agg_cmd(interaction: discord.Interaction, coin: str):
         lines.append("**Read:** Funding balanced across venues.")
     embed = discord.Embed(title=f"\U0001F310 Aggregated Derivatives - {base}", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Scient Lounge - Binance + Bybit + OKX")
+    embed.set_footer(text="Sigma Trading - Binance + Bybit + OKX")
     await interaction.followup.send(embed=embed)
 
 
@@ -3956,7 +3964,7 @@ async def whale_cmd(interaction: discord.Interaction, coin: str, min_usd: int = 
         lines.append(f"*No single trades above ${min_usd/1e3:.0f}K this hour - quiet whales.*")
     embed = discord.Embed(title=f"\U0001F40B Whale Watch - {symbol}", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Scient Lounge - Binance spot aggTrades")
+    embed.set_footer(text="Sigma Trading - Binance spot aggTrades")
     await interaction.followup.send(embed=embed)
 
 
@@ -4014,7 +4022,7 @@ async def lsr_cmd(interaction: discord.Interaction, coin: str):
         lines.append(f"**Read:** {read}")
     embed = discord.Embed(title=f"\u2696\uFE0F Long/Short Ratio - {symbol}", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Scient Lounge - Binance futures, 1h data")
+    embed.set_footer(text="Sigma Trading - Binance futures, 1h data")
     await interaction.followup.send(embed=embed)
 
 
@@ -4192,7 +4200,7 @@ async def levels(interaction: discord.Interaction, coin: str, timeframe: app_com
     lines.append("\n*\u2B50 = number of touches (max 3 shown). Auto-detected from swing pivots - always confirm with your own chart.*")
     embed = discord.Embed(title=f"Key Levels - {symbol} ({tfv})", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Scient Lounge - swing pivot clusters")
+    embed.set_footer(text="Sigma Trading - swing pivot clusters")
     await interaction.followup.send(embed=embed)
 
 
@@ -4367,7 +4375,7 @@ def build_help_embed() -> discord.Embed:
         ),
         inline=False,
     )
-    embed.set_footer(text="Scient Lounge - Quant Terminal")
+    embed.set_footer(text="Sigma Trading - Quant Terminal")
     return embed
 
 
@@ -4497,7 +4505,7 @@ async def subs_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="\U0001F4B3 Subscriptions", color=NAVY, timestamp=now)
     embed.description = "\n".join(r[1] for r in rows[:30])
     embed.add_field(name="Total", value=f"{len(subs)} active | ${total_rev} lifetime recorded", inline=False)
-    embed.set_footer(text="Scient Lounge - subscription system")
+    embed.set_footer(text="Sigma Trading - subscription system")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -4769,7 +4777,7 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     embed.add_field(name="Graded on", value=(f"{len(rs)} closed" if rs else "-"), inline=True)
     embed.add_field(name="Best", value=(f"{best:+g}R" if best is not None else "-"), inline=True)
     embed.add_field(name="Worst", value=(f"{worst:+g}R" if worst is not None else "-"), inline=True)
-    embed.set_footer(text="Scient Lounge - Journal")
+    embed.set_footer(text="Sigma Trading - Journal")
     await interaction.followup.send(embed=embed, view=StatsCSVView(mine, target.display_name), ephemeral=True)
 
 
@@ -4800,7 +4808,7 @@ async def spot_stats(interaction: discord.Interaction, analyst: discord.Member =
     embed.add_field(name="BE / Invalid", value=f"{len(be)} / {len(invalid)}", inline=True)
     results = [p.get("result_pct") for p in closed if p.get("result_pct")]
     embed.add_field(name="Results", value=(", ".join(results[:10]) if results else "-"), inline=False)
-    embed.set_footer(text="Scient Lounge - Spot Journal")
+    embed.set_footer(text="Sigma Trading - Spot Journal")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
