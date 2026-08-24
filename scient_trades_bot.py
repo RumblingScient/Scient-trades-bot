@@ -1994,11 +1994,6 @@ def build_join_dm() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="\U0001F9E0 Learn & Test Yourself",
-        value="`/quiz` - trading quizzes from basics to advanced. Build a streak.",
-        inline=False,
-    )
-    embed.add_field(
         name="\U0001F513 Want the full picture?",
         value=(
             "Members with **full access** get live analyst trade setups, entry/SL/targets, "
@@ -3423,19 +3418,6 @@ async def losers(interaction: discord.Interaction):
     await _movers(interaction, top=False)
 
 
-@bot.tree.command(name="quiz", description="Random TA quiz question - test yourself")
-async def quiz(interaction: discord.Interaction):
-    q, _ = _quiz_pick()
-    embed = _quiz_embed(q)
-    embed.description += "\n\n*Answer is private - only you see your result. Keep the streak going with Next question.*"
-    view = QuizView(q)
-    await interaction.response.send_message(embed=embed, view=view)
-    try:
-        view.message = await interaction.original_response()
-    except Exception:
-        pass
-
-
 @bot.tree.command(name="dominance", description="BTC dominance + total market cap")
 async def dominance(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -4378,11 +4360,10 @@ def build_help_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="\U0001F514 Pings & Learning",
+        name="\U0001F514 Pings",
         value=(
             "`/follow` `/unfollow` - analyst trade pings\n"
-            "Or use the buttons in #select-analyst-alerts\n"
-            "`/quiz` - trading quizzes, basics to advanced"
+            "Or use the buttons in #select-analyst-alerts"
         ),
         inline=False,
     )
