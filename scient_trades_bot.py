@@ -35,6 +35,55 @@ SUB_REMINDER_DAYS = 3  # DM a renewal reminder this many days before expiry
 FREE_ALERT_LIMIT = 5      # max active alerts for non-pro members
 ALERT_CHECK_MIN = 3       # how often (minutes) to check alert prices
 LIQ_CHANNEL_ID = 1535755722678341733  # #liquidations feed
+FUNDING_GUARD_CHANNEL_ID = LIQ_CHANNEL_ID  # euphoria warnings post here (change to a dedicated channel any time)
+
+# ---------------- SIGMA CHART THEME ----------------
+SG_OBS = "#0A0C10"    # canvas
+SG_GRA = "#141A22"    # panels
+SG_CARD = "#1A222C"   # raised
+SG_SLATE = "#2A3644"  # grid/borders
+SG_ASH = "#8593A6"    # muted text
+SG_PAPER = "#EEF3F8"  # primary text
+SG_CYAN = "#22D3C5"   # primary accent
+SG_CYAND = "#0E8F87"
+SG_AMBER = "#E8590C"  # Scient accent
+SG_LONG = "#16C784"   # semantic profit only
+SG_SHORT = "#EA3943"  # semantic loss only
+
+_SIGMA_LOGO_IMG = None
+
+def _sigma_logo():
+    global _SIGMA_LOGO_IMG
+    if _SIGMA_LOGO_IMG is None:
+        try:
+            import matplotlib.image as _mpimg
+            p = Path(__file__).with_name("brand") / "sigma_badge.png"
+            _SIGMA_LOGO_IMG = _mpimg.imread(str(p)) if p.exists() else False
+        except Exception:
+            _SIGMA_LOGO_IMG = False
+    return _SIGMA_LOGO_IMG
+
+
+def sigma_style_ax(ax):
+    ax.set_facecolor(SG_OBS)
+    ax.grid(color=SG_SLATE, linewidth=0.5, alpha=0.35)
+    for sp in ax.spines.values():
+        sp.set_color(SG_SLATE)
+    ax.tick_params(colors=SG_ASH, labelsize=8)
+
+
+def sigma_logo_ax(ax, zoom=0.085, pos=(0.985, 0.97)):
+    img = _sigma_logo()
+    if img is False or img is None:
+        return
+    try:
+        from matplotlib.offsetbox import OffsetImage, AnnotationBbox
+        ab = AnnotationBbox(OffsetImage(img, zoom=zoom), pos, xycoords="axes fraction",
+                            frameon=False, box_alignment=(1, 1))
+        ax.add_artist(ab)
+    except Exception:
+        pass
+# ---------------------------------------------------
 LIQ_MIN_USD = 250_000     # Binance splits big liquidations into smaller orders, so $1M+ almost never fires
 LIQ_BIG_USD = 1_000_000   # always posts, even when throttling
 LIQ_MAX_PER_MIN = 8       # soft throttle: past this in a minute, only LIQ_BIG_USD+ gets through
@@ -82,7 +131,7 @@ NEWS_SOURCE_BLACKLIST = ("cointelegraph", "wu blockchain", "wublockchain")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHANNEL = "@scientclub"
 TG_ENABLED = True
-DISCORD_INVITE = "https://discord.gg/SigmaTrading"
+DISCORD_INVITE = "https://discord.gg/scientlounge"
 TG_BRIEF_UTC_HOUR = 6   # 12:00 PM IST = 06:30 UTC
 TG_BRIEF_UTC_MIN = 30
 TG_MACRO_CORE = ("sec", "etf", "fed", "fomc", "cpi", "rate cut", "rate hike")
@@ -93,7 +142,7 @@ TG_MOVE_SYMBOLS = ("BTC", "ETH")
 TG_MOVE_THRESHOLD = 1.5      # % rolling 1h move (live) that triggers a chart post
 TG_MOVE_COOLDOWN_MIN = 90    # min minutes between move alerts per symbol
 EMA_PERIODS = [20, 50, 100, 200]  # change to match Scient 4EMA periods
-EMA_COLORS = ["#E8590C", "#FAC775", "#378ADD", "#1C4E80"]
+EMA_COLORS = ["#E8590C", "#FAC775", SG_CYAN, "#5B9CFF"]
 ANALYST_ROLE_NAME = "Analyst"
 PING_ROLE_ID = 1525861312729452704
 X_PING_ROLE_ID = 1525861448088031462
@@ -120,7 +169,7 @@ IST = timezone(timedelta(hours=5, minutes=30))
 NAVY = discord.Color.from_str("#1C4E80")
 GREEN = discord.Color.from_str("#2E7D32")
 RED = discord.Color.from_str("#C62828")
-BLUE = discord.Color.from_str("#378ADD")
+BLUE = discord.Color.from_str(SG_CYAN)
 GOLD = discord.Color.from_str("#C9A227")
 GREY = discord.Color.light_grey()
 DGREY = discord.Color.dark_grey()
@@ -778,7 +827,7 @@ def build_board_embed() -> discord.Embed:
     data = load_trades()
     open_trades = [t for t in data.values() if not t.get("closed")]
     embed = discord.Embed(title="Open Positions - Live Board", color=NAVY, timestamp=datetime.now(timezone.utc))
-    embed.set_footer(text=f"Sigma Trading - {len(open_trades)} open - auto-updates")
+    embed.set_footer(text=f"Scient Lounge - {len(open_trades)} open - auto-updates")
     if not open_trades:
         embed.description = "*No open positions right now.*"
         return embed
@@ -807,7 +856,7 @@ def build_spot_board_embed() -> discord.Embed:
     data = load_spot()
     open_plays = [p for p in data.values() if not p.get("closed")]
     embed = discord.Embed(title="Spot Portfolio - Live Board", color=GOLD, timestamp=datetime.now(timezone.utc))
-    embed.set_footer(text=f"Sigma Trading - {len(open_plays)} active plays - auto-updates")
+    embed.set_footer(text=f"Scient Lounge - {len(open_plays)} active plays - auto-updates")
     if not open_plays:
         embed.description = "*No active spot plays right now.*"
         return embed
@@ -892,7 +941,7 @@ async def tg_send(text: str, disable_preview: bool = True) -> bool:
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": disable_preview,
-        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "Join Sigma Trading \u2192", "url": DISCORD_INVITE}]]}),
+        "reply_markup": json.dumps({"inline_keyboard": [[{"text": "Join Scient Lounge \u2192", "url": DISCORD_INVITE}]]}),
     }
     try:
         async with aiohttp.ClientSession() as session:
@@ -915,7 +964,7 @@ async def tg_send_photo(photo: io.BytesIO, caption: str) -> bool:
     form.add_field("chat_id", TG_CHANNEL)
     form.add_field("caption", caption)
     form.add_field("parse_mode", "HTML")
-    form.add_field("reply_markup", json.dumps({"inline_keyboard": [[{"text": "Join Sigma Trading \u2192", "url": DISCORD_INVITE}]]}))
+    form.add_field("reply_markup", json.dumps({"inline_keyboard": [[{"text": "Join Scient Lounge \u2192", "url": DISCORD_INVITE}]]}))
     form.add_field("photo", photo, filename="chart.png", content_type="image/png")
     try:
         async with aiohttp.ClientSession() as session:
@@ -1095,7 +1144,7 @@ async def watch_cmd(interaction: discord.Interaction, action: app_commands.Choic
     lines = [r for r in results if isinstance(r, str)]
     embed = discord.Embed(title="Your Watchlist", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines) if lines else "*Couldn't fetch prices right now.*"
-    embed.set_footer(text="Sigma Trading - 24h change")
+    embed.set_footer(text="Scient Lounge - 24h change")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -1133,7 +1182,7 @@ async def calendar_cmd(interaction: discord.Interaction):
         embed.description = "\n".join(upcoming[:10]) + "\n\n*CPI and FOMC dates move crypto. Manage risk around them.*"
     else:
         embed.description = "No upcoming events on file. Ping an admin to refresh the calendar."
-    embed.set_footer(text="Sigma Trading - official BLS + Federal Reserve schedules")
+    embed.set_footer(text="Scient Lounge - official BLS + Federal Reserve schedules")
     await interaction.followup.send(embed=embed)
 
 
@@ -1168,7 +1217,7 @@ async def alert_check_loop():
                     color=GREEN if a["direction"] == "above" else RED,
                     timestamp=datetime.now(timezone.utc),
                 )
-                embed.set_footer(text="Sigma Trading - Quant alerts")
+                embed.set_footer(text="Scient Lounge - Quant alerts")
                 await user.send(embed=embed)
             except discord.Forbidden:
                 print(f"[alert] DM blocked for {uid}")
@@ -1973,11 +2022,11 @@ class FollowNewsButton(Button):
 
 def build_join_dm() -> discord.Embed:
     embed = discord.Embed(
-        title="Welcome to Sigma Trading \U0001F44B",
+        title="Welcome to Scient Lounge \U0001F44B",
         color=NAVY,
         description=(
-            "Glad to have you here. Sigma Trading is a **trading desk, not a signal service** - "
-            "every setup posted before it plays out, every result logged publicly.\n\n"
+            "Glad to have you here. Scient Lounge is a trading community built around "
+            "**process, not hype** - real setups, real tools, and a market terminal built into the server.\n\n"
             "Here's what you can start using right now, free:"
         ),
     )
@@ -1994,11 +2043,8 @@ def build_join_dm() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="\U0001F4CB Check us before you trust us",
-        value=(
-            "**#results-board** is the full public log - every setup timestamped at post time, "
-            "wins and losses both, CSV downloadable. No membership needed to read it."
-        ),
+        name="\U0001F9E0 Learn & Test Yourself",
+        value="`/quiz` - trading quizzes from basics to advanced. Build a streak.",
         inline=False,
     )
     embed.add_field(
@@ -2010,7 +2056,7 @@ def build_join_dm() -> discord.Embed:
         ),
         inline=False,
     )
-    embed.set_footer(text="Sigma Trading - setups, not signals")
+    embed.set_footer(text="Scient Lounge - setups, not signals")
     return embed
 
 
@@ -2019,7 +2065,7 @@ def build_pro_dm() -> discord.Embed:
         title="You're in. Full access unlocked \U0001F680",
         color=GOLD,
         description=(
-            "Welcome to the full Sigma Trading experience. Here's exactly what you now have access to - "
+            "Welcome to the full Scient Lounge experience. Here's exactly what you now have access to - "
             "take two minutes to set yourself up so you don't miss anything."
         ),
     )
@@ -2070,7 +2116,7 @@ def build_pro_dm() -> discord.Embed:
         value="The daily news digest and market brief keep you on top of what matters. Watch **#news-wire**.",
         inline=False,
     )
-    embed.set_footer(text="Sigma Trading - welcome aboard")
+    embed.set_footer(text="Scient Lounge - welcome aboard")
     return embed
 
 
@@ -2131,6 +2177,8 @@ async def on_ready():
         backup_loop.start()
     if not subs_check_loop.is_running():
         subs_check_loop.start()
+    if not funding_guard_loop.is_running():
+        funding_guard_loop.start()
     if not tg_digest_loop.is_running():
         tg_digest_loop.start()
     if TG_NEWS_CHANNELS and not tg_sources_loop.is_running():
@@ -2224,7 +2272,7 @@ async def setup_follow_panel(interaction: discord.Interaction):
         value="Urgent market events only - hacks, exchange halts, delistings. Rare by design, so it stays worth reading.",
         inline=False,
     )
-    embed.set_footer(text="Sigma Trading - you're in control of your pings")
+    embed.set_footer(text="Scient Lounge - you're in control of your pings")
     await interaction.channel.send(embed=embed, view=FollowPanel())
     await interaction.response.send_message("Follow panel posted.", ephemeral=True)
 
@@ -2536,7 +2584,7 @@ async def thread_note(t: dict, text: str):
             pass
 
 
-async def post_update_feed(t: dict, title: str, color: discord.Color, line: str, footer: str = "Sigma Trading - Trade Updates"):
+async def post_update_feed(t: dict, title: str, color: discord.Color, line: str, footer: str = "Scient Lounge - Trade Updates"):
     if not TRADE_UPDATES_CHANNEL_ID:
         return
     ch = bot.get_channel(TRADE_UPDATES_CHANNEL_ID)
@@ -2619,7 +2667,7 @@ async def spot_update(interaction: discord.Interaction, play: str, avg_entry: st
     line = ", ".join(changes) if changes else "Update"
     if note:
         line += f"\n> {note}"
-    await post_update_feed(p, "Spot Play Update", GOLD, line, footer="Sigma Trading - Spot Plays")
+    await post_update_feed(p, "Spot Play Update", GOLD, line, footer="Scient Lounge - Spot Plays")
     await thread_note(p, f"**Update** - {', '.join(changes) if changes else ''}" + (f" - {note}" if note else ""))
     await interaction.followup.send(f"Play updated: {', '.join(changes) if changes else 'note added'}", ephemeral=True)
 
@@ -2680,7 +2728,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     title, color, line = feed[result.value]
     if note:
         line += f"\n> {note}"
-    await post_update_feed(p, title, color, line, footer="Sigma Trading - Spot Plays")
+    await post_update_feed(p, title, color, line, footer="Scient Lounge - Spot Plays")
     await thread_note(p, f"**Closed - {result.value}{ptxt}**" + (f" - {note}" if note else ""))
     await interaction.followup.send(f"Play closed: {result.value}{ptxt}", ephemeral=True)
 
@@ -3084,7 +3132,7 @@ async def recent(interaction: discord.Interaction, analyst: discord.Member = Non
         embed.add_field(name="Spot", value="\n".join(lines)[:1024], inline=False)
     if not closed and not sclosed:
         embed.description = "*No closed trades yet.*"
-    embed.set_footer(text="Sigma Trading - Journal")
+    embed.set_footer(text="Scient Lounge - Journal")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -3106,7 +3154,7 @@ async def price(interaction: discord.Interaction, coin: str):
         color = GREEN if tf["chg"] >= 0 else RED
         embed = discord.Embed(title=f"{arrow} {symbol}", color=color, timestamp=datetime.now(timezone.utc))
         embed.description = f"**Price:** {tf['price']:,.2f}\n**24h:** {tf['chg']:+.2f}%"
-        embed.set_footer(text="Sigma Trading - traditional markets")
+        embed.set_footer(text="Scient Lounge - traditional markets")
         await interaction.followup.send(embed=embed)
         return
     data = await md_ticker24(pair)
@@ -3125,7 +3173,7 @@ async def price(interaction: discord.Interaction, coin: str):
         f"**24h:** {chg:+.2f}%\n"
         f"**24h High:** ${fnum(high)} | **24h Low:** ${fnum(low)}"
     )
-    embed.set_footer(text="Sigma Trading - Binance spot")
+    embed.set_footer(text="Scient Lounge - Binance spot")
     await interaction.followup.send(embed=embed)
 
 
@@ -3172,7 +3220,7 @@ async def pnl(interaction: discord.Interaction, account: str, risk: str, entry: 
             lines.append(f"**Margin @ {lev:g}x:** ${fnum(margin)} ({margin / acc * 100:.1f}% of account)")
     embed = discord.Embed(title="Position Size Calculator", color=NAVY)
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Sigma Trading - risk first, always")
+    embed.set_footer(text="Scient Lounge - risk first, always")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -3194,7 +3242,7 @@ def make_chart_image(symbol: str, interval: str, klines: list) -> io.BytesIO:
             ema = df["Close"].ewm(span=period, adjust=False).mean()
             addplots.append(mpf.make_addplot(ema, color=color, width=1.3))
     mc = mpf.make_marketcolors(up="#0ECB81", down="#F6465D", edge="inherit", wick="inherit", volume={"up": "#0ECB8155", "down": "#F6465D55"})
-    style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, facecolor="#131722", edgecolor="#2A2E39", figcolor="#131722", gridcolor="#1E222D", gridstyle="-", rc={"axes.labelcolor": "#B2B5BE", "xtick.color": "#B2B5BE", "ytick.color": "#B2B5BE", "font.size": 9})
+    style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, facecolor=SG_OBS, edgecolor=SG_SLATE, figcolor=SG_OBS, gridcolor=SG_SLATE, gridstyle="-", rc={"axes.labelcolor": SG_ASH, "xtick.color": SG_ASH, "ytick.color": SG_ASH, "font.size": 9})
     last = df["Close"].iloc[-1]
     price_txt = f"{last:,.2f}" if last >= 1000 else f"{last:,.4f}".rstrip("0").rstrip(".")
     fig, axes = mpf.plot(
@@ -3203,7 +3251,7 @@ def make_chart_image(symbol: str, interval: str, klines: list) -> io.BytesIO:
         panel_ratios=(5, 1), figsize=(13, 7.5),
         scale_width_adjustment=dict(candle=1.5, volume=0.9),
         tight_layout=True, returnfig=True,
-        hlines=dict(hlines=[float(last)], colors=["#B2B5BE"], linestyle="--", linewidths=0.8, alpha=0.6),
+        hlines=dict(hlines=[float(last)], colors=[SG_ASH], linestyle="--", linewidths=0.8, alpha=0.6),
         ylabel="", ylabel_lower="",
     )
     for ax in axes:
@@ -3211,18 +3259,22 @@ def make_chart_image(symbol: str, interval: str, klines: list) -> io.BytesIO:
         ax.yaxis.set_label_position("right")
     x0, x1 = axes[0].get_xlim()
     axes[0].set_xlim(x0, x1 + (x1 - x0) * 0.06)
-    axes[0].set_title(f"{symbol}  {interval}  |  {price_txt}", color="#EAECEF", fontsize=13, loc="left", pad=12)
+    axes[0].set_title(f"{symbol}  {interval}  |  {price_txt}", color=SG_PAPER, fontsize=13, loc="left", pad=12)
     up = df["Close"].iloc[-1] >= df["Open"].iloc[-1]
     tag_color = "#0ECB81" if up else "#F6465D"
     axes[0].annotate(
         price_txt, xy=(1.0, float(last)), xycoords=("axes fraction", "data"),
         xytext=(4, 0), textcoords="offset points", ha="left", va="center",
-        color="#131722", fontsize=9, fontweight="bold", clip_on=False,
+        color=SG_OBS, fontsize=9, fontweight="bold", clip_on=False,
         annotation_clip=False, zorder=10,
         bbox=dict(boxstyle="round,pad=0.25", facecolor=tag_color, edgecolor="none"),
     )
+    try:
+        sigma_logo_ax(ax)
+    except Exception:
+        pass
     buf = io.BytesIO()
-    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
     import matplotlib.pyplot as plt
     plt.close(fig)
     buf.seek(0)
@@ -3278,7 +3330,7 @@ async def liq(interaction: discord.Interaction, entry: str, leverage: str, direc
         f"**Distance:** {dist:.2f}% against you\n\n"
         f"*Estimate with 0.5% maintenance margin - exact level varies by exchange, position size, and margin mode. Always check your exchange.*"
     )
-    embed.set_footer(text="Sigma Trading - risk first, always")
+    embed.set_footer(text="Scient Lounge - risk first, always")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -3303,7 +3355,7 @@ async def funding(interaction: discord.Interaction, coin: str):
         f"**Lean:** {lean}\n"
         f"**Mark:** ${fnum(mark)} | **Next funding:** <t:{nxt}:R>"
     )
-    embed.set_footer(text="Sigma Trading - Binance perps")
+    embed.set_footer(text="Scient Lounge - Binance perps")
     await interaction.followup.send(embed=embed)
 
 
@@ -3340,7 +3392,7 @@ async def fear(interaction: discord.Interaction):
     chg = f" ({val - prev:+d} vs yesterday)" if prev is not None else ""
     embed = discord.Embed(title=f"{emoji} Fear & Greed: {val} - {label}", color=color, timestamp=datetime.now(timezone.utc))
     embed.description = f"`{bar}` {val}/100{chg}\n\n*Extreme fear = others panicking. Extreme greed = time to be careful.*"
-    embed.set_footer(text="Sigma Trading - alternative.me")
+    embed.set_footer(text="Scient Lounge - alternative.me")
     await interaction.followup.send(embed=embed)
 
 
@@ -3372,7 +3424,7 @@ async def oi(interaction: discord.Interaction, coin: str):
     usd_txt = f" (${oi_usd / 1e9:.2f}B)" if oi_usd and oi_usd >= 1e9 else (f" (${oi_usd / 1e6:.1f}M)" if oi_usd else "")
     embed = discord.Embed(title=f"Open Interest - {symbol} Perp", color=color, timestamp=datetime.now(timezone.utc))
     embed.description = f"**OI:** {fnum(oi_now)} {symbol}{usd_txt}{chg_txt}"
-    embed.set_footer(text="Sigma Trading - Binance perps")
+    embed.set_footer(text="Scient Lounge - Binance perps")
     await interaction.followup.send(embed=embed)
 
 
@@ -3412,7 +3464,7 @@ async def _movers(interaction: discord.Interaction, top: bool):
         lines.append(f"**{i}. {sym}** {chg:+.2f}% - ${fnum(last)} - vol {vol}")
     embed = discord.Embed(title=title, color=color, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines) + "\n\n*USDT pairs, min $10M volume*"
-    embed.set_footer(text="Sigma Trading - Binance spot")
+    embed.set_footer(text="Scient Lounge - Binance spot")
     await interaction.followup.send(embed=embed)
 
 
@@ -3424,6 +3476,19 @@ async def gainers(interaction: discord.Interaction):
 @bot.tree.command(name="losers", description="Top 5 losers of the day")
 async def losers(interaction: discord.Interaction):
     await _movers(interaction, top=False)
+
+
+@bot.tree.command(name="quiz", description="Random TA quiz question - test yourself")
+async def quiz(interaction: discord.Interaction):
+    q, _ = _quiz_pick()
+    embed = _quiz_embed(q)
+    embed.description += "\n\n*Answer is private - only you see your result. Keep the streak going with Next question.*"
+    view = QuizView(q)
+    await interaction.response.send_message(embed=embed, view=view)
+    try:
+        view.message = await interaction.original_response()
+    except Exception:
+        pass
 
 
 @bot.tree.command(name="dominance", description="BTC dominance + total market cap")
@@ -3453,7 +3518,7 @@ async def dominance(interaction: discord.Interaction):
         f"**Total market cap:** ${mcap / 1e12:.2f}T {arrow} {mcap_chg:+.2f}% (24h)\n\n"
         f"*BTC dominance rising = money rotating to BTC. Falling = alts catching bids.*"
     )
-    embed.set_footer(text="Sigma Trading - CoinGecko")
+    embed.set_footer(text="Scient Lounge - CoinGecko")
     await interaction.followup.send(embed=embed)
 
 
@@ -3494,7 +3559,7 @@ async def vol(interaction: discord.Interaction, coin: str):
         f"**Volatility:** {rating}\n\n"
         f"*Rule of thumb: your SL should live outside the noise - tighter than ATR usually means getting wicked out.*"
     )
-    embed.set_footer(text="Sigma Trading - Binance")
+    embed.set_footer(text="Scient Lounge - Binance")
     await interaction.followup.send(embed=embed)
 
 
@@ -3504,20 +3569,20 @@ def make_cvd_image(symbol: str, tf_label: str, dates: list, closes: list, cvd_sp
     import matplotlib.pyplot as plt
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True,
                                    gridspec_kw={"height_ratios": [2, 1.4], "hspace": 0.06},
-                                   facecolor="#131722")
+                                   facecolor=SG_OBS)
     for ax in (ax1, ax2):
-        ax.set_facecolor("#131722")
-        ax.grid(color="#1E222D", linewidth=0.5)
+        ax.set_facecolor(SG_OBS)
+        ax.grid(color=SG_SLATE, linewidth=0.5)
         for sp in ax.spines.values():
-            sp.set_color("#2A2E39")
-        ax.tick_params(colors="#B2B5BE", labelsize=8)
+            sp.set_color(SG_SLATE)
+        ax.tick_params(colors=SG_ASH, labelsize=8)
         ax.yaxis.tick_right()
-    ax1.plot(dates, closes, color="#EAECEF", linewidth=1.4)
-    ax1.set_title(f"{symbol}  {tf_label}  |  Price vs CVD", color="#EAECEF", fontsize=12, loc="left", pad=10)
+    ax1.plot(dates, closes, color=SG_PAPER, linewidth=1.4)
+    ax1.set_title(f"{symbol}  {tf_label}  |  Price vs CVD", color=SG_PAPER, fontsize=12, loc="left", pad=10)
     ax2.plot(dates, cvd_spot, color="#E8590C", linewidth=1.6, label="Spot CVD")
-    ax2.plot(dates, cvd_perp, color="#378ADD", linewidth=1.6, label="Perp CVD")
-    ax2.axhline(0, color="#B2B5BE", linewidth=0.6, linestyle="--", alpha=0.5)
-    leg = ax2.legend(facecolor="#131722", edgecolor="#2A2E39", labelcolor="#EAECEF", fontsize=9, loc="upper left")
+    ax2.plot(dates, cvd_perp, color=SG_CYAN, linewidth=1.6, label="Perp CVD")
+    ax2.axhline(0, color=SG_ASH, linewidth=0.6, linestyle="--", alpha=0.5)
+    leg = ax2.legend(facecolor=SG_OBS, edgecolor=SG_SLATE, labelcolor=SG_PAPER, fontsize=9, loc="upper left")
     def _fmt_usd(x, _):
         ax_abs = abs(x)
         if ax_abs >= 1e9: return f"{x/1e9:.1f}B"
@@ -3526,9 +3591,13 @@ def make_cvd_image(symbol: str, tf_label: str, dates: list, closes: list, cvd_sp
         return f"{x:.0f}"
     import matplotlib.ticker as mticker
     ax2.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_usd))
+    try:
+        sigma_logo_ax(ax1)
+    except Exception:
+        pass
     plt.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -3636,26 +3705,543 @@ def make_rvol_image(symbol: str, months: list, rvs: list, current_rv: float) -> 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    fig, ax = plt.subplots(figsize=(12, 5.5), facecolor="#131722")
-    ax.set_facecolor("#131722")
-    ax.grid(color="#1E222D", linewidth=0.5, axis="y")
+    fig, ax = plt.subplots(figsize=(12, 5.5), facecolor=SG_OBS)
+    ax.set_facecolor(SG_OBS)
+    ax.grid(color=SG_SLATE, linewidth=0.5, axis="y")
     for sp in ax.spines.values():
-        sp.set_color("#2A2E39")
-    ax.tick_params(colors="#B2B5BE", labelsize=8)
-    colors = ["#E8590C" if i == len(rvs) - 1 else "#1C4E80" for i in range(len(rvs))]
+        sp.set_color(SG_SLATE)
+    ax.tick_params(colors=SG_ASH, labelsize=8)
+    colors = ["#E8590C" if i == len(rvs) - 1 else SG_CYAND for i in range(len(rvs))]
     ax.bar(range(len(rvs)), rvs, color=colors, width=0.8)
     step = max(1, len(months) // 12)
     ax.set_xticks(range(0, len(months), step))
     ax.set_xticklabels([months[i] for i in range(0, len(months), step)], rotation=45, ha="right")
     ax.set_title(f"{symbol}  |  30d Realized Volatility by Month (annualized)",
-                 color="#EAECEF", fontsize=12, loc="left", pad=10)
+                 color=SG_PAPER, fontsize=12, loc="left", pad=10)
     ax.yaxis.set_major_formatter(lambda x, _: f"{x:.0f}%")
     plt.tight_layout()
+    try:
+        sigma_logo_ax(ax)
+    except Exception:
+        pass
     buf = io.BytesIO()
-    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf
+
+
+_ALTSEASON_CACHE = {"ts": 0, "data": None}
+ALTSEASON_STABLES = {"USDT","USDC","DAI","FDUSD","TUSD","USDE","PYUSD","USDS","WBTC","WETH","STETH","WSTETH","WEETH","CBBTC","LEO","OKB"}
+
+
+def make_altseason_image(months: list, vals: list, current: float) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, (axm, axg) = plt.subplots(2, 1, figsize=(12, 6.5), facecolor=SG_OBS,
+                                   gridspec_kw={"height_ratios": [2, 1], "hspace": 0.4})
+    sigma_style_ax(axm)
+    colors = [SG_LONG if v >= 75 else (SG_SHORT if v <= 25 else SG_CYAN) for v in vals]
+    axm.bar(range(len(vals)), vals, color=colors, width=0.62)
+    axm.axhline(75, color=SG_LONG, lw=1, ls="--", alpha=0.7)
+    axm.axhline(25, color=SG_SHORT, lw=1, ls="--", alpha=0.7)
+    axm.text(len(vals) - 0.4, 77, "ALTSEASON", color=SG_LONG, fontsize=8, ha="right")
+    axm.text(len(vals) - 0.4, 19, "BTC SEASON", color=SG_SHORT, fontsize=8, ha="right")
+    axm.set_xticks(range(len(months)))
+    axm.set_xticklabels(months, fontsize=8)
+    axm.set_ylim(0, 100)
+    axm.set_title("ALTSEASON INDEX  ·  % of top 50 outperforming BTC (90d)",
+                  color=SG_PAPER, fontsize=14, loc="left", pad=12, fontweight="bold")
+    sigma_logo_ax(axm)
+    axg.set_facecolor(SG_OBS); axg.axis("off"); axg.set_xlim(0, 100); axg.set_ylim(0, 1)
+    axg.barh(0.5, 100, height=0.34, color=SG_CARD, edgecolor=SG_SLATE)
+    axg.barh(0.5, 25, height=0.34, color=SG_SHORT, alpha=0.25)
+    axg.barh(0.5, 50, left=25, height=0.34, color=SG_ASH, alpha=0.12)
+    axg.barh(0.5, 25, left=75, height=0.34, color=SG_LONG, alpha=0.25)
+    axg.plot([current], [0.5], marker="v", color=SG_PAPER, markersize=13)
+    axg.text(current, 0.94, f"NOW  {current:.0f}", color=SG_PAPER, fontsize=12, ha="center",
+             fontweight="bold", family="monospace")
+    axg.text(1.5, 0.06, "BTC dominance rules", color=SG_ASH, fontsize=8.5)
+    axg.text(98.5, 0.06, "Full rotation", color=SG_ASH, fontsize=8.5, ha="right")
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="altseason", description="Altseason index - % of top 50 beating BTC over 90 days")
+async def altseason_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    import time as _time
+    now = _time.time()
+    if _ALTSEASON_CACHE["data"] and now - _ALTSEASON_CACHE["ts"] < 6 * 3600:
+        months, vals, current, n_out, n_tot = _ALTSEASON_CACHE["data"]
+    else:
+        # top coins by mcap from CoinGecko (free), then history from Binance
+        try:
+            async with aiohttp.ClientSession() as s:
+                cg = await _get_json(s, "https://api.coingecko.com/api/v3/coins/markets",
+                                     {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 80, "page": 1}, 20)
+        except Exception:
+            cg = None
+        if not cg or not isinstance(cg, list):
+            await interaction.followup.send("Couldn't fetch the top-50 list right now (CoinGecko rate limit) - try again in a minute.")
+            return
+        syms = []
+        for c in cg:
+            sym = str(c.get("symbol", "")).upper()
+            if sym in ("BTC",) or sym in ALTSEASON_STABLES:
+                continue
+            syms.append(sym)
+            if len(syms) >= 50:
+                break
+        async def _kl(sym):
+            async with aiohttp.ClientSession() as s2:
+                return sym, await _get_json(s2, "https://api.binance.com/api/v3/klines",
+                                            {"symbol": f"{sym}USDT", "interval": "1d", "limit": 400}, 20)
+        results = await asyncio.gather(*[_kl(x) for x in syms], return_exceptions=True)
+        async with aiohttp.ClientSession() as s3:
+            btc = await _get_json(s3, "https://api.binance.com/api/v3/klines",
+                                  {"symbol": "BTCUSDT", "interval": "1d", "limit": 400}, 20)
+        if not btc or not isinstance(btc, list):
+            await interaction.followup.send("BTC history unavailable right now.")
+            return
+        btc_close = {int(k[0]): float(k[4]) for k in btc}
+        btc_keys = sorted(btc_close.keys())
+        coins = {}
+        for r in results:
+            if isinstance(r, Exception) or not r or not isinstance(r[1], list) or len(r[1]) < 120:
+                continue
+            coins[r[0]] = {int(k[0]): float(k[4]) for k in r[1]}
+        if len(coins) < 20:
+            await interaction.followup.send("Not enough listed history to compute the index right now.")
+            return
+        # monthly index over last ~12 month-ends + current
+        def index_at(ts_idx):
+            ts = btc_keys[ts_idx]
+            ts_90 = btc_keys[max(0, ts_idx - 90)]
+            if ts_90 not in btc_close:
+                return None
+            btc_r = btc_close[ts] / btc_close[ts_90] - 1
+            out = tot = 0
+            for cmap in coins.values():
+                if ts in cmap and ts_90 in cmap:
+                    tot += 1
+                    if cmap[ts] / cmap[ts_90] - 1 > btc_r:
+                        out += 1
+            if tot < 15:
+                return None
+            return out / tot * 100, out, tot
+        months, vals = [], []
+        step = 30
+        for idx in range(len(btc_keys) - 1 - step * 11, len(btc_keys) - 1, step):
+            if idx < 90:
+                continue
+            r = index_at(idx)
+            if r:
+                months.append(datetime.fromtimestamp(btc_keys[idx] / 1000, tz=timezone.utc).strftime("%b"))
+                vals.append(r[0])
+        cur = index_at(len(btc_keys) - 1)
+        if not cur:
+            await interaction.followup.send("Index computation failed - try again shortly.")
+            return
+        current, n_out, n_tot = cur
+        months.append("Now"); vals.append(current)
+        _ALTSEASON_CACHE["data"] = (months, vals, current, n_out, n_tot)
+        _ALTSEASON_CACHE["ts"] = now
+    if current < 25:
+        read = "BTC season - alts bleed vs BTC. Rotation into alts is fighting the tape."
+    elif current < 50:
+        read = "BTC-led market. Only the strongest alts keep up - be selective."
+    elif current < 75:
+        read = "Broadening - rotation building. Majors first, then mid-caps. Above 75 confirms altseason."
+    else:
+        read = "ALTSEASON CONFIRMED. Historically lasts weeks, not months - take profits INTO strength, don't add leverage."
+    try:
+        buf = await asyncio.to_thread(make_altseason_image, months, vals, current)
+    except Exception as e:
+        await interaction.followup.send(f"Chart render failed: {e}")
+        return
+    f = discord.File(buf, filename="altseason.png")
+    await interaction.followup.send(
+        content=f"**Altseason Index: {current:.0f}** - {n_out}/{n_tot} of the top 50 beat BTC over 90d.\n**Read:** {read}",
+        file=f)
+
+
+@bot.tree.command(name="unlocks", description="Token unlocks in the next 14 days - the supply calendar")
+async def unlocks_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        async with aiohttp.ClientSession() as s:
+            d = await _get_json(s, "https://api.llama.fi/emissions", None, 25)
+    except Exception:
+        d = None
+    if not d or not isinstance(d, list):
+        await interaction.followup.send("Unlock data unavailable right now (DefiLlama).")
+        return
+    now_ts = datetime.now(timezone.utc).timestamp()
+    horizon = now_ts + 14 * 86400
+    rows = []
+    for proto in d:
+        try:
+            events = proto.get("upcomingEvent") or []
+            if isinstance(events, dict):
+                events = [events]
+            mcap = proto.get("mcap") or 0
+            sym = (proto.get("token") or proto.get("name") or "?").upper()
+            for ev in events:
+                ts = ev.get("timestamp")
+                if not ts or not (now_ts <= float(ts) <= horizon):
+                    continue
+                usd = 0
+                try:
+                    tokens = sum(float(x) for x in (ev.get("noOfTokens") or []) if x)
+                    price = float(proto.get("price") or 0)
+                    usd = tokens * price
+                except Exception:
+                    pass
+                if usd < 1_000_000:
+                    continue
+                pct = (usd / mcap * 100) if mcap else None
+                rows.append((float(ts), sym, usd, pct))
+        except Exception:
+            continue
+    if not rows:
+        await interaction.followup.send("No significant unlocks (> $1M) found in the next 14 days - or the data source changed shape. Calendar looks clear.")
+        return
+    rows.sort(key=lambda r: r[0])
+    lines = []
+    for ts, sym, usd, pct in rows[:15]:
+        day = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%a %d %b")
+        if pct is None:
+            sev, note = "\U0001F7E1", ""
+        elif pct < 1:
+            sev, note = "\U0001F7E2", "minor - usually absorbed"
+        elif pct < 3:
+            sev, note = "\U0001F7E1", "meaningful - weakness tends to front-run these"
+        else:
+            sev, note = "\U0001F534", "heavy supply - longs into this fight the calendar"
+        ptxt = f" ({pct:.1f}% of mcap)" if pct is not None else ""
+        lines.append(f"{sev} **{sym}** - ${usd/1e6:.0f}M{ptxt} - {day}" + (f"\n    *{note}*" if note else ""))
+    embed = discord.Embed(title="\U0001F513 Token Unlocks - next 14 days", color=NAVY,
+                          timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines)
+    embed.set_footer(text="Sigma Trading - DefiLlama data · unlock selling front-runs the date")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="fees", description="BTC + ETH network fees - the retail thermometer")
+async def fees_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    btc_fee = eth_gwei = None
+    try:
+        async with aiohttp.ClientSession() as s:
+            mf = await _get_json(s, "https://mempool.space/api/v1/fees/recommended", None, 15)
+            if mf:
+                btc_fee = float(mf.get("fastestFee") or 0)
+            async with s.post("https://cloudflare-eth.com",
+                              json={"jsonrpc": "2.0", "method": "eth_gasPrice", "params": [], "id": 1},
+                              timeout=aiohttp.ClientTimeout(total=15)) as r:
+                if r.status == 200:
+                    j = await r.json()
+                    eth_gwei = int(j["result"], 16) / 1e9
+    except Exception:
+        pass
+    if btc_fee is None and eth_gwei is None:
+        await interaction.followup.send("Fee data unavailable right now.")
+        return
+    def btc_read(f):
+        if f < 20: return "calm"
+        if f < 60: return "active"
+        if f < 100: return "busy"
+        return "CONGESTED"
+    def eth_read(g):
+        if g < 15: return "calm"
+        if g < 35: return "active"
+        if g < 60: return "busy"
+        return "CONGESTED"
+    lines = []
+    if btc_fee is not None:
+        lines.append(f"**BTC:** {btc_fee:.0f} sat/vB ({btc_read(btc_fee)})")
+    if eth_gwei is not None:
+        lines.append(f"**ETH:** {eth_gwei:.1f} gwei ({eth_read(eth_gwei)})")
+    hot = (btc_fee or 0) >= 100 or (eth_gwei or 0) >= 60
+    quiet = (btc_fee or 999) < 20 and (eth_gwei or 999) < 15
+    if hot:
+        read = "\U0001F525 Chains congested - retail FOMO is live. Historically distribution weather, not accumulation."
+    elif quiet:
+        read = "Chains quiet - retail absent. Tops don't form in silence."
+    else:
+        read = "Activity building - normal bull rotation, no euphoria signal from fees yet."
+    embed = discord.Embed(title="\u26FD Network Fees - Retail Thermometer", color=NAVY,
+                          timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines) + f"\n**Read:** {read}"
+    embed.set_footer(text="Sigma Trading - fee spikes mark euphoria, not entries")
+    await interaction.followup.send(embed=embed)
+
+
+# ---------------- FUNDING EUPHORIA GUARD ----------------
+FUNDING_HOT = 0.06      # %/8h OI-weighted, crossing above fires the warning
+FUNDING_COLD = -0.02    # crossing below fires the shorts-crowded note
+FUNDING_RESET = 0.03    # back inside +/- this = re-arm
+FUNDING_COOLDOWN_H = 12
+_funding_guard_state = {}   # base -> {"last_fire": ts, "armed": True}
+
+
+@tasks.loop(minutes=15)
+async def funding_guard_loop():
+    try:
+        await _funding_guard_tick()
+    except Exception as e:
+        print(f"[fguard] tick error: {e}", flush=True)
+
+
+async def _funding_guard_tick():
+    if not FUNDING_GUARD_CHANNEL_ID:
+        return
+    ch = bot.get_channel(FUNDING_GUARD_CHANNEL_ID)
+    if ch is None:
+        return
+    now = datetime.now(timezone.utc).timestamp()
+    for base in ("BTC", "ETH"):
+        rows = await fetch_agg_rows(base)
+        if not rows:
+            continue
+        total_oi = sum(r[1] for r in rows)
+        if total_oi <= 0:
+            continue
+        wf = sum(r[2] * r[1] for r in rows) / total_oi
+        st = _funding_guard_state.setdefault(base, {"last_fire": 0, "armed": True})
+        if abs(wf) < FUNDING_RESET:
+            st["armed"] = True
+            continue
+        if not st["armed"] or now - st["last_fire"] < FUNDING_COOLDOWN_H * 3600:
+            continue
+        if wf >= FUNDING_HOT:
+            title = f"\u26A0\uFE0F Funding Euphoria - {base}"
+            body = (f"OI-weighted funding **{wf:+.3f}%/8h** across {len(rows)} venues.\n"
+                    f"**What this means:** longs paying heavily to stay in - leverage crowded one side.\n"
+                    f"**What usually follows:** violent wicks into that leverage.\n"
+                    f"**What it isn't:** a short signal - it's a *tighten stops, don't add leverage here* signal.")
+        elif wf <= FUNDING_COLD:
+            title = f"\u2696\uFE0F Shorts Crowded - {base}"
+            body = (f"OI-weighted funding **{wf:+.3f}%/8h** - shorts paying across venues.\n"
+                    f"Crowded shorts are squeeze fuel above. Careful chasing weakness here.")
+        else:
+            continue
+        embed = discord.Embed(title=title, description=body + f"\n\n*Resets when funding normalizes inside \u00B1{FUNDING_RESET:g}%.*",
+                              color=NAVY, timestamp=datetime.now(timezone.utc))
+        embed.set_footer(text="Sigma Trading - automated leverage guard")
+        try:
+            await ch.send(embed=embed)
+            st["last_fire"] = now
+            st["armed"] = False
+            print(f"[fguard] fired {base} at {wf:+.3f}%", flush=True)
+        except Exception as e:
+            print(f"[fguard] send error: {e}", flush=True)
+
+
+@funding_guard_loop.before_loop
+async def _before_funding_guard():
+    await bot.wait_until_ready()
+
+
+def make_cycle_image(prices: list, ma111: list, ma350x2: list, score: float, metrics_line: str) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    n = len(prices)
+    fig = plt.figure(figsize=(12, 7), facecolor=SG_OBS)
+    gs = fig.add_gridspec(2, 1, height_ratios=[3, 1], hspace=0.28)
+    ax = fig.add_subplot(gs[0]); sigma_style_ax(ax)
+    x = list(range(n))
+    ax.plot(x, prices, color=SG_PAPER, lw=1.2, label="BTC")
+    ax.plot(x, ma111, color=SG_CYAN, lw=1.5, label="111DMA")
+    ax.plot(x, ma350x2, color=SG_AMBER, lw=1.5, label="2x350DMA")
+    ax.set_yscale("log")
+    ax.legend(facecolor=SG_GRA, edgecolor=SG_SLATE, labelcolor=SG_PAPER, fontsize=9, loc="upper left")
+    ax.set_title("BTC  ·  CYCLE HEAT", color=SG_PAPER, fontsize=15, loc="left", pad=12, fontweight="bold")
+    sigma_logo_ax(ax)
+    ax2 = fig.add_subplot(gs[1]); ax2.set_facecolor(SG_OBS)
+    ax2.set_xlim(0, 10); ax2.set_ylim(0, 1); ax2.axis("off")
+    ax2.barh(0.55, 10, height=0.3, color=SG_CARD, edgecolor=SG_SLATE)
+    steps = 200
+    for i2 in range(steps):
+        g = i2 / steps
+        c = SG_CYAN if g < 0.5 else (SG_AMBER if g < 0.8 else SG_SHORT)
+        left = i2 * 10 / steps
+        ax2.barh(0.55, 10 / steps, left=left, height=0.3, color=c,
+                 alpha=0.9 if left <= score else 0.22)
+    ax2.plot([score], [0.55], marker="v", color=SG_PAPER, markersize=12)
+    ax2.text(0, 0.13, "COOL", color=SG_CYAN, fontsize=9)
+    ax2.text(9.15, 0.13, "EUPHORIC", color=SG_SHORT, fontsize=9)
+    ax2.text(5, 0.97, f"CYCLE HEAT  {score:.0f} / 10", color=SG_PAPER, fontsize=13, ha="center", fontweight="bold")
+    ax2.text(5, -0.14, metrics_line, color=SG_ASH, fontsize=9, ha="center", family="monospace")
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="cycle", description="BTC cycle heat - Pi Cycle, Mayer, 200W MA, one score")
+async def cycle_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    import math
+    try:
+        async with aiohttp.ClientSession() as s:
+            daily = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                                    {"symbol": "BTCUSDT", "interval": "1d", "limit": 1000}, 20)
+            weekly = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                                     {"symbol": "BTCUSDT", "interval": "1w", "limit": 250}, 20)
+    except Exception:
+        daily = weekly = None
+    if not daily or not isinstance(daily, list) or len(daily) < 400:
+        await interaction.followup.send("Couldn't fetch enough BTC history right now.")
+        return
+    closes = [float(k[4]) for k in daily]
+    price = closes[-1]
+    def sma(arr, w, idx=None):
+        idx = len(arr) if idx is None else idx
+        if idx < w:
+            return None
+        return sum(arr[idx - w:idx]) / w
+    ma111_series, ma350x2_series = [], []
+    for i2 in range(len(closes)):
+        m1 = sma(closes, 111, i2 + 1)
+        m3 = sma(closes, 350, i2 + 1)
+        ma111_series.append(m1 if m1 else float("nan"))
+        ma350x2_series.append(2 * m3 if m3 else float("nan"))
+    ma111 = ma111_series[-1]
+    ma350x2 = ma350x2_series[-1]
+    mayer = price / sma(closes, 200) if sma(closes, 200) else None
+    w_closes = [float(k[4]) for k in weekly] if weekly and isinstance(weekly, list) else []
+    ma200w = sma(w_closes, 200) if len(w_closes) >= 200 else (sma(w_closes, len(w_closes)) if w_closes else None)
+    dist_200w = (price / ma200w - 1) * 100 if ma200w else None
+    pi_gap = (ma350x2 - ma111) / ma350x2 * 100 if ma350x2 and ma111 else None
+    # RV percentile (30d ann. vs 1yr)
+    rets = [math.log(closes[i2] / closes[i2 - 1]) for i2 in range(1, len(closes)) if closes[i2 - 1] > 0]
+    def _std(xs):
+        if len(xs) < 2:
+            return 0.0
+        m = sum(xs) / len(xs)
+        return (sum((x - m) ** 2 for x in xs) / (len(xs) - 1)) ** 0.5
+    rv_series = [_std(rets[i2 - 30:i2]) * math.sqrt(365) * 100 for i2 in range(max(30, len(rets) - 365), len(rets) + 1)]
+    rv_now = rv_series[-1] if rv_series else 0
+    rv_pct = sum(1 for x in rv_series if x <= rv_now) / len(rv_series) * 100 if rv_series else 50
+    # score 0-10
+    s_mayer = 0 if not mayer else min(10, max(0, (mayer - 0.8) / (2.8 - 0.8) * 10))
+    s_pi = 0 if pi_gap is None else min(10, max(0, (35 - pi_gap) / 35 * 10))
+    s_200w = 0 if dist_200w is None else min(10, max(0, dist_200w / 350 * 10))
+    score = round(0.4 * s_mayer + 0.35 * s_pi + 0.25 * s_200w, 1)
+    # narration
+    if mayer is None:
+        mayer_read = ""
+    elif mayer < 0.8:
+        mayer_read = "Mayer in deep-value zone - historically generational bids."
+    elif mayer < 1.5:
+        mayer_read = "Mayer healthy - trend has room to run."
+    elif mayer < 2.4:
+        mayer_read = "Mayer heated - late-cycle behavior starts here, trail stops."
+    else:
+        mayer_read = "Mayer above 2.4 - every past reading here resolved in a major correction. Size down."
+    if pi_gap is None:
+        pi_read = ""
+    elif pi_gap > 25:
+        pi_read = "Pi Cycle crossover distant - no top signal."
+    elif pi_gap > 10:
+        pi_read = "Pi Cycle gap closing - weeks of vertical price could trigger it."
+    else:
+        pi_read = "PI CYCLE NEAR CROSSOVER - every past cross marked the cycle top within days."
+    metrics_line = (f"Mayer {mayer:.2f}   ·   vs 200W MA {dist_200w:+.0f}%   ·   "
+                    f"RV {rv_pct:.0f}th pctile   ·   Pi gap {pi_gap:.0f}%")
+    try:
+        buf = await asyncio.to_thread(make_cycle_image, closes[-900:],
+                                      ma111_series[-900:], ma350x2_series[-900:], score, metrics_line)
+    except Exception as e:
+        await interaction.followup.send(f"Chart render failed: {e}")
+        return
+    heat_word = "Cool" if score < 3.5 else ("Elevated" if score < 7 else "Euphoric")
+    lines = [f"**Cycle Heat {score:g}/10 - {heat_word}.**",
+             f"{mayer_read}",
+             f"{pi_read}",
+             f"**What flips this:** Mayer >2.4 or Pi gap <10% pushes heat toward 9/10 - historically the exit window, not the entry."]
+    f = discord.File(buf, filename="btc_cycle.png")
+    await interaction.followup.send(content="\n".join(l for l in lines if l), file=f)
+
+
+def make_ratio_image(sym: str, ratios: list, ma50: list, chg90: float, verdict: str, vcolor: str) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(12, 5.6), facecolor=SG_OBS)
+    sigma_style_ax(ax)
+    x = list(range(len(ratios)))
+    ax.plot(x, ratios, color=SG_PAPER, lw=1.3)
+    ax.plot(x, ma50, color=SG_CYAN, lw=1.5, label="50DMA")
+    ax.fill_between(x, ratios, min(ratios), color=SG_CYAN, alpha=0.05)
+    ax.set_title(f"{sym} / BTC  ·  1D", color=SG_PAPER, fontsize=15, loc="left", pad=12, fontweight="bold")
+    ax.text(0.99, 1.02, f"90d vs BTC: {chg90:+.1f}%  ·  {verdict}", transform=ax.transAxes,
+            color=vcolor, fontsize=10, ha="right", family="monospace")
+    ax.legend(facecolor=SG_GRA, edgecolor=SG_SLATE, labelcolor=SG_PAPER, fontsize=9, loc="upper left")
+    sigma_logo_ax(ax)
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="ratio", description="Coin vs BTC - real strength or just USD beta?")
+@app_commands.describe(coin="Coin symbol, e.g. SOL")
+async def ratio_cmd(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    base = re.sub(r"[^A-Za-z0-9]", "", coin).upper().replace("USDT", "")
+    ratios = None
+    async with aiohttp.ClientSession() as s:
+        d = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                            {"symbol": f"{base}BTC", "interval": "1d", "limit": 365}, 20)
+        if d and isinstance(d, list) and len(d) > 60:
+            ratios = [float(k[4]) for k in d]
+        else:
+            du = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                                 {"symbol": f"{base}USDT", "interval": "1d", "limit": 365}, 20)
+            db = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                                 {"symbol": "BTCUSDT", "interval": "1d", "limit": 365}, 20)
+            if du and db and isinstance(du, list) and isinstance(db, list) and len(du) > 60:
+                n = min(len(du), len(db))
+                ratios = [float(du[i2][4]) / float(db[i2][4]) for i2 in range(-n, 0)]
+    if not ratios:
+        await interaction.followup.send(f"No BTC-pair data for **{base}**.")
+        return
+    ma50 = []
+    for i2 in range(len(ratios)):
+        w = ratios[max(0, i2 - 49):i2 + 1]
+        ma50.append(sum(w) / len(w))
+    chg90 = (ratios[-1] / ratios[-91] - 1) * 100 if len(ratios) > 91 else (ratios[-1] / ratios[0] - 1) * 100
+    above = ratios[-1] > ma50[-1]
+    rising = ma50[-1] > ma50[-15] if len(ma50) > 15 else True
+    if above and rising:
+        verdict, vc = "genuine outperformance", SG_LONG
+        read = "Strength in BTC terms, not just USD beta. Rotation favors it."
+    elif above and not rising:
+        verdict, vc = "stalling above the DMA", SG_AMBER
+        read = "Outperformance losing momentum - a DMA loss turns this to dead money vs BTC."
+    elif not above and not rising:
+        verdict, vc = "underperforming BTC", SG_SHORT
+        read = "USD gains here are beta, not alpha - dead money vs just holding BTC."
+    else:
+        verdict, vc = "early reversal attempt", SG_CYAN
+        read = "Turning up from below - a clean DMA reclaim would confirm the rotation."
+    try:
+        buf = await asyncio.to_thread(make_ratio_image, base, ratios, ma50, chg90, verdict, vc)
+    except Exception as e:
+        await interaction.followup.send(f"Chart render failed: {e}")
+        return
+    f = discord.File(buf, filename=f"{base}_btc_ratio.png")
+    await interaction.followup.send(content=f"**{base}/BTC:** {chg90:+.1f}% (90d) - {verdict}.\n**Read:** {read}", file=f)
 
 
 @bot.tree.command(name="rvol", description="Realized volatility regime - is the market compressed or wild?")
@@ -3780,7 +4366,7 @@ async def snapshot_cmd(interaction: discord.Interaction, coin: str):
         lines.append(fg_line)
     embed = discord.Embed(title=f"\U0001F4F8 {symbol} Snapshot", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Sigma Trading - morning check, one command")
+    embed.set_footer(text="Scient Lounge - morning check, one command")
     await interaction.followup.send(embed=embed)
 
 
@@ -3849,20 +4435,17 @@ async def stables_cmd(interaction: discord.Interaction):
         f"**7d:** {arrow7} {chg7:+.2f}% | **30d:** {arrow30} {chg30:+.2f}%\n"
         f"**Read:** {read}"
     )
-    embed.set_footer(text="Sigma Trading - DefiLlama data · stablecoin supply leads price")
+    embed.set_footer(text="Scient Lounge - DefiLlama data · stablecoin supply leads price")
     await interaction.followup.send(embed=embed)
 
 
 @bot.tree.command(name="agg", description="Aggregated OI + funding across Binance, Bybit and OKX")
 @app_commands.describe(coin="Coin symbol, e.g. BTC")
-async def agg_cmd(interaction: discord.Interaction, coin: str):
-    await interaction.response.defer()
-    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
-    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+async def fetch_agg_rows(base: str):
+    """(exchange, oi_usd, funding_pct) rows across Binance/Bybit/OKX - shared by /agg and the euphoria guard."""
     pair = f"{base}USDT"
     rows = []
     async with aiohttp.ClientSession() as s:
-        # Binance
         try:
             oi_d = await _get_json(s, "https://fapi.binance.com/fapi/v1/openInterest", {"symbol": pair}, 15)
             px_d = await _get_json(s, "https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol": pair}, 15)
@@ -3871,14 +4454,12 @@ async def agg_cmd(interaction: discord.Interaction, coin: str):
                 rows.append(("Binance", float(oi_d["openInterest"]) * mark, float(px_d["lastFundingRate"]) * 100))
         except Exception:
             pass
-        # Bybit
         try:
             bb = await _get_json(s, "https://api.bybit.com/v5/market/tickers", {"category": "linear", "symbol": pair}, 15)
             t = bb["result"]["list"][0]
             rows.append(("Bybit", float(t["openInterestValue"]), float(t["fundingRate"]) * 100))
         except Exception:
             pass
-        # OKX
         try:
             inst = f"{base}-USDT-SWAP"
             oi_o = await _get_json(s, "https://www.okx.com/api/v5/public/open-interest", {"instId": inst}, 15)
@@ -3889,6 +4470,14 @@ async def agg_cmd(interaction: discord.Interaction, coin: str):
                 rows.append(("OKX", oi_usd, fr))
         except Exception:
             pass
+    return rows
+
+
+async def agg_cmd(interaction: discord.Interaction, coin: str):
+    await interaction.response.defer()
+    symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
+    base = symbol[:-4] if symbol.endswith("USDT") else symbol
+    rows = await fetch_agg_rows(base)
     if not rows:
         await interaction.followup.send(f"No perp data found for **{base}** on any tracked exchange.")
         return
@@ -3908,7 +4497,7 @@ async def agg_cmd(interaction: discord.Interaction, coin: str):
         lines.append("**Read:** Funding balanced across venues.")
     embed = discord.Embed(title=f"\U0001F310 Aggregated Derivatives - {base}", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Sigma Trading - Binance + Bybit + OKX")
+    embed.set_footer(text="Scient Lounge - Binance + Bybit + OKX")
     await interaction.followup.send(embed=embed)
 
 
@@ -3964,7 +4553,7 @@ async def whale_cmd(interaction: discord.Interaction, coin: str, min_usd: int = 
         lines.append(f"*No single trades above ${min_usd/1e3:.0f}K this hour - quiet whales.*")
     embed = discord.Embed(title=f"\U0001F40B Whale Watch - {symbol}", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Sigma Trading - Binance spot aggTrades")
+    embed.set_footer(text="Scient Lounge - Binance spot aggTrades")
     await interaction.followup.send(embed=embed)
 
 
@@ -4022,7 +4611,7 @@ async def lsr_cmd(interaction: discord.Interaction, coin: str):
         lines.append(f"**Read:** {read}")
     embed = discord.Embed(title=f"\u2696\uFE0F Long/Short Ratio - {symbol}", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Sigma Trading - Binance futures, 1h data")
+    embed.set_footer(text="Scient Lounge - Binance futures, 1h data")
     await interaction.followup.send(embed=embed)
 
 
@@ -4037,44 +4626,48 @@ def make_liqzones_image(symbol: str, price: float, zones: list) -> io.BytesIO:
     longs = sorted([z for z in zones if z["side"] == "long"], key=lambda z: z["price"])
     shorts = sorted([z for z in zones if z["side"] == "short"], key=lambda z: z["price"])
 
-    fig, ax = plt.subplots(figsize=(11, 7.5), facecolor="#131722")
-    ax.set_facecolor("#131722")
+    fig, ax = plt.subplots(figsize=(11, 7.5), facecolor=SG_OBS)
+    ax.set_facecolor(SG_OBS)
 
     bar_h = price * 0.006
     for z in longs:
-        ax.barh(z["price"], -z["intensity"], height=bar_h, color="#E5484D", alpha=0.92,
+        ax.barh(z["price"], -z["intensity"], height=bar_h, color=SG_SHORT, alpha=0.92,
                 edgecolor="#ff6b6f", linewidth=0.5)
         dist = (z["price"] - price) / price * 100
         ax.text(-z["intensity"] - 0.03, z["price"], f"{z['lev']}x  {dist:+.1f}%",
                 color="#ff8f92", fontsize=8.5, va="center", ha="right")
     for z in shorts:
-        ax.barh(z["price"], z["intensity"], height=bar_h, color="#30A46C", alpha=0.92,
+        ax.barh(z["price"], z["intensity"], height=bar_h, color=SG_LONG, alpha=0.92,
                 edgecolor="#4fd18b", linewidth=0.5)
         dist = (z["price"] - price) / price * 100
         ax.text(z["intensity"] + 0.03, z["price"], f"{z['lev']}x  {dist:+.1f}%",
                 color="#5fe0a0", fontsize=8.5, va="center", ha="left")
 
-    ax.axhline(price, color="#EAECEF", linewidth=1.4)
-    ax.text(0, price, f"  ${fnum(price)}  ", color="#131722", fontsize=9.5, fontweight="bold",
-            va="center", ha="center", bbox=dict(boxstyle="round,pad=0.3", fc="#EAECEF", ec="none"))
+    ax.axhline(price, color=SG_PAPER, linewidth=1.4)
+    ax.text(0, price, f"  ${fnum(price)}  ", color=SG_OBS, fontsize=9.5, fontweight="bold",
+            va="center", ha="center", bbox=dict(boxstyle="round,pad=0.3", fc=SG_PAPER, ec="none"))
 
     ax.set_xlim(-1.35, 1.35)
-    ax.axvline(0, color="#2A2E39", linewidth=0.8)
-    ax.text(-0.7, ax.get_ylim()[1], "LONG liquidations \u25BC", color="#E5484D",
+    ax.axvline(0, color=SG_SLATE, linewidth=0.8)
+    ax.text(-0.7, ax.get_ylim()[1], "LONG liquidations \u25BC", color=SG_SHORT,
             fontsize=10, ha="center", va="bottom", fontweight="bold")
-    ax.text(0.7, ax.get_ylim()[1], "\u25B2 SHORT liquidations", color="#30A46C",
+    ax.text(0.7, ax.get_ylim()[1], "\u25B2 SHORT liquidations", color=SG_LONG,
             fontsize=10, ha="center", va="bottom", fontweight="bold")
 
-    ax.set_title(f"{symbol}   Estimated Liquidation Zones", color="#EAECEF", fontsize=13, loc="left", pad=24)
+    ax.set_title(f"{symbol}   Estimated Liquidation Zones", color=SG_PAPER, fontsize=13, loc="left", pad=24)
     ax.set_xticks([])
-    ax.tick_params(colors="#B2B5BE", labelsize=8)
+    ax.tick_params(colors=SG_ASH, labelsize=8)
     ax.yaxis.set_major_formatter(lambda x, _: f"${fnum(x)}")
-    ax.grid(color="#1E222D", linewidth=0.5, axis="y")
+    ax.grid(color=SG_SLATE, linewidth=0.5, axis="y")
     for sp in ax.spines.values():
-        sp.set_color("#20242E")
+        sp.set_color(SG_SLATE)
     plt.tight_layout()
+    try:
+        sigma_logo_ax(ax)
+    except Exception:
+        pass
     buf = io.BytesIO()
-    fig.savefig(buf, dpi=130, facecolor="#131722", bbox_inches="tight")
+    fig.savefig(buf, dpi=130, facecolor=SG_OBS, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -4200,7 +4793,7 @@ async def levels(interaction: discord.Interaction, coin: str, timeframe: app_com
     lines.append("\n*\u2B50 = number of touches (max 3 shown). Auto-detected from swing pivots - always confirm with your own chart.*")
     embed = discord.Embed(title=f"Key Levels - {symbol} ({tfv})", color=NAVY, timestamp=datetime.now(timezone.utc))
     embed.description = "\n".join(lines)
-    embed.set_footer(text="Sigma Trading - swing pivot clusters")
+    embed.set_footer(text="Scient Lounge - swing pivot clusters")
     await interaction.followup.send(embed=embed)
 
 
@@ -4211,8 +4804,8 @@ def make_heatmap_image(rows: list) -> io.BytesIO:
     import matplotlib.patches as mpatches
     cols = 5
     nrows = (len(rows) + cols - 1) // cols
-    fig, ax = plt.subplots(figsize=(11, nrows * 1.5), facecolor="#131722")
-    ax.set_facecolor("#131722")
+    fig, ax = plt.subplots(figsize=(11, nrows * 1.5), facecolor=SG_OBS)
+    ax.set_facecolor(SG_OBS)
     ax.set_xlim(0, cols)
     ax.set_ylim(0, nrows)
     ax.axis("off")
@@ -4224,14 +4817,18 @@ def make_heatmap_image(rows: list) -> io.BytesIO:
             color = (0.05, 0.35 + 0.35 * mag, 0.25 + 0.2 * mag)
         else:
             color = (0.45 + 0.35 * mag, 0.13, 0.2)
-        rect = mpatches.FancyBboxPatch((c_i + 0.03, r_i + 0.04), 0.94, 0.92, boxstyle="round,pad=0.01,rounding_size=0.03", facecolor=color, edgecolor="#131722", linewidth=2)
+        rect = mpatches.FancyBboxPatch((c_i + 0.03, r_i + 0.04), 0.94, 0.92, boxstyle="round,pad=0.01,rounding_size=0.03", facecolor=color, edgecolor=SG_OBS, linewidth=2)
         ax.add_patch(rect)
-        ax.text(c_i + 0.5, r_i + 0.62, sym, ha="center", va="center", color="#EAECEF", fontsize=13, fontweight="bold")
-        ax.text(c_i + 0.5, r_i + 0.33, f"{chg:+.2f}%", ha="center", va="center", color="#EAECEF", fontsize=11)
-    fig.suptitle("24h Market Heatmap - top volume", color="#EAECEF", fontsize=13, y=0.995)
+        ax.text(c_i + 0.5, r_i + 0.62, sym, ha="center", va="center", color=SG_PAPER, fontsize=13, fontweight="bold")
+        ax.text(c_i + 0.5, r_i + 0.33, f"{chg:+.2f}%", ha="center", va="center", color=SG_PAPER, fontsize=11)
+    fig.suptitle("24h Market Heatmap - top volume", color=SG_PAPER, fontsize=13, y=0.995)
     plt.tight_layout()
+    try:
+        sigma_logo_ax(ax)
+    except Exception:
+        pass
     buf = io.BytesIO()
-    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -4277,21 +4874,21 @@ def make_compare_image(sym1: str, sym2: str, closes1: list, closes2: list, dates
     import matplotlib.pyplot as plt
     n1 = [c / closes1[0] * 100 - 100 for c in closes1]
     n2 = [c / closes2[0] * 100 - 100 for c in closes2]
-    fig, ax = plt.subplots(figsize=(11, 5.5), facecolor="#131722")
-    ax.set_facecolor("#131722")
+    fig, ax = plt.subplots(figsize=(11, 5.5), facecolor=SG_OBS)
+    ax.set_facecolor(SG_OBS)
     ax.plot(dates, n1, color="#E8590C", linewidth=2, label=sym1)
-    ax.plot(dates, n2, color="#378ADD", linewidth=2, label=sym2)
-    ax.axhline(0, color="#B2B5BE", linewidth=0.6, linestyle="--", alpha=0.5)
-    ax.grid(color="#1E222D", linewidth=0.5)
+    ax.plot(dates, n2, color=SG_CYAN, linewidth=2, label=sym2)
+    ax.axhline(0, color=SG_ASH, linewidth=0.6, linestyle="--", alpha=0.5)
+    ax.grid(color=SG_SLATE, linewidth=0.5)
     for spine in ax.spines.values():
-        spine.set_color("#2A2E39")
-    ax.tick_params(colors="#B2B5BE", labelsize=8)
+        spine.set_color(SG_SLATE)
+    ax.tick_params(colors=SG_ASH, labelsize=8)
     ax.yaxis.tick_right()
-    leg = ax.legend(facecolor="#131722", edgecolor="#2A2E39", labelcolor="#EAECEF", fontsize=10)
-    ax.set_title(f"{sym1} vs {sym2} - 30d performance (%)", color="#EAECEF", fontsize=12, loc="left", pad=10)
+    leg = ax.legend(facecolor=SG_OBS, edgecolor=SG_SLATE, labelcolor=SG_PAPER, fontsize=10)
+    ax.set_title(f"{sym1} vs {sym2} - 30d performance (%)", color=SG_PAPER, fontsize=12, loc="left", pad=10)
     plt.tight_layout()
     buf = io.BytesIO()
-    fig.savefig(buf, dpi=120, facecolor="#131722", bbox_inches="tight")
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
     return buf
@@ -4336,7 +4933,12 @@ def build_help_embed() -> discord.Embed:
         value=(
             "`/levels` - auto support/resistance with strength\n"
             "`/vol` - current volatility snapshot (for SL sizing)\n"
-            "`/rvol` - volatility regime, compressed or wild"
+            "`/rvol` - volatility regime, compressed or wild\n"
+            "`/cycle` - BTC cycle heat: Pi Cycle, Mayer, 200W MA\n"
+            "`/altseason` - % of top 50 beating BTC, rotation index\n"
+            "`/ratio` - coin vs BTC: real strength or USD beta?\n"
+            "`/unlocks` - token unlock calendar, next 14 days\n"
+            "`/fees` - BTC + ETH fees, the retail thermometer"
         ),
         inline=False,
     )
@@ -4368,14 +4970,15 @@ def build_help_embed() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="\U0001F514 Pings",
+        name="\U0001F514 Pings & Learning",
         value=(
             "`/follow` `/unfollow` - analyst trade pings\n"
-            "Or use the buttons in #select-analyst-alerts"
+            "Or use the buttons in #select-analyst-alerts\n"
+            "`/quiz` - trading quizzes, basics to advanced"
         ),
         inline=False,
     )
-    embed.set_footer(text="Sigma Trading - Quant Terminal")
+    embed.set_footer(text="Scient Lounge - Quant Terminal")
     return embed
 
 
@@ -4505,7 +5108,7 @@ async def subs_cmd(interaction: discord.Interaction):
     embed = discord.Embed(title="\U0001F4B3 Subscriptions", color=NAVY, timestamp=now)
     embed.description = "\n".join(r[1] for r in rows[:30])
     embed.add_field(name="Total", value=f"{len(subs)} active | ${total_rev} lifetime recorded", inline=False)
-    embed.set_footer(text="Sigma Trading - subscription system")
+    embed.set_footer(text="Scient Lounge - subscription system")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -4777,7 +5380,7 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     embed.add_field(name="Graded on", value=(f"{len(rs)} closed" if rs else "-"), inline=True)
     embed.add_field(name="Best", value=(f"{best:+g}R" if best is not None else "-"), inline=True)
     embed.add_field(name="Worst", value=(f"{worst:+g}R" if worst is not None else "-"), inline=True)
-    embed.set_footer(text="Sigma Trading - Journal")
+    embed.set_footer(text="Scient Lounge - Journal")
     await interaction.followup.send(embed=embed, view=StatsCSVView(mine, target.display_name), ephemeral=True)
 
 
@@ -4808,7 +5411,7 @@ async def spot_stats(interaction: discord.Interaction, analyst: discord.Member =
     embed.add_field(name="BE / Invalid", value=f"{len(be)} / {len(invalid)}", inline=True)
     results = [p.get("result_pct") for p in closed if p.get("result_pct")]
     embed.add_field(name="Results", value=(", ".join(results[:10]) if results else "-"), inline=False)
-    embed.set_footer(text="Sigma Trading - Spot Journal")
+    embed.set_footer(text="Scient Lounge - Spot Journal")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
