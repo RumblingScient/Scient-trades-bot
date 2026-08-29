@@ -3735,7 +3735,8 @@ _ALTSEASON_CACHE = {"ts": 0, "data": None}
 ALTSEASON_STABLES = {"USDT","USDC","DAI","FDUSD","TUSD","USDE","PYUSD","USDS","WBTC","WETH","STETH","WSTETH","WEETH","CBBTC","LEO","OKB"}
 
 
-def make_altseason_image(months: list, vals: list, current: float) -> io.BytesIO:
+def make_altseason_image(months: list, vals: list, current: float,
+                         read_line: str = "", trigger_line: str = "") -> io.BytesIO:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -3753,6 +3754,9 @@ def make_altseason_image(months: list, vals: list, current: float) -> io.BytesIO
     axm.set_ylim(0, 100)
     axm.set_title("ALTSEASON INDEX  ·  % of top 50 outperforming BTC (90d)",
                   color=SG_PAPER, fontsize=14, loc="left", pad=12, fontweight="bold")
+    stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
+    axm.text(0.868, 1.04, stamp, transform=axm.transAxes, color=SG_ASH, fontsize=9.5,
+             ha="right", family="monospace")
     sigma_logo_ax(axm)
     axg.set_facecolor(SG_OBS); axg.axis("off"); axg.set_xlim(0, 100); axg.set_ylim(0, 1)
     axg.barh(0.5, 100, height=0.34, color=SG_CARD, edgecolor=SG_SLATE)
@@ -3764,6 +3768,12 @@ def make_altseason_image(months: list, vals: list, current: float) -> io.BytesIO
              fontweight="bold", family="monospace")
     axg.text(1.5, 0.06, "BTC dominance rules", color=SG_ASH, fontsize=8.5)
     axg.text(98.5, 0.06, "Full rotation", color=SG_ASH, fontsize=8.5, ha="right")
+    axg.text(25, 1.28, "<25 BTC season", color=SG_SHORT, fontsize=8, ha="center")
+    axg.text(75, 1.28, ">75 ALTSEASON confirmed", color=SG_LONG, fontsize=8, ha="center")
+    if trigger_line:
+        axg.text(50, -0.42, trigger_line, color=SG_CYAN, fontsize=10, ha="center", family="monospace")
+    if read_line:
+        axg.text(50, -0.82, read_line, color=SG_PAPER, fontsize=10.5, ha="center")
     buf = io.BytesIO()
     fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
     plt.close(fig)
@@ -3841,7 +3851,7 @@ async def altseason_cmd(interaction: discord.Interaction):
                 continue
             r = index_at(idx)
             if r:
-                months.append(datetime.fromtimestamp(btc_keys[idx] / 1000, tz=timezone.utc).strftime("%b"))
+                months.append(datetime.fromtimestamp(btc_keys[idx] / 1000, tz=timezone.utc).strftime("%d %b"))
                 vals.append(r[0])
         cur = index_at(len(btc_keys) - 1)
         if not cur:
@@ -3851,22 +3861,31 @@ async def altseason_cmd(interaction: discord.Interaction):
         months.append("Now"); vals.append(current)
         _ALTSEASON_CACHE["data"] = (months, vals, current, n_out, n_tot)
         _ALTSEASON_CACHE["ts"] = now
+    need = max(0, 75 - current)
+    coins_needed = max(0, int((75 * n_tot / 100) + 0.999) - n_out)
     if current < 25:
-        read = "BTC season - alts bleed vs BTC. Rotation into alts is fighting the tape."
+        read = "BTC season - alts bleed vs BTC. Rotation here is fighting the tape."
+        trigger = f"Altseason trigger: 75  ·  {need:.0f} points away ({coins_needed} more coins must flip vs BTC)"
     elif current < 50:
-        read = "BTC-led market. Only the strongest alts keep up - be selective."
+        read = "BTC-led market. Only the strongest alts keep up - be selective, majors only."
+        trigger = f"Altseason trigger: 75  ·  {need:.0f} points away ({coins_needed} more coins must flip vs BTC)"
     elif current < 75:
-        read = "Broadening - rotation building. Majors first, then mid-caps. Above 75 confirms altseason."
+        read = "Broadening - rotation building. Majors lead first, mid-caps follow."
+        trigger = f"Altseason trigger: 75  ·  only {need:.0f} points away ({coins_needed} coins) - watch BTC.D for the break"
     else:
-        read = "ALTSEASON CONFIRMED. Historically lasts weeks, not months - take profits INTO strength, don't add leverage."
+        read = "ALTSEASON CONFIRMED - historically lasts weeks, not months. Sell INTO strength."
+        trigger = "Trigger crossed  ·  falls back below 75 = rotation ending"
     try:
-        buf = await asyncio.to_thread(make_altseason_image, months, vals, current)
+        buf = await asyncio.to_thread(make_altseason_image, months, vals, current, read, trigger)
     except Exception as e:
         await interaction.followup.send(f"Chart render failed: {e}")
         return
     f = discord.File(buf, filename="altseason.png")
     await interaction.followup.send(
-        content=f"**Altseason Index: {current:.0f}** - {n_out}/{n_tot} of the top 50 beat BTC over 90d.\n**Read:** {read}",
+        content=(f"**Altseason Index: {current:.0f}** - {n_out}/{n_tot} of the top 50 beat BTC over 90d.\n"
+                 f"**Read:** {read}\n**Trigger:** {trigger}\n"
+                 f"*History: 2021 altseason ran ~10 weeks above 75. Confirmation beats anticipation - "
+                 f"entering at 75 still caught most of it.*"),
         file=f)
 
 
@@ -4048,7 +4067,8 @@ async def _before_funding_guard():
     await bot.wait_until_ready()
 
 
-def make_cycle_image(prices: list, ma111: list, ma350x2: list, score: float, metrics_line: str) -> io.BytesIO:
+def make_cycle_image(prices: list, ma111: list, ma350x2: list, score: float, metrics_line: str,
+                     price_now: float = None, heat_word: str = "", read_line: str = "") -> io.BytesIO:
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -4063,6 +4083,10 @@ def make_cycle_image(prices: list, ma111: list, ma350x2: list, score: float, met
     ax.set_yscale("log")
     ax.legend(facecolor=SG_GRA, edgecolor=SG_SLATE, labelcolor=SG_PAPER, fontsize=9, loc="upper left")
     ax.set_title("BTC  ·  CYCLE HEAT", color=SG_PAPER, fontsize=15, loc="left", pad=12, fontweight="bold")
+    if price_now:
+        stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
+        ax.text(0.865, 1.03, f"${price_now:,.0f}   ·   {stamp}", transform=ax.transAxes,
+                color=SG_ASH, fontsize=10, ha="right", family="monospace")
     sigma_logo_ax(ax)
     ax2 = fig.add_subplot(gs[1]); ax2.set_facecolor(SG_OBS)
     ax2.set_xlim(0, 10); ax2.set_ylim(0, 1); ax2.axis("off")
@@ -4077,8 +4101,11 @@ def make_cycle_image(prices: list, ma111: list, ma350x2: list, score: float, met
     ax2.plot([score], [0.55], marker="v", color=SG_PAPER, markersize=12)
     ax2.text(0, 0.13, "COOL", color=SG_CYAN, fontsize=9)
     ax2.text(9.15, 0.13, "EUPHORIC", color=SG_SHORT, fontsize=9)
-    ax2.text(5, 0.97, f"CYCLE HEAT  {score:.0f} / 10", color=SG_PAPER, fontsize=13, ha="center", fontweight="bold")
+    hw = f"  ·  {heat_word.upper()}" if heat_word else ""
+    ax2.text(5, 0.97, f"CYCLE HEAT  {score:g} / 10{hw}", color=SG_PAPER, fontsize=13, ha="center", fontweight="bold")
     ax2.text(5, -0.14, metrics_line, color=SG_ASH, fontsize=9, ha="center", family="monospace")
+    if read_line:
+        ax2.text(5, -0.45, read_line, color=SG_PAPER, fontsize=10.5, ha="center")
     buf = io.BytesIO()
     fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
     plt.close(fig)
@@ -4157,13 +4184,20 @@ async def cycle_cmd(interaction: discord.Interaction):
         pi_read = "PI CYCLE NEAR CROSSOVER - every past cross marked the cycle top within days."
     metrics_line = (f"Mayer {mayer:.2f}   ·   vs 200W MA {dist_200w:+.0f}%   ·   "
                     f"RV {rv_pct:.0f}th pctile   ·   Pi gap {pi_gap:.0f}%")
+    heat_word = "Cool" if score < 3.5 else ("Elevated" if score < 7 else "Euphoric")
+    if score < 3.5:
+        chart_read = "Early/mid cycle - no top signals. Dips are for buying, not fearing."
+    elif score < 7:
+        chart_read = "Heating up - trend intact but late-cycle behavior begins. Trail stops."
+    else:
+        chart_read = "Euphoric zone - historically the exit window, not the entry."
     try:
         buf = await asyncio.to_thread(make_cycle_image, closes[-900:],
-                                      ma111_series[-900:], ma350x2_series[-900:], score, metrics_line)
+                                      ma111_series[-900:], ma350x2_series[-900:], score, metrics_line,
+                                      price, heat_word, chart_read)
     except Exception as e:
         await interaction.followup.send(f"Chart render failed: {e}")
         return
-    heat_word = "Cool" if score < 3.5 else ("Elevated" if score < 7 else "Euphoric")
     lines = [f"**Cycle Heat {score:g}/10 - {heat_word}.**",
              f"{mayer_read}",
              f"{pi_read}",
