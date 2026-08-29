@@ -3241,7 +3241,7 @@ def make_chart_image(symbol: str, interval: str, klines: list) -> io.BytesIO:
         if len(df) >= period:
             ema = df["Close"].ewm(span=period, adjust=False).mean()
             addplots.append(mpf.make_addplot(ema, color=color, width=1.3))
-    mc = mpf.make_marketcolors(up="#0ECB81", down="#F6465D", edge="inherit", wick="inherit", volume={"up": "#0ECB8155", "down": "#F6465D55"})
+    mc = mpf.make_marketcolors(up=SG_LONG, down=SG_SHORT, edge="inherit", wick="inherit", volume={"up": SG_LONG + "55", "down": SG_SHORT + "55"})
     style = mpf.make_mpf_style(base_mpf_style="nightclouds", marketcolors=mc, facecolor=SG_OBS, edgecolor=SG_SLATE, figcolor=SG_OBS, gridcolor=SG_SLATE, gridstyle="-", rc={"axes.labelcolor": SG_ASH, "xtick.color": SG_ASH, "ytick.color": SG_ASH, "font.size": 9})
     last = df["Close"].iloc[-1]
     price_txt = f"{last:,.2f}" if last >= 1000 else f"{last:,.4f}".rstrip("0").rstrip(".")
@@ -3261,7 +3261,7 @@ def make_chart_image(symbol: str, interval: str, klines: list) -> io.BytesIO:
     axes[0].set_xlim(x0, x1 + (x1 - x0) * 0.06)
     axes[0].set_title(f"{symbol}  {interval}  |  {price_txt}", color=SG_PAPER, fontsize=13, loc="left", pad=12)
     up = df["Close"].iloc[-1] >= df["Open"].iloc[-1]
-    tag_color = "#0ECB81" if up else "#F6465D"
+    tag_color = SG_LONG if up else SG_SHORT
     axes[0].annotate(
         price_txt, xy=(1.0, float(last)), xycoords=("axes fraction", "data"),
         xytext=(4, 0), textcoords="offset points", ha="left", va="center",
@@ -3270,7 +3270,7 @@ def make_chart_image(symbol: str, interval: str, klines: list) -> io.BytesIO:
         bbox=dict(boxstyle="round,pad=0.25", facecolor=tag_color, edgecolor="none"),
     )
     try:
-        sigma_logo_ax(ax)
+        sigma_logo_ax(axes[0], zoom=0.075, pos=(0.985, 0.955))
     except Exception:
         pass
     buf = io.BytesIO()
@@ -4067,6 +4067,344 @@ async def _before_funding_guard():
     await bot.wait_until_ready()
 
 
+async def _btc_daily_full():
+    """BTC daily closes since 2017 listing - paginated (Binance 1000/call)."""
+    out = []
+    start = 1502928000000  # 2017-08-17
+    async with aiohttp.ClientSession() as s:
+        for _ in range(6):
+            d = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                                {"symbol": "BTCUSDT", "interval": "1d", "startTime": start, "limit": 1000}, 20)
+            if not d or not isinstance(d, list):
+                break
+            out += d
+            if len(d) < 1000:
+                break
+            start = int(d[-1][0]) + 86400000
+    return out
+
+
+RAINBOW_BANDS = [
+    (1.35, "#EA3943", "MAX BUBBLE - sell, seriously"),
+    (1.00, "#F06A3C", "FOMO intensifies - distribute"),
+    (0.65, "#F5A11B", "Is this a bubble? - trim"),
+    (0.30, "#F5C211", "HODL - trend mature"),
+    (-0.05, "#9BC53D", "Still cheap - hold"),
+    (-0.40, "#16C784", "Accumulate"),
+    (-0.75, "#22D3C5", "BUY - fire sale"),
+]
+
+
+def make_rainbow_image(dates_n: int, prices: list, fit: list, resid_std: float, cur_z: float, band_label: str) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import math as _m
+    fig, ax = plt.subplots(figsize=(12.5, 7), facecolor=SG_OBS)
+    sigma_style_ax(ax)
+    x = list(range(dates_n))
+    prev_k = 1.9
+    for k, color, label in RAINBOW_BANDS:
+        upper = [f * (10 ** (prev_k * resid_std)) for f in fit]
+        lower = [f * (10 ** (k * resid_std)) for f in fit]
+        ax.fill_between(x, lower, upper, color=color, alpha=0.32, linewidth=0)
+        ax.text(dates_n * 1.005, lower[-1] * 1.15, label.split(" - ")[0], color=color, fontsize=7.5, va="center")
+        prev_k = k
+    ax.plot(x, prices, color=SG_PAPER, lw=1.2)
+    ax.set_yscale("log")
+    ax.set_xlim(0, dates_n * 1.16)
+    ax.set_title("BTC RAINBOW  ·  log regression bands", color=SG_PAPER, fontsize=15, loc="left", pad=12, fontweight="bold")
+    stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
+    ax.text(0.985, 1.03, f"${prices[-1]:,.0f}  ·  {stamp}", transform=ax.transAxes, color=SG_ASH,
+            fontsize=10, ha="right", family="monospace")
+    ax.annotate("YOU ARE HERE", xy=(dates_n - 1, prices[-1]), xytext=(dates_n * 0.72, prices[-1] * 2.6),
+                color=SG_PAPER, fontsize=10, fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color=SG_PAPER, lw=1.2))
+    ax.text(dates_n * 0.5, min(prices) * 0.75, f"Current band: {band_label}", color=SG_PAPER,
+            fontsize=11, ha="center", fontweight="bold")
+    sigma_logo_ax(ax, pos=(0.10, 0.97))
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="rainbow", description="The Bitcoin Rainbow - where are we in the cycle bands?")
+async def rainbow_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    import math as _m
+    kl = await _btc_daily_full()
+    if len(kl) < 800:
+        await interaction.followup.send("Not enough BTC history right now - try again.")
+        return
+    closes = [float(k[4]) for k in kl]
+    t0 = 1231006505000  # genesis 2009-01-03
+    days = [(int(k[0]) - t0) / 86400000 for k in kl]
+    xs = [_m.log10(d) for d in days]
+    ys = [_m.log10(c) for c in closes]
+    n = len(xs)
+    mx, my = sum(xs) / n, sum(ys) / n
+    slope = sum((xs[i] - mx) * (ys[i] - my) for i in range(n)) / sum((xs[i] - mx) ** 2 for i in range(n))
+    inter = my - slope * mx
+    fit = [10 ** (slope * xs[i] + inter) for i in range(n)]
+    resid = [ys[i] - (slope * xs[i] + inter) for i in range(n)]
+    rs = (sum(r * r for r in resid) / (n - 1)) ** 0.5
+    cur_z = resid[-1] / rs
+    band_label = RAINBOW_BANDS[-1][2]
+    for k, color, label in RAINBOW_BANDS:
+        if cur_z >= k:
+            band_label = label
+            break
+    try:
+        buf = await asyncio.to_thread(make_rainbow_image, n, closes, fit, rs, cur_z, band_label.split(" - ")[0])
+    except Exception as e:
+        await interaction.followup.send(f"Render failed: {e}")
+        return
+    reads = {
+        "MAX BUBBLE - sell, seriously": "Every prior cycle top printed inside this band. History says distribute, not accumulate.",
+        "FOMO intensifies - distribute": "Late-cycle heat. Selling into strength here has beaten holding through it every cycle.",
+        "Is this a bubble? - trim": "Markup phase - trend strong, but this is where trimming plans get written.",
+        "HODL - trend mature": "Mid-cycle. Trend intact, chasing gets punished - let entries come to you.",
+        "Still cheap - hold": "Below trend. Historically a hold zone, not a sell zone.",
+        "Accumulate": "Discount territory - past cycles rewarded steady bids here.",
+        "BUY - fire sale": "Every past visit to this band was a generational bottom window.",
+    }
+    await interaction.followup.send(
+        content=(f"**Rainbow band: {band_label.split(' - ')[0]}** (z {cur_z:+.2f})\n"
+                 f"**Read:** {reads.get(band_label, '')}\n"
+                 f"*Bands fitted on 2017+ Binance data - positions drift as the regression refits. Context, not a trigger.*"),
+        file=discord.File(buf, filename="btc_rainbow.png"))
+
+
+def make_monthly_image(years: list, grid: dict, avg_row: list) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    rows = len(years)
+    fig, ax = plt.subplots(figsize=(12.5, 1.2 + 0.62 * (rows + 1)), facecolor=SG_OBS)
+    ax.set_facecolor(SG_OBS); ax.axis("off")
+    months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    ax.set_xlim(0, 13); ax.set_ylim(-1.6, rows + 1)
+    for j, mname in enumerate(months):
+        ax.text(j + 1.5, rows + 0.55, mname, color=SG_ASH, fontsize=9, ha="center", family="monospace")
+    for i, yr in enumerate(years):
+        y = rows - 1 - i
+        ax.text(0.75, y + 0.28, str(yr), color=SG_PAPER, fontsize=9.5, ha="right", family="monospace", fontweight="bold")
+        for j in range(12):
+            v = grid.get((yr, j + 1))
+            if v is None:
+                continue
+            mag = min(1.0, abs(v) / 40)
+            col = SG_LONG if v >= 0 else SG_SHORT
+            ax.add_patch(plt.Rectangle((j + 1.02, y + 0.03), 0.96, 0.62, color=col, alpha=0.18 + 0.62 * mag))
+            ax.text(j + 1.5, y + 0.28, f"{v:+.0f}", color=SG_PAPER, fontsize=8.6, ha="center", family="monospace")
+    ax.text(0.75, -0.62, "AVG", color=SG_CYAN, fontsize=9.5, ha="right", family="monospace", fontweight="bold")
+    for j, a in enumerate(avg_row):
+        if a is None:
+            continue
+        ax.text(j + 1.5, -0.62, f"{a:+.0f}", color=SG_CYAN, fontsize=8.8, ha="center", family="monospace")
+    ax.set_title("BTC MONTHLY RETURNS (%)", color=SG_PAPER, fontsize=15, loc="left", pad=14, fontweight="bold")
+    stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
+    ax.text(0.99, 1.02, stamp, transform=ax.transAxes, color=SG_ASH, fontsize=9.5, ha="right", family="monospace")
+    sigma_logo_ax(ax, zoom=0.06, pos=(0.995, 1.10))
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=130, facecolor=SG_OBS, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="monthly", description="BTC monthly returns heatmap - which months pay?")
+async def monthly_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        async with aiohttp.ClientSession() as s:
+            kl = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                                 {"symbol": "BTCUSDT", "interval": "1M", "limit": 120}, 20)
+    except Exception:
+        kl = None
+    if not kl or not isinstance(kl, list) or len(kl) < 24:
+        await interaction.followup.send("Monthly data unavailable right now.")
+        return
+    grid = {}
+    for k in kl:
+        d = datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc)
+        o, c = float(k[1]), float(k[4])
+        if o > 0:
+            grid[(d.year, d.month)] = (c - o) / o * 100
+    years = sorted({y for (y, _) in grid}, reverse=True)
+    avg_row = []
+    for m in range(1, 13):
+        vals = [grid[(y, m)] for y in years if (y, m) in grid]
+        # exclude the current (incomplete) month from the average
+        nowd = datetime.now(timezone.utc)
+        vals = [grid[(y, m)] for y in years if (y, m) in grid and not (y == nowd.year and m == nowd.month)]
+        avg_row.append(sum(vals) / len(vals) if vals else None)
+    try:
+        buf = await asyncio.to_thread(make_monthly_image, years, grid, avg_row)
+    except Exception as e:
+        await interaction.followup.send(f"Render failed: {e}")
+        return
+    nowd = datetime.now(timezone.utc)
+    this_avg = avg_row[nowd.month - 1]
+    nxt = avg_row[nowd.month % 12]
+    mn = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
+    lines = [f"**{mn[nowd.month-1]} historical avg:** {this_avg:+.1f}%" if this_avg is not None else "",
+             f"**{mn[nowd.month%12]} historical avg:** {nxt:+.1f}%" if nxt is not None else "",
+             "*Seasonality is a tendency, not a law - size accordingly.*"]
+    await interaction.followup.send(content="\n".join(l for l in lines if l),
+                                    file=discord.File(buf, filename="btc_monthly.png"))
+
+
+def make_bmsb_image(prices: list, sma20: list, ema21: list, status: str, scolor: str) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(12, 6), facecolor=SG_OBS)
+    sigma_style_ax(ax)
+    x = list(range(len(prices)))
+    lo = [min(a, b) for a, b in zip(sma20, ema21)]
+    hi = [max(a, b) for a, b in zip(sma20, ema21)]
+    ax.fill_between(x, lo, hi, color=SG_CYAN, alpha=0.25)
+    ax.plot(x, sma20, color=SG_CYAN, lw=1.2, label="20W SMA")
+    ax.plot(x, ema21, color=SG_AMBER, lw=1.2, label="21W EMA")
+    ax.plot(x, prices, color=SG_PAPER, lw=1.4)
+    ax.set_yscale("log")
+    ax.legend(facecolor=SG_GRA, edgecolor=SG_SLATE, labelcolor=SG_PAPER, fontsize=9, loc="upper left")
+    ax.set_title("BTC  ·  BULL MARKET SUPPORT BAND (weekly)", color=SG_PAPER, fontsize=14, loc="left", pad=12, fontweight="bold")
+    stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
+    ax.text(0.985, 1.03, f"${prices[-1]:,.0f}  ·  {stamp}", transform=ax.transAxes, color=SG_ASH,
+            fontsize=10, ha="right", family="monospace")
+    ax.text(0.5, -0.13, status, transform=ax.transAxes, color=scolor, fontsize=11.5, ha="center", fontweight="bold")
+    sigma_logo_ax(ax)
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="bmsb", description="Bull Market Support Band - is the bull structure intact?")
+async def bmsb_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        async with aiohttp.ClientSession() as s:
+            kl = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                                 {"symbol": "BTCUSDT", "interval": "1w", "limit": 200}, 20)
+    except Exception:
+        kl = None
+    if not kl or not isinstance(kl, list) or len(kl) < 40:
+        await interaction.followup.send("Weekly data unavailable right now.")
+        return
+    closes = [float(k[4]) for k in kl]
+    sma20, ema21 = [], []
+    ema = closes[0]
+    alpha = 2 / 22
+    for i in range(len(closes)):
+        w = closes[max(0, i - 19):i + 1]
+        sma20.append(sum(w) / len(w))
+        ema = closes[i] * alpha + ema * (1 - alpha)
+        ema21.append(ema)
+    price = closes[-1]
+    lo, hi = min(sma20[-1], ema21[-1]), max(sma20[-1], ema21[-1])
+    if price > hi:
+        pct = (price / hi - 1) * 100
+        status, sc = f"ABOVE the band (+{pct:.0f}%) - bull structure intact", SG_LONG
+        read = ("Bull intact. Corrections INTO the band have been buy zones every cycle - "
+                f"the band sits {(1 - hi / price) * 100:.0f}% below, that's your line in the sand.")
+    elif price >= lo:
+        status, sc = "INSIDE the band - the retest is live", SG_AMBER
+        read = "This is the decision zone. Weekly close above = bull resumes. Weekly close below = defense mode, cut leverage."
+    else:
+        pct = (1 - price / lo) * 100
+        status, sc = f"BELOW the band (-{pct:.0f}%) - bull structure broken", SG_SHORT
+        read = "Every extended stay below the band has been bear territory. Rallies into the band from below get sold - respect it."
+    try:
+        buf = await asyncio.to_thread(make_bmsb_image, closes, sma20, ema21, status, sc)
+    except Exception as e:
+        await interaction.followup.send(f"Render failed: {e}")
+        return
+    await interaction.followup.send(content=f"**BMSB:** {status}\n**Read:** {read}",
+                                    file=discord.File(buf, filename="btc_bmsb.png"))
+
+
+def make_roi_image(cur: list, prev: list, prev_label: str, day_now: int) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(12, 6.2), facecolor=SG_OBS)
+    sigma_style_ax(ax)
+    ax.plot(range(len(prev)), prev, color=SG_ASH, lw=1.2, label=prev_label, alpha=0.85)
+    ax.plot(range(len(cur)), cur, color=SG_CYAN, lw=1.7, label="This cycle (2024 halving)")
+    ax.axvline(day_now, color=SG_PAPER, lw=0.8, ls="--", alpha=0.6)
+    ax.annotate("WE ARE HERE", xy=(day_now, cur[-1]), xytext=(day_now * 0.62, cur[-1] * 1.9),
+                color=SG_PAPER, fontsize=10, fontweight="bold",
+                arrowprops=dict(arrowstyle="->", color=SG_PAPER, lw=1.1))
+    ax.set_yscale("log")
+    ax.set_xlabel("Days since halving", color=SG_ASH, fontsize=9)
+    ax.set_title("BTC CYCLE ROI  ·  price multiple from halving day", color=SG_PAPER,
+                 fontsize=14, loc="left", pad=12, fontweight="bold")
+    stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
+    ax.text(0.985, 1.03, stamp, transform=ax.transAxes, color=SG_ASH, fontsize=9.5, ha="right", family="monospace")
+    ax.legend(facecolor=SG_GRA, edgecolor=SG_SLATE, labelcolor=SG_PAPER, fontsize=9, loc="lower right")
+    sigma_logo_ax(ax)
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+@bot.tree.command(name="roi", description="This cycle vs last - price multiple since each halving")
+async def roi_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    kl = await _btc_daily_full()
+    if len(kl) < 800:
+        await interaction.followup.send("Not enough history right now.")
+        return
+    H_2020 = 1589155200000  # 2020-05-11
+    H_2024 = 1713484800000  # 2024-04-19
+    closes = {int(k[0]): float(k[4]) for k in kl}
+    keys = sorted(closes)
+    def cycle_series(h_ts, max_days):
+        base = None
+        out = []
+        for ts in keys:
+            d = (ts - h_ts) / 86400000
+            if d < 0 or d > max_days:
+                continue
+            if base is None:
+                base = closes[ts]
+            out.append(closes[ts] / base)
+        return out
+    prev = cycle_series(H_2020, 1460)
+    cur = cycle_series(H_2024, 1460)
+    if len(cur) < 30 or len(prev) < 200:
+        await interaction.followup.send("Cycle data incomplete right now.")
+        return
+    day_now = len(cur) - 1
+    prev_at_now = prev[day_now] if day_now < len(prev) else prev[-1]
+    prev_peak = max(prev)
+    prev_peak_day = prev.index(prev_peak)
+    try:
+        buf = await asyncio.to_thread(make_roi_image, cur, prev, "2020 cycle", day_now)
+    except Exception as e:
+        await interaction.followup.send(f"Render failed: {e}")
+        return
+    ahead = cur[-1] / prev_at_now - 1
+    comp = "ahead of" if ahead > 0 else "behind"
+    if day_now < prev_peak_day:
+        timing = f"2020's cycle peaked on day {prev_peak_day} ({prev_peak:.1f}x) - {prev_peak_day - day_now} days from where we are now."
+    else:
+        timing = f"We are PAST the day the 2020 cycle peaked (day {prev_peak_day}) - late-cycle by last cycle's clock."
+    await interaction.followup.send(
+        content=(f"**Day {day_now} since halving:** {cur[-1]:.2f}x vs 2020 cycle's {prev_at_now:.2f}x at the same point "
+                 f"({abs(ahead)*100:.0f}% {comp}).\n**Timing:** {timing}\n"
+                 f"*Cycles rhyme, they don't repeat - diminishing returns each cycle are the norm.*"),
+        file=discord.File(buf, filename="btc_cycle_roi.png"))
+
+
 def make_cycle_image(prices: list, ma111: list, ma350x2: list, score: float, metrics_line: str,
                      price_now: float = None, heat_word: str = "", read_line: str = "") -> io.BytesIO:
     import matplotlib
@@ -4158,11 +4496,36 @@ async def cycle_cmd(interaction: discord.Interaction):
     rv_series = [_std(rets[i2 - 30:i2]) * math.sqrt(365) * 100 for i2 in range(max(30, len(rets) - 365), len(rets) + 1)]
     rv_now = rv_series[-1] if rv_series else 0
     rv_pct = sum(1 for x in rv_series if x <= rv_now) / len(rv_series) * 100 if rv_series else 50
-    # score 0-10
+    # Puell Multiple (miner revenue / 365d avg) - blockchain.info free
+    puell = None
+    try:
+        async with aiohttp.ClientSession() as s:
+            bj = await _get_json(s, "https://api.blockchain.info/charts/miners-revenue",
+                                 {"timespan": "2years", "format": "json"}, 20)
+        vals = [p["y"] for p in bj.get("values", []) if p.get("y")]
+        if len(vals) >= 365:
+            puell = vals[-1] / (sum(vals[-365:]) / 365)
+    except Exception:
+        pass
+    # BMSB position (weekly band)
+    bmsb_pos = None
+    if len(w_closes) >= 21:
+        w20 = sum(w_closes[-20:]) / 20
+        e = w_closes[0]
+        for c in w_closes:
+            e = c * (2 / 22) + e * (1 - 2 / 22)
+        band_hi = max(w20, e)
+        bmsb_pos = price / band_hi - 1
+    # score 0-10 (5 factors)
     s_mayer = 0 if not mayer else min(10, max(0, (mayer - 0.8) / (2.8 - 0.8) * 10))
     s_pi = 0 if pi_gap is None else min(10, max(0, (35 - pi_gap) / 35 * 10))
     s_200w = 0 if dist_200w is None else min(10, max(0, dist_200w / 350 * 10))
-    score = round(0.4 * s_mayer + 0.35 * s_pi + 0.25 * s_200w, 1)
+    s_puell = 0 if puell is None else min(10, max(0, (puell - 0.5) / (4.0 - 0.5) * 10))
+    s_bmsb = 0 if bmsb_pos is None else min(10, max(0, bmsb_pos / 1.0 * 10))
+    weights = [(0.30, s_mayer), (0.25, s_pi), (0.18, s_200w)]
+    weights.append((0.17, s_puell) if puell is not None else (0.17, s_mayer))
+    weights.append((0.10, s_bmsb) if bmsb_pos is not None else (0.10, s_200w))
+    score = round(sum(w * v for w, v in weights), 1)
     # narration
     if mayer is None:
         mayer_read = ""
@@ -4182,8 +4545,9 @@ async def cycle_cmd(interaction: discord.Interaction):
         pi_read = "Pi Cycle gap closing - weeks of vertical price could trigger it."
     else:
         pi_read = "PI CYCLE NEAR CROSSOVER - every past cross marked the cycle top within days."
-    metrics_line = (f"Mayer {mayer:.2f}   ·   vs 200W MA {dist_200w:+.0f}%   ·   "
-                    f"RV {rv_pct:.0f}th pctile   ·   Pi gap {pi_gap:.0f}%")
+    metrics_line = (f"Mayer {mayer:.2f}   ·   200W {dist_200w:+.0f}%   ·   Pi gap {pi_gap:.0f}%"
+                    + (f"   ·   Puell {puell:.2f}" if puell is not None else "")
+                    + (f"   ·   BMSB {bmsb_pos*100:+.0f}%" if bmsb_pos is not None else ""))
     heat_word = "Cool" if score < 3.5 else ("Elevated" if score < 7 else "Euphoric")
     if score < 3.5:
         chart_read = "Early/mid cycle - no top signals. Dips are for buying, not fearing."
@@ -4198,9 +4562,16 @@ async def cycle_cmd(interaction: discord.Interaction):
     except Exception as e:
         await interaction.followup.send(f"Chart render failed: {e}")
         return
+    puell_read = ""
+    if puell is not None:
+        if puell >= 4:
+            puell_read = "Puell above 4 - miner revenue euphoric, historically top territory."
+        elif puell <= 0.5:
+            puell_read = "Puell below 0.5 - miner capitulation zone, historically bottoms."
     lines = [f"**Cycle Heat {score:g}/10 - {heat_word}.**",
              f"{mayer_read}",
              f"{pi_read}",
+             f"{puell_read}",
              f"**What flips this:** Mayer >2.4 or Pi gap <10% pushes heat toward 9/10 - historically the exit window, not the entry."]
     f = discord.File(buf, filename="btc_cycle.png")
     await interaction.followup.send(content="\n".join(l for l in lines if l), file=f)
@@ -4972,7 +5343,11 @@ def build_help_embed() -> discord.Embed:
             "`/altseason` - % of top 50 beating BTC, rotation index\n"
             "`/ratio` - coin vs BTC: real strength or USD beta?\n"
             "`/unlocks` - token unlock calendar, next 14 days\n"
-            "`/fees` - BTC + ETH fees, the retail thermometer"
+            "`/fees` - BTC + ETH fees, the retail thermometer\n"
+            "`/rainbow` - the Bitcoin Rainbow, which band are we in\n"
+            "`/monthly` - BTC monthly returns heatmap\n"
+            "`/bmsb` - Bull Market Support Band, structure check\n"
+            "`/roi` - this cycle vs 2020, multiple since halving"
         ),
         inline=False,
     )
