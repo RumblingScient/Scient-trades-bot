@@ -4439,8 +4439,6 @@ async def stables_cmd(interaction: discord.Interaction):
     await interaction.followup.send(embed=embed)
 
 
-@bot.tree.command(name="agg", description="Aggregated OI + funding across Binance, Bybit and OKX")
-@app_commands.describe(coin="Coin symbol, e.g. BTC")
 async def fetch_agg_rows(base: str):
     """(exchange, oi_usd, funding_pct) rows across Binance/Bybit/OKX - shared by /agg and the euphoria guard."""
     pair = f"{base}USDT"
@@ -4473,6 +4471,8 @@ async def fetch_agg_rows(base: str):
     return rows
 
 
+@bot.tree.command(name="agg", description="Aggregated OI + funding across Binance, Bybit and OKX")
+@app_commands.describe(coin="Coin symbol, e.g. BTC")
 async def agg_cmd(interaction: discord.Interaction, coin: str):
     await interaction.response.defer()
     symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
