@@ -4094,26 +4094,61 @@ ETF_JSON_URLS = [
 async def etf_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     data = None
-    async with aiohttp.ClientSession() as s:
+    headers = {"User-Agent": "Mozilla/5.0 (SigmaTerminal; +discord bot; data credit: TFTC CC BY 4.0)"}
+    async with aiohttp.ClientSession(headers=headers) as s:
         for url in ETF_JSON_URLS:
             try:
-                d = await _get_json(s, url, None, 20)
-                if d:
-                    data = d
-                    break
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    if r.status == 200:
+                        data = await r.json(content_type=None)
+                        if data:
+                            break
             except Exception:
                 continue
+    def _num(x):
+        if x is None:
+            return None
+        try:
+            s2 = str(x).replace(",", "").replace("$", "").strip()
+            if s2.startswith("(") and s2.endswith(")"):
+                s2 = "-" + s2[1:-1]
+            return float(s2)
+        except Exception:
+            return None
     rows = []
     if data:
         try:
-            arr = data if isinstance(data, list) else (data.get("data") or data.get("flows") or data.get("daily") or [])
+            if isinstance(data, dict):
+                arr = None
+                for key in ("data", "flows", "daily", "days", "series", "rows", "history"):
+                    if isinstance(data.get(key), list):
+                        arr = data[key]
+                        break
+                if arr is None:
+                    arr = next((v for v in data.values() if isinstance(v, list) and v and isinstance(v[0], dict)), [])
+            else:
+                arr = data
             for it in arr:
-                dt = it.get("date") or it.get("day") or it.get("d")
-                v = it.get("total") if it.get("total") is not None else (it.get("net") if it.get("net") is not None else it.get("flow"))
+                if not isinstance(it, dict):
+                    continue
+                low = {str(k).lower(): v for k, v in it.items()}
+                dt = low.get("date") or low.get("day") or low.get("d") or low.get("timestamp")
+                v = None
+                for key in ("total", "net", "flow", "net_flow", "total_flow", "totalusd", "value"):
+                    if low.get(key) is not None:
+                        v = _num(low[key])
+                        break
+                if v is None:
+                    # sum per-fund numeric fields as a last resort
+                    fund_vals = [_num(x) for k2, x in low.items()
+                                 if k2 not in ("date", "day", "d", "timestamp") and _num(x) is not None]
+                    v = sum(fund_vals) if fund_vals else None
                 if dt is None or v is None:
                     continue
-                rows.append((str(dt)[:10], float(v)))
-        except Exception:
+                dts = str(dt)[:10]
+                rows.append((dts, v))
+        except Exception as e:
+            print(f"[etf] parse error: {e}", flush=True)
             rows = []
     if not rows:
         await interaction.followup.send(
@@ -4263,18 +4298,71 @@ async def hash_cmd(interaction: discord.Interaction):
     sma60 = [sum(hs[max(0, i - 59):i + 1]) / len(hs[max(0, i - 59):i + 1]) for i in range(len(hs))]
     cap_now = sma30[-1] < sma60[-1]
     crossed_up = sma30[-1] >= sma60[-1] and sma30[-8] < sma60[-8]
+    # BTC closes aligned to the hashrate timestamps (blockchain.info x = unix seconds)
+    prices = None
+    try:
+        async with aiohttp.ClientSession() as s2:
+            kl = await _get_json(s2, "https://api.binance.com/api/v3/klines",
+                                 {"symbol": "BTCUSDT", "interval": "1d", "limit": 1000}, 20)
+        if kl and isinstance(kl, list):
+            close_by_day = {int(k[0] // 86400000): float(k[4]) for k in kl}
+            prices = []
+            last_c = None
+            for ts, _v in vals:
+                c = close_by_day.get(int(ts // 86400))
+                if c is not None:
+                    last_c = c
+                prices.append(last_c)
+            if prices and prices[0] is None:
+                first = next((p for p in prices if p is not None), None)
+                prices = [p if p is not None else first for p in prices]
+            if any(p is None for p in prices):
+                prices = None
+    except Exception:
+        prices = None
+    # state duration + last recovery cross
+    days_in_state = 1
+    for i in range(len(hs) - 2, -1, -1):
+        if (sma30[i] < sma60[i]) == cap_now:
+            days_in_state += 1
+        else:
+            break
+    last_cross_idx = None
+    for i in range(len(hs) - 1, 0, -1):
+        if sma30[i] >= sma60[i] and sma30[i - 1] < sma60[i - 1]:
+            last_cross_idx = i
+            break
+    cross_note = ""
+    if last_cross_idx is not None:
+        days_ago = len(hs) - 1 - last_cross_idx
+        cross_dt = datetime.fromtimestamp(vals[last_cross_idx][0], tz=timezone.utc).strftime("%d %b %y")
+        if prices and prices[last_cross_idx]:
+            chg = (prices[-1] / prices[last_cross_idx] - 1) * 100
+            cross_note = f"Last recovery cross: {cross_dt} ({days_ago}d ago) - BTC {chg:+.0f}% since."
+        else:
+            cross_note = f"Last recovery cross: {cross_dt} ({days_ago}d ago)."
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(12, 5.8), facecolor=SG_OBS)
     sigma_style_ax(ax)
     x = list(range(len(hs)))
-    ax.plot(x, hs, color=SG_ASH, lw=0.8, alpha=0.6, label="Hashrate")
+    ax.plot(x, hs, color=SG_ASH, lw=0.7, alpha=0.45, label="Hashrate")
     ax.plot(x, sma30, color=SG_CYAN, lw=1.6, label="30D SMA")
     ax.plot(x, sma60, color=SG_AMBER, lw=1.6, label="60D SMA")
     for i in x:
         if sma30[i] < sma60[i]:
             ax.axvspan(i - 0.5, i + 0.5, color=SG_SHORT, alpha=0.05)
+    if prices and len(prices) == len(hs):
+        ax2 = ax.twinx()
+        ax2.plot(x, prices, color=SG_PAPER, lw=1.2)
+        ax2.set_yscale("log")
+        ax2.set_yticks([])
+        for sp in ax2.spines.values():
+            sp.set_color(SG_SLATE)
+        ax2.text(x[-1], prices[-1], f"  ${prices[-1]:,.0f}", color=SG_PAPER, fontsize=9,
+                 va="center", family="monospace")
+        ax.plot([], [], color=SG_PAPER, lw=1.2, label="BTC price")
     ax.legend(facecolor=SG_GRA, edgecolor=SG_SLATE, labelcolor=SG_PAPER, fontsize=9, loc="upper left")
     stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
     ax.set_title("HASH RIBBONS  ·  miner capitulation tracker", color=SG_PAPER, fontsize=14,
@@ -4289,11 +4377,345 @@ async def hash_cmd(interaction: discord.Interaction):
     if crossed_up:
         read = "\U0001F7E2 RIBBON RECOVERY - the historical buy signal just fired. One of BTC's best-performing signals ever."
     elif cap_now:
-        read = "\U0001F534 Miner capitulation in progress (30D below 60D). Historically the accumulation window opens on the recovery cross - watch for it."
+        read = (f"\U0001F534 Miner capitulation in progress, {days_in_state}d and counting (30D below 60D). "
+                f"The signal is NOT the capitulation - it's the recovery cross that ends it. Watch for 30D reclaiming 60D.")
     else:
-        read = "Ribbons healthy - miners expanding. No capitulation, no signal, trend supported."
+        read = (f"Ribbons healthy {days_in_state}d running - miners expanding, network secure. "
+                f"No capitulation, no signal. Miner stress usually appears AFTER major price damage, not before.")
+    body = f"**Hash Ribbons:** {'capitulation' if cap_now else 'healthy'} ({days_in_state}d).\n**Read:** {read}"
+    if cross_note:
+        body += f"\n{cross_note}"
     f = discord.File(buf, filename="hash_ribbons.png")
-    await interaction.followup.send(content=f"**Hash Ribbons:** {'capitulation' if cap_now else 'healthy'}.\n**Read:** {read}", file=f)
+    await interaction.followup.send(content=body, file=f)
+
+
+def _pearson(a: list, b: list):
+    n = min(len(a), len(b))
+    if n < 10:
+        return None
+    a, b = a[-n:], b[-n:]
+    ma, mb = sum(a) / n, sum(b) / n
+    cov = sum((a[i] - ma) * (b[i] - mb) for i in range(n))
+    va = sum((x - ma) ** 2 for x in a) ** 0.5
+    vb = sum((x - mb) ** 2 for x in b) ** 0.5
+    if va == 0 or vb == 0:
+        return None
+    return cov / (va * vb)
+
+
+@bot.tree.command(name="premium", description="Coinbase premium history + Kimchi premium - US vs Korean bid")
+async def premium_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    headers = {"User-Agent": "Mozilla/5.0 (SigmaTerminal)"}
+    bn_by_day, cb_by_day = {}, {}
+    kimchi = None
+    try:
+        async with aiohttp.ClientSession(headers=headers) as s:
+            bn = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                                 {"symbol": "BTCUSDT", "interval": "1d", "limit": 95}, 20)
+            for k in bn or []:
+                bn_by_day[int(k[0] // 86400000)] = float(k[4])
+            async with s.get("https://api.exchange.coinbase.com/products/BTC-USD/candles",
+                             params={"granularity": 86400},
+                             timeout=aiohttp.ClientTimeout(total=20)) as r:
+                if r.status == 200:
+                    for c in await r.json(content_type=None):
+                        cb_by_day[int(c[0] // 86400)] = float(c[4])
+            up = await _get_json(s, "https://api.upbit.com/v1/candles/days",
+                                 {"market": "KRW-BTC", "count": 1}, 15)
+            fx = await _get_json(s, "https://open.er-api.com/v6/latest/USD", None, 15)
+            krw = float((fx or {}).get("rates", {}).get("KRW") or 0)
+            if up and isinstance(up, list) and krw > 0 and bn_by_day:
+                bn_now = bn_by_day[max(bn_by_day)]
+                kimchi = (float(up[0]["trade_price"]) / krw - bn_now) / bn_now * 100
+    except Exception as e:
+        print(f"[premium] {e}", flush=True)
+    days = sorted(set(bn_by_day) & set(cb_by_day))[-90:]
+    if len(days) < 20:
+        await interaction.followup.send("Premium data unavailable right now (Coinbase/Binance).")
+        return
+    prem = [(cb_by_day[d] - bn_by_day[d]) / bn_by_day[d] * 100 for d in days]
+    ma7 = [sum(prem[max(0, i - 6):i + 1]) / len(prem[max(0, i - 6):i + 1]) for i in range(len(prem))]
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(12, 5.6), facecolor=SG_OBS)
+    sigma_style_ax(ax)
+    x = list(range(len(prem)))
+    ax.fill_between(x, prem, 0, where=[p >= 0 for p in prem], color=SG_LONG, alpha=0.25, interpolate=True)
+    ax.fill_between(x, prem, 0, where=[p < 0 for p in prem], color=SG_SHORT, alpha=0.25, interpolate=True)
+    ax.plot(x, prem, color=SG_PAPER, lw=1.0, alpha=0.7)
+    ax.plot(x, ma7, color=SG_CYAN, lw=1.7, label="7D MA")
+    ax.axhline(0, color=SG_ASH, lw=0.8)
+    ax.legend(facecolor=SG_GRA, edgecolor=SG_SLATE, labelcolor=SG_PAPER, fontsize=9, loc="upper left")
+    ax.yaxis.set_major_formatter(lambda v, _: f"{v:+.2f}%")
+    stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
+    ax.set_title("COINBASE PREMIUM  ·  90 days", color=SG_PAPER, fontsize=14, loc="left", pad=12, fontweight="bold")
+    ax.text(0.865, 1.03, stamp, transform=ax.transAxes, color=SG_ASH, fontsize=10, ha="right", family="monospace")
+    read_img = "US bid present" if ma7[-1] > 0.01 else ("US selling into overseas bid" if ma7[-1] < -0.01 else "neutral")
+    ax.text(0.5, -0.14, f"7D avg {ma7[-1]:+.3f}% - {read_img}", transform=ax.transAxes,
+            color=SG_PAPER, fontsize=10.5, ha="center")
+    sigma_logo_ax(ax)
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    cur = prem[-1]
+    if ma7[-1] > 0.02:
+        read = "Sustained positive premium - US institutions paying up. This has accompanied every ETF-era leg up."
+    elif ma7[-1] < -0.02:
+        read = "Sustained discount - US selling into the overseas bid. Rallies without US support tend to fade."
+    else:
+        read = "Flat premium - no regional conviction either way."
+    lines = [f"**Coinbase premium:** {cur:+.3f}% today, 7D avg {ma7[-1]:+.3f}%."]
+    if kimchi is not None:
+        if kimchi > 5:
+            k_read = "Korean retail euphoric - historically a late-cycle marker (2021 top printed double digits)."
+        elif kimchi > 2:
+            k_read = "Korean retail bidding - risk appetite building."
+        elif kimchi < 0:
+            k_read = "Korean discount - retail apathy, historically closer to bottoms than tops."
+        else:
+            k_read = "neutral."
+        lines.append(f"**Kimchi premium:** {kimchi:+.2f}% - {k_read}")
+    lines.append(f"**Read:** {read}")
+    f = discord.File(buf, filename="btc_premium.png")
+    await interaction.followup.send(content="\n".join(lines), file=f)
+
+
+@bot.tree.command(name="basis", description="Quarterly futures basis - the leverage/carry regime")
+async def basis_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    rows = []
+    try:
+        async with aiohttp.ClientSession() as s:
+            info = await _get_json(s, "https://fapi.binance.com/fapi/v1/exchangeInfo", None, 25)
+            now_ms = datetime.now(timezone.utc).timestamp() * 1000
+            targets = []
+            for sym in (info or {}).get("symbols", []):
+                if sym.get("contractType") in ("CURRENT_QUARTER", "NEXT_QUARTER") and \
+                   sym.get("baseAsset") in ("BTC", "ETH") and sym.get("quoteAsset") == "USDT" and \
+                   sym.get("status") == "TRADING":
+                    targets.append((sym["symbol"], sym["baseAsset"], sym.get("contractType"),
+                                    float(sym.get("deliveryDate") or 0)))
+            spot = {}
+            for base in ("BTC", "ETH"):
+                sp = await _get_json(s, "https://api.binance.com/api/v3/ticker/price",
+                                     {"symbol": f"{base}USDT"}, 15)
+                spot[base] = float((sp or {}).get("price") or 0)
+            for symbol, base, ctype, ddate in targets:
+                if not spot.get(base) or ddate <= now_ms:
+                    continue
+                px = await _get_json(s, "https://fapi.binance.com/fapi/v1/ticker/price",
+                                     {"symbol": symbol}, 15)
+                fut = float((px or {}).get("price") or 0)
+                if fut <= 0:
+                    continue
+                days = (ddate - now_ms) / 86400000
+                ann = (fut / spot[base] - 1) * 365 / max(days, 1) * 100
+                rows.append((base, ctype.replace("_", " ").title(), symbol, days, ann))
+    except Exception as e:
+        print(f"[basis] {e}", flush=True)
+    if not rows:
+        await interaction.followup.send("Quarterly futures data unavailable right now.")
+        return
+    rows.sort(key=lambda r: (r[0], r[3]))
+    lines = []
+    worst = max(r[4] for r in rows)
+    for base, ctype, symbol, days, ann in rows:
+        lines.append(f"**{base}** {ctype} ({days:.0f}d): **{ann:+.1f}%** annualized")
+    if worst > 15:
+        read = "Basis in euphoria territory (>15% ann) - leverage paying heavily for exposure. 2021-top vibes; this is where longs get expensive and squeezes get violent."
+    elif worst > 8:
+        read = "Healthy bull carry (8-15%) - demand for leverage present but not desperate."
+    elif worst > 2:
+        read = "Muted basis - spot-driven market, little speculative froth. Room to run."
+    else:
+        read = "Flat/negative basis - capitulation conditions. Historically closer to bottoms than tops."
+    embed = discord.Embed(title="\U0001F4C8 Futures Basis - Carry Regime", color=NAVY,
+                          timestamp=datetime.now(timezone.utc))
+    embed.description = "\n".join(lines) + f"\n\n**Read:** {read}"
+    embed.set_footer(text="Sigma Trading - Binance quarterly futures vs spot")
+    await interaction.followup.send(embed=embed)
+
+
+@bot.tree.command(name="sessions", description="Asia vs Europe vs US - who is buying, who is selling (30d)")
+async def sessions_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        async with aiohttp.ClientSession() as s:
+            kl = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                                 {"symbol": "BTCUSDT", "interval": "1h", "limit": 744}, 25)
+    except Exception:
+        kl = None
+    if not kl or not isinstance(kl, list) or len(kl) < 200:
+        await interaction.followup.send("Hourly data unavailable right now.")
+        return
+    SESSIONS = [("Asia", 0, 8), ("Europe", 8, 14), ("US", 14, 22)]
+    day_sess = {}
+    for k in kl:
+        dt = datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc)
+        for name, h1, h2 in SESSIONS:
+            if h1 <= dt.hour < h2:
+                key = (dt.date(), name)
+                o, c = float(k[1]), float(k[4])
+                if key not in day_sess:
+                    day_sess[key] = [o, c]
+                else:
+                    day_sess[key][1] = c
+                break
+    stats = {}
+    for (day, name), (o, c) in day_sess.items():
+        if o > 0:
+            stats.setdefault(name, []).append((c / o - 1) * 100)
+    if not stats:
+        await interaction.followup.send("Couldn't compute session returns.")
+        return
+    names = [n for n, _, _ in SESSIONS]
+    cums, avgs, wins = {}, {}, {}
+    for n in names:
+        rets = stats.get(n, [])
+        cum = 1.0
+        for r in rets:
+            cum *= (1 + r / 100)
+        cums[n] = (cum - 1) * 100
+        avgs[n] = sum(rets) / len(rets) if rets else 0
+        wins[n] = sum(1 for r in rets if r > 0) / len(rets) * 100 if rets else 0
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(11, 5.4), facecolor=SG_OBS)
+    sigma_style_ax(ax)
+    vals = [cums[n] for n in names]
+    ax.bar(names, vals, color=[SG_LONG if v >= 0 else SG_SHORT for v in vals], width=0.5)
+    ax.axhline(0, color=SG_ASH, lw=0.8)
+    for i, n in enumerate(names):
+        ax.text(i, vals[i] + (0.15 if vals[i] >= 0 else -0.3), f"{vals[i]:+.1f}%",
+                color=SG_PAPER, fontsize=11, ha="center", fontweight="bold", family="monospace")
+        ax.text(i, min(0, min(vals)) - 1.1, f"avg {avgs[n]:+.2f}%/d · {wins[n]:.0f}% green",
+                color=SG_ASH, fontsize=8.5, ha="center", family="monospace")
+    ax.yaxis.set_major_formatter(lambda v, _: f"{v:+.0f}%")
+    stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
+    ax.set_title("SESSION RETURNS  ·  BTC cumulative, last 30 days (UTC)", color=SG_PAPER,
+                 fontsize=14, loc="left", pad=12, fontweight="bold")
+    ax.text(0.865, 1.03, stamp, transform=ax.transAxes, color=SG_ASH, fontsize=10, ha="right", family="monospace")
+    sigma_logo_ax(ax)
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    best = max(names, key=lambda n: cums[n])
+    worst = min(names, key=lambda n: cums[n])
+    if cums["US"] > 0 and cums["Asia"] > 0:
+        read = "Both US and Asia net buyers - broad demand, healthiest kind of tape."
+    elif cums["US"] < 0 < cums["Asia"]:
+        read = "Asia buying what the US sells - absorption pattern. Watch which side exhausts first."
+    elif cums["Asia"] < 0 < cums["US"]:
+        read = "US bid carrying the tape while Asia distributes - ETF-era signature, sustainable while flows stay positive."
+    else:
+        read = "All sessions weak - no regional bid. Defensive tape."
+    f = discord.File(buf, filename="btc_sessions.png")
+    await interaction.followup.send(
+        content=(f"**Strongest: {best} ({cums[best]:+.1f}%)** · Weakest: {worst} ({cums[worst]:+.1f}%) over 30d.\n"
+                 f"**Read:** {read}\n*Sessions in UTC: Asia 00-08 · Europe 08-14 · US 14-22.*"),
+        file=f)
+
+
+CORR_TRADFI = {"SPX": "^GSPC", "DXY": "DX-Y.NYB", "GOLD": "GC=F"}
+
+
+@bot.tree.command(name="corr", description="30d correlation matrix - BTC/ETH/SOL vs SPX, DXY, GOLD")
+async def corr_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    headers = {"User-Agent": "Mozilla/5.0 (SigmaTerminal)"}
+    closes = {}
+    try:
+        async with aiohttp.ClientSession(headers=headers) as s:
+            for base in ("BTC", "ETH", "SOL"):
+                kl = await _get_json(s, "https://api.binance.com/api/v3/klines",
+                                     {"symbol": f"{base}USDT", "interval": "1d", "limit": 95}, 20)
+                if kl and isinstance(kl, list):
+                    closes[base] = {int(k[0] // 86400000): float(k[4]) for k in kl}
+            for name, ysym in CORR_TRADFI.items():
+                d = await _get_json(s, f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}",
+                                    {"interval": "1d", "range": "3mo"}, 20)
+                try:
+                    res = d["chart"]["result"][0]
+                    ts = res["timestamp"]
+                    cl = res["indicators"]["quote"][0]["close"]
+                    closes[name] = {int(t // 86400): float(c) for t, c in zip(ts, cl) if c}
+                except Exception:
+                    continue
+    except Exception as e:
+        print(f"[corr] {e}", flush=True)
+    assets = [a for a in ("BTC", "ETH", "SOL", "SPX", "DXY", "GOLD") if a in closes and len(closes[a]) > 25]
+    if len(assets) < 3:
+        await interaction.followup.send("Not enough data for the matrix right now.")
+        return
+    common = None
+    for a in assets:
+        common = set(closes[a]) if common is None else common & set(closes[a])
+    days = sorted(common)[-45:]
+    if len(days) < 25:
+        await interaction.followup.send("Not enough overlapping trading days right now.")
+        return
+    rets = {}
+    for a in assets:
+        series = [closes[a][d] for d in days]
+        rets[a] = [(series[i] / series[i - 1] - 1) for i in range(1, len(series))][-30:]
+    n = len(assets)
+    M = [[(_pearson(rets[assets[i]], rets[assets[j]]) if i != j else 1.0) for j in range(n)] for i in range(n)]
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(9.5, 8), facecolor=SG_OBS)
+    ax.set_facecolor(SG_OBS)
+    for i in range(n):
+        for j in range(n):
+            v = M[i][j]
+            if v is None:
+                colr, a2 = SG_CARD, 0.6
+                txt = "-"
+            else:
+                colr = SG_CYAN if v >= 0 else SG_SHORT
+                a2 = 0.15 + 0.75 * min(abs(v), 1)
+                txt = f"{v:+.2f}"
+            ax.add_patch(plt.Rectangle((j, n - 1 - i), 0.95, 0.95, color=colr, alpha=a2))
+            ax.text(j + 0.475, n - 1 - i + 0.42, txt, color=SG_PAPER, fontsize=11,
+                    ha="center", family="monospace", fontweight="bold")
+    for i, a in enumerate(assets):
+        ax.text(i + 0.475, n + 0.12, a, color=SG_PAPER, fontsize=11, ha="center", fontweight="bold")
+        ax.text(-0.15, n - 1 - i + 0.42, a, color=SG_PAPER, fontsize=11, ha="right", fontweight="bold")
+    ax.set_xlim(-1.2, n + 0.2); ax.set_ylim(-0.9, n + 0.7); ax.axis("off")
+    stamp = datetime.now(timezone.utc).strftime("%d %b %Y")
+    ax.text(0, n + 0.55, "CORRELATION MATRIX  ·  30d daily returns", color=SG_PAPER, fontsize=14, fontweight="bold")
+    ax.text(n + 0.1, -0.75, stamp, color=SG_ASH, fontsize=9.5, ha="right", family="monospace")
+    sigma_logo_ax(ax, pos=(1.0, 1.06), zoom=0.07)
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    lines = []
+    def _get(a, b):
+        if a in assets and b in assets:
+            return M[assets.index(a)][assets.index(b)]
+        return None
+    bs = _get("BTC", "SPX")
+    if bs is not None:
+        if bs > 0.5:
+            lines.append(f"**BTC-SPX {bs:+.2f}** - macro-coupled. BTC trades as a risk asset right now; watch equities and FOMC.")
+        elif bs < 0.2:
+            lines.append(f"**BTC-SPX {bs:+.2f}** - decoupled. Crypto-native flows driving price, macro noise matters less.")
+        else:
+            lines.append(f"**BTC-SPX {bs:+.2f}** - loosely coupled.")
+    bd = _get("BTC", "DXY")
+    if bd is not None:
+        lines.append(f"**BTC-DXY {bd:+.2f}** - " + ("normal inverse relationship intact." if bd < -0.2 else "inverse link weak right now - dollar isn't the driver."))
+    be = _get("BTC", "ETH")
+    if be is not None and be < 0.7:
+        lines.append(f"**BTC-ETH {be:+.2f}** - unusually low; rotation/divergence phase inside crypto.")
+    f = discord.File(buf, filename="corr_matrix.png")
+    await interaction.followup.send(content="\n".join(lines) if lines else "Correlation matrix:", file=f)
 
 
 RAINBOW_BANDS = [
@@ -5562,7 +5984,11 @@ def build_help_embed() -> discord.Embed:
             "`/roi` - this cycle vs 2020, multiple since halving\n"
             "`/etf` - Bitcoin ETF daily flows, the institutional bid\n"
             "`/options` - DVOL, put/call, max pain (Deribit)\n"
-            "`/hash` - Hash Ribbons, miner capitulation signal"
+            "`/hash` - Hash Ribbons, miner capitulation signal\n"
+            "`/premium` - Coinbase + Kimchi premium, US vs Korean bid\n"
+            "`/basis` - quarterly futures basis, the carry regime\n"
+            "`/sessions` - Asia vs EU vs US, who's buying (30d)\n"
+            "`/corr` - correlation matrix vs SPX, DXY, GOLD"
         ),
         inline=False,
     )
