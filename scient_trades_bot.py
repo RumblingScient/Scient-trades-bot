@@ -131,7 +131,7 @@ NEWS_SOURCE_BLACKLIST = ("cointelegraph", "wu blockchain", "wublockchain")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHANNEL = "@scientclub"
 TG_ENABLED = True
-DISCORD_INVITE = "https://discord.gg/scientlounge"
+DISCORD_INVITE = "https://discord.gg/SigmaTrading"
 TG_BRIEF_UTC_HOUR = 6   # 12:00 PM IST = 06:30 UTC
 TG_BRIEF_UTC_MIN = 30
 TG_MACRO_CORE = ("sec", "etf", "fed", "fomc", "cpi", "rate cut", "rate hike")
@@ -3475,19 +3475,6 @@ async def gainers(interaction: discord.Interaction):
 @bot.tree.command(name="losers", description="Top 5 losers of the day")
 async def losers(interaction: discord.Interaction):
     await _movers(interaction, top=False)
-
-
-@bot.tree.command(name="quiz", description="Random TA quiz question - test yourself")
-async def quiz(interaction: discord.Interaction):
-    q, _ = _quiz_pick()
-    embed = _quiz_embed(q)
-    embed.description += "\n\n*Answer is private - only you see your result. Keep the streak going with Next question.*"
-    view = QuizView(q)
-    await interaction.response.send_message(embed=embed, view=view)
-    try:
-        view.message = await interaction.original_response()
-    except Exception:
-        pass
 
 
 @bot.tree.command(name="dominance", description="BTC dominance + total market cap")
@@ -7059,6 +7046,250 @@ def make_monthly_recap_image(stats: dict) -> io.BytesIO:
     return buf
 
 
+ANALYST_JOURNAL_CHANNEL_IDS: dict[int, int] = {}   # analyst_id -> channel_id; empty = post to RECAP_CHANNEL_ID
+
+
+def _analyst_month_stats(analyst_id: int, start, end):
+    entries = []
+    for k, mid, t in _res_all_closed():
+        if t.get("analyst_id") != analyst_id:
+            continue
+        try:
+            d = datetime.fromisoformat(t["closed_at"])
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            if start <= d.astimezone(IST) < end:
+                entries.append((k, mid, t))
+        except Exception:
+            continue
+    if not entries:
+        return None
+    tot = _res_totals(entries)
+    longs  = [(k, m, t) for k, m, t in entries if t.get("direction") == "LONG"]
+    shorts = [(k, m, t) for k, m, t in entries if t.get("direction") == "SHORT"]
+    def _wr(sub):
+        w = sum(1 for _, _, t in sub if t.get("result") == "WIN")
+        l = sum(1 for _, _, t in sub if t.get("result") == "LOSS")
+        return (w / (w + l) * 100) if (w + l) else 0
+    win_rs  = [t.get("result_r") for k, _, t in entries if k == "fut"
+               and t.get("result") == "WIN" and isinstance(t.get("result_r"), (int, float))]
+    loss_rs = [t.get("result_r") for k, _, t in entries if k == "fut"
+               and t.get("result") == "LOSS" and isinstance(t.get("result_r"), (int, float))]
+    best = None
+    for k, _, t in entries:
+        if k == "fut" and isinstance(t.get("result_r"), (int, float)):
+            if best is None or t["result_r"] > best[0]:
+                best = (t["result_r"], t.get("pair", "?"), t.get("direction", ""))
+    pair_counts = {}
+    for _, _, t in entries:
+        p = (t.get("pair") or "?").upper()
+        pair_counts[p] = pair_counts.get(p, 0) + 1
+    top_pair, top_n = max(pair_counts.items(), key=lambda x: x[1]) if pair_counts else ("\u2014", 0)
+    log = []
+    for k, _, t in sorted(entries, key=lambda x: x[2].get("closed_at") or ""):
+        res = {"WIN": "W", "LOSS": "L", "BE": "BE", "INVALID": "INV"}.get(t.get("result"), "?")
+        rv = None
+        if k == "fut" and isinstance(t.get("result_r"), (int, float)):
+            rtxt = f"{t['result_r']:+.2f}"; rv = float(t["result_r"])
+        elif k == "spot" and isinstance(t.get("result_pct"), (int, float)):
+            rtxt = f"{t['result_pct']:+.1f}%"
+        else:
+            rtxt = "\u2014"
+        try:
+            dtxt = datetime.fromisoformat(t["closed_at"]).astimezone(IST).strftime("%d %b")
+        except Exception:
+            dtxt = "\u2014"
+        log.append({"pair": t.get("pair", "?"), "side": (t.get("direction") or "").title() or "Spot",
+                    "res": res, "r": rtxt, "rv": rv, "date": dtxt})
+    an = next((t.get("analyst_name") for _, _, t in entries if t.get("analyst_name")), "Analyst")
+    return {"analyst": an.upper(), "n": tot["n"], "w": tot["wins"], "l": tot["losses"],
+            "be": tot["be"], "inv": tot["inv"], "wr": tot["wr"], "net": tot["total_r"],
+            "longs": len(longs), "shorts": len(shorts),
+            "wr_long": _wr(longs), "wr_short": _wr(shorts),
+            "avg_w": (sum(win_rs) / len(win_rs)) if win_rs else 0.0,
+            "avg_l": (sum(loss_rs) / len(loss_rs)) if loss_rs else 0.0,
+            "hl1_label": "BEST SETUP",
+            "hl1_value": (f"{best[0]:+.2f}R" if best else "\u2014"),
+            "hl1_sub": (f"{best[1]} {best[2].lower()}" if best else ""),
+            "hl2_label": "MOST TRADED", "hl2_value": top_pair.split("/")[0],
+            "hl2_sub": f"{top_n} of {tot['n']} setups", "log": log}
+
+
+def make_analyst_month_image(s: dict) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    fams = _sigma_fonts()
+    DISP, MONO = fams["disp"], fams["mono"]
+    TXT = fams.get("txt", MONO)
+
+    rows = s["log"][:40]
+    rowh = 3.0
+    H = 130 + 10 + len(rows)*rowh
+    W = 100
+    fig = plt.figure(figsize=(W/10, H/10), facecolor=SIGMA_BG)
+    ax = fig.add_axes([0,0,1,1]); ax.set_xlim(0,W); ax.set_ylim(0,H); ax.axis("off")
+    def box(x,y,w,h,fc=SIGMA_CARD,ec=SIGMA_SLATE,lw=1.1):
+        ax.add_patch(mpatches.FancyBboxPatch((x,y),w,h,boxstyle="round,pad=0,rounding_size=1.2",
+                     facecolor=fc,edgecolor=ec,linewidth=lw))
+    T = H
+
+    # ── header: badge + analyst as the title, month under ──
+    box(8, T-14, 7, 7, fc=SIGMA_CYAN, ec=SIGMA_CYAN)
+    ax.plot([13.2,9.4,11.4,9.4,13.2],[T-8.6,T-8.6,T-10.5,T-12.4,T-12.4],color=SIGMA_BG,lw=2.6,solid_capstyle="butt")
+    ax.text(17.5, T-9.2, "SIGMA TRADING", color=SIGMA_PAPER, fontsize=12, family=DISP, va="center")
+    ax.text(17.5, T-12.6, "the month, logged", color=SIGMA_ASH, fontsize=7.5, family=MONO, va="center")
+    ax.text(92, T-10.8, s["month"].upper(), color=SIGMA_CYAN, fontsize=11, family=MONO, ha="right", va="center")
+    ax.text(8, T-24, s["analyst"], color=SIGMA_PAPER, fontsize=30, family=DISP)
+    ax.text(8, T-29, "every number below is from the public board \u2014 nothing typed in by hand",
+            color=SIGMA_ASH, fontsize=7.4, family=TXT)
+
+    # ── hero: NET giant + counters ──
+    hy = T-36
+    ax.text(8, hy-11, f"{s['net']:+.2f}R", color=(SIGMA_GREEN if s["net"]>=0 else SIGMA_RED), fontsize=42, family=MONO)
+    ax.text(8, hy-16.5, "NET \u00b7 SUM OF ALL CLOSES", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    for i,(k,v) in enumerate([("SETUPS CLOSED", str(s["n"])),
+                               ("WIN RATE, DECIDED", f"{s['wr']:.0f}%"),
+                               ("W / L / BE / INV", f"{s['w']}/{s['l']}/{s['be']}/{s['inv']}")]):
+        x = 55 + 0
+        yy = hy - 3 - i*5.6
+        ax.text(55, yy, k, color=SIGMA_ASH, fontsize=8, family=MONO)
+        ax.text(92, yy, v, color=SIGMA_PAPER, fontsize=11, family=MONO, ha="right")
+
+    # ── R-TAPE: one bar per close, in order ──
+    ty = hy-25
+    ax.text(8, ty, "THE TAPE", color=SIGMA_CYAN, fontsize=8.5, family=MONO)
+    ax.text(92, ty, "one bar per close, in order \u00b7 height = R", color=SIGMA_ASH, fontsize=7, family=MONO, ha="right")
+    base_y = ty-11
+    ax.plot([8,92],[base_y,base_y], color=SIGMA_SLATE, lw=1)
+    rs = [r.get("rv") for r in rows]
+    mx = max((abs(v) for v in rs if v is not None), default=1) or 1
+    bw = min(3.2, 84/max(len(rows),1) * 0.62)
+    step = 84/max(len(rows),1)
+    for i, r in enumerate(rows):
+        x = 8 + i*step + (step-bw)/2
+        v = r.get("rv")
+        if v is None:
+            ax.add_patch(mpatches.Rectangle((x, base_y-0.5), bw, 1.0, facecolor=SIGMA_SLATE, edgecolor="none"))
+            continue
+        h = max(0.6, abs(v)/mx*7.5)
+        col = SIGMA_GREEN if v > 0 else (SIGMA_RED if v < 0 else SIGMA_SLATE)
+        y = base_y if v >= 0 else base_y-h
+        ax.add_patch(mpatches.Rectangle((x, y), bw, h, facecolor=col, edgecolor="none"))
+
+    # ── direction split: two panels ──
+    dy = base_y-14
+    box(8, dy-14, 41, 12.5)
+    ax.text(10.5, dy-4.5, "LONGS", color=SIGMA_GREEN, fontsize=8.5, family=MONO)
+    ax.text(10.5, dy-9.5, f"{s['longs']}", color=SIGMA_PAPER, fontsize=15, family=MONO)
+    ax.text(47, dy-4.5, "WIN RATE", color=SIGMA_ASH, fontsize=7.4, family=MONO, ha="right")
+    ax.text(47, dy-9.5, f"{s['wr_long']:.0f}%", color=SIGMA_PAPER, fontsize=15, family=MONO, ha="right")
+    box(51, dy-14, 41, 12.5)
+    ax.text(53.5, dy-4.5, "SHORTS", color=SIGMA_RED, fontsize=8.5, family=MONO)
+    ax.text(53.5, dy-9.5, f"{s['shorts']}", color=SIGMA_PAPER, fontsize=15, family=MONO)
+    ax.text(90, dy-4.5, "WIN RATE", color=SIGMA_ASH, fontsize=7.4, family=MONO, ha="right")
+    ax.text(90, dy-9.5, f"{s['wr_short']:.0f}%", color=SIGMA_PAPER, fontsize=15, family=MONO, ha="right")
+
+    # ── the shape of it: avg win vs avg loss + payoff ──
+    sy = dy-20
+    ax.text(8, sy, "THE SHAPE OF IT", color=SIGMA_CYAN, fontsize=8.5, family=MONO)
+    aw, al = s["avg_w"], abs(s["avg_l"]) or 0.0001
+    payoff = aw/al if al else 0
+    ax.text(8, sy-5.5, "AVG WIN", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    ax.text(30, sy-5.5, f"{aw:+.2f}R", color=SIGMA_GREEN, fontsize=10.5, family=MONO, ha="right")
+    ax.text(38, sy-5.5, "AVG LOSS", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    ax.text(60, sy-5.5, f"{s['avg_l']:+.2f}R", color=SIGMA_RED, fontsize=10.5, family=MONO, ha="right")
+    ax.text(68, sy-5.5, "PAYOFF", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    ax.text(92, sy-5.5, f"{payoff:.1f} : 1", color=SIGMA_CYAN, fontsize=10.5, family=MONO, ha="right")
+    # proportional bars
+    tot = aw+al
+    if tot > 0:
+        wfrac = aw/tot*84
+        ax.add_patch(mpatches.Rectangle((8, sy-9.5), wfrac, 1.6, facecolor=SIGMA_GREEN, edgecolor="none"))
+        ax.add_patch(mpatches.Rectangle((8+wfrac, sy-9.5), 84-wfrac, 1.6, facecolor=SIGMA_RED, edgecolor="none", alpha=0.85))
+
+    # ── worth noting ──
+    wy = sy-15
+    ax.text(8, wy, "WORTH NOTING", color=SIGMA_CYAN, fontsize=8.5, family=MONO)
+    ax.text(8, wy-5.5, "BEST CLOSE", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    ax.text(8, wy-10.5, s["hl1_value"], color=SIGMA_GREEN, fontsize=13, family=MONO)
+    ax.text(8, wy-14, s["hl1_sub"], color=SIGMA_ASH, fontsize=7.2, family=TXT)
+    ax.text(51, wy-5.5, "MOST VISITED", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    ax.text(51, wy-10.5, s["hl2_value"], color=SIGMA_PAPER, fontsize=13, family=MONO)
+    ax.text(51, wy-14, s["hl2_sub"], color=SIGMA_ASH, fontsize=7.2, family=TXT)
+
+    # ── the log ──
+    ly = wy-20
+    ax.text(8, ly, "THE LOG", color=SIGMA_CYAN, fontsize=8.5, family=MONO)
+    ax.text(92, ly, "as recorded \u00b7 closed order", color=SIGMA_ASH, fontsize=7, family=MONO, ha="right")
+    ty2 = ly-5
+    box(8, ty2-3.2, 84, 4, fc="#1B222C", ec=SIGMA_SLATE)
+    for lab, x, ha in [("CLOSED",12,"left"),("SETUP",32,"left"),("SIDE",58,"center"),("CLOSE",72,"center"),("R",88,"right")]:
+        ax.text(x, ty2-1.9, lab, color=SIGMA_CYAN, fontsize=7.6, family=MONO, ha=ha)
+    ry = ty2-6.6
+    for i,r in enumerate(rows):
+        if i % 2 == 0:
+            ax.add_patch(mpatches.Rectangle((8, ry-1.1), 84, rowh, facecolor="#10161E", edgecolor="none"))
+        ax.text(12, ry, r.get("date","\u2014"), color=SIGMA_ASH, fontsize=7.8, family=MONO)
+        ax.text(32, ry, r["pair"], color=SIGMA_PAPER, fontsize=8.2, family=MONO)
+        ax.text(58, ry, r["side"][0] if r["side"] else "?", color=(SIGMA_GREEN if r["side"]=="Long" else (SIGMA_RED if r["side"]=="Short" else SIGMA_ASH)), fontsize=8.2, family=MONO, ha="center")
+        rescol = {"W":SIGMA_GREEN,"L":SIGMA_RED}.get(r["res"], SIGMA_ASH)
+        ax.text(72, ry, r["res"], color=rescol, fontsize=8.2, family=MONO, ha="center")
+        rc = SIGMA_GREEN if r["r"].startswith("+") else (SIGMA_RED if r["r"].startswith("-") else SIGMA_ASH)
+        ax.text(88, ry, r["r"], color=rc, fontsize=8.2, family=MONO, ha="right")
+        ry -= rowh
+
+    ax.plot([8,92],[ry+0.5,ry+0.5], color=SIGMA_SLATE, lw=1)
+    ax.text(50, ry-4, "logged at post time \u00b7 the full board is public \u00b7 CSV export in results-board",
+            color=SIGMA_ASH, fontsize=7.4, family=TXT, ha="center")
+    ax.text(50, ry-8.5, "SETUPS, NOT SIGNALS", color=SIGMA_CYAN, fontsize=8, family=MONO, ha="center")
+    buf = io.BytesIO(); fig.savefig(buf, dpi=140, facecolor=SIGMA_BG); plt.close(fig); buf.seek(0)
+    return buf
+
+
+async def post_analyst_journals(start=None, end=None, label=None) -> int:
+    if start is None:
+        start, end, _slug, label = _last_complete_month_range()
+    posted = 0
+    for aid in (RESULTS_ANALYST_IDS or set()):
+        stats = _analyst_month_stats(aid, start, end)
+        if not stats:
+            continue
+        stats["month"] = label or start.strftime("%B %Y")
+        ch = bot.get_channel(ANALYST_JOURNAL_CHANNEL_IDS.get(aid) or RECAP_CHANNEL_ID or RESULTS_CHANNEL_ID)
+        if ch is None:
+            continue
+        try:
+            buf = await asyncio.to_thread(make_analyst_month_image, stats)
+            await ch.send(content=f"**{stats['analyst'].title()} \u2014 {stats['month']}** \u00b7 "
+                                  f"{stats['n']} setups, {stats['net']:+.2f}R net.",
+                          file=discord.File(buf, filename=f"journal_{stats['analyst'].lower()}.png"))
+            posted += 1
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            print(f"[journal] error for {aid}: {e}", flush=True)
+    return posted
+
+
+@bot.tree.command(name="journal_month",
+                  description="(Admin) Post per-analyst monthly journal cards (default: last complete month)")
+@app_commands.describe(days="Use last N days instead of last complete month")
+async def journal_month_cmd(interaction: discord.Interaction, days: int = 0):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if days and days > 0:
+        end = datetime.now(IST)
+        start = end - timedelta(days=min(days, 365))
+        n = await post_analyst_journals(start, end, f"Last {min(days,365)} days")
+    else:
+        n = await post_analyst_journals()
+    await interaction.followup.send(f"Posted {n} journal card(s)." if n else
+                                    "No closed setups for any analyst in that range.", ephemeral=True)
+
+
 async def post_monthly_recap(start=None, end=None, label=None) -> bool:
     if start is None:
         start, end, _slug, label = _last_complete_month_range()
@@ -7088,6 +7319,7 @@ async def sigma_monthly_loop():
     if datetime.now(IST).day != 1:
         return
     await post_monthly_recap()
+    await post_analyst_journals()
 
 
 @sigma_monthly_loop.before_loop
