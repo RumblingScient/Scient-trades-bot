@@ -22,7 +22,7 @@ TRADES_CHANNEL_ID = 1525147189360332840
 TRADE_UPDATES_CHANNEL_ID = 1525863205174378617
 OPEN_BOARD_CHANNEL_ID = 1525863082256109690
 X_FEED_CHANNEL_ID = 1525862152076923020
-SPOT_CHANNEL_ID = 1533876035462889482
+SPOT_CHANNEL_ID = TRADES_CHANNEL_ID  # spot plays post in the same channel as futures setups
 # Pro roles that unlock full access (either one triggers the Pro welcome DM)
 PRO_ROLE_IDS = {1500476858477576374, 1484576832362905630}  # Scient Pass (referral), Scient Pro (payment)
 SUB_ROLE_ID = 1484576832362905630  # role granted/removed by the subscription system (Scient Pro)
@@ -880,13 +880,69 @@ def build_spot_board_embed() -> discord.Embed:
     return embed
 
 
+def build_combined_board_embed() -> discord.Embed:
+    """One pinned card: FUTURES section on top, SPOT section below, per-analyst rows in each."""
+    fut = [t for t in load_trades().values() if not t.get("closed")]
+    spo = [p for p in load_spot().values() if not p.get("closed")]
+    embed = discord.Embed(title="Open Positions - Live Board", color=NAVY,
+                          timestamp=datetime.now(timezone.utc))
+    embed.description = f"**{len(fut)} futures \u00b7 {len(spo)} spot** open right now"
+    order = list(ANALYSTS.keys())
+
+    def _grouped(items):
+        items = sorted(items, key=lambda t: (order.index(t.get("analyst_key", "")) if t.get("analyst_key", "") in order
+                                             else len(order), t.get("created_at", "")))
+        groups = {}
+        for t in items:
+            groups.setdefault(t.get("analyst_key", "other"), []).append(t)
+        keys = [k for k in order if k in groups] + [k for k in groups if k not in order]
+        return [(groups[k][0].get("analyst_name", k.capitalize()), groups[k]) for k in keys]
+
+    # ── FUTURES ──
+    embed.add_field(name="\u2500\u2500\u2500  FUTURES  \u2500\u2500\u2500", value="\u200b", inline=False)
+    if not fut:
+        embed.add_field(name="\u200b", value="*No open futures setups.*", inline=False)
+    for name, trades in _grouped(fut):
+        lines = []
+        for t in trades:
+            d = "\U0001F7E2 L" if t["direction"] == "LONG" else "\U0001F534 S"
+            e = entry_display(t, marks=False)
+            lines.append(f"{d} **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "")
+                         + f" - entry `{e}` - {short_status(t)} - [view]({jump_url(t)})")
+        embed.add_field(name=f"{name} ({len(trades)})", value="\n".join(lines)[:1024], inline=False)
+
+    # ── SPOT ──
+    embed.add_field(name="\u2500\u2500\u2500  SPOT  \u2500\u2500\u2500", value="\u200b", inline=False)
+    if not spo:
+        embed.add_field(name="\u200b", value="*No active spot plays.*", inline=False)
+    for name, plays in _grouped(spo):
+        lines = []
+        for p in plays:
+            avg = f" - avg `{p['avg_entry']}`" if p.get("avg_entry") else ""
+            lines.append(f"\U0001FA99 **{p['pair'].upper()}** - zone `{p['dca_zone']}`{avg}"
+                         f" - {spot_status_line(p)} - [view]({jump_url(p)})")
+        embed.add_field(name=f"{name} ({len(plays)})", value="\n".join(lines)[:1024], inline=False)
+
+    embed.set_footer(text=f"Sigma Trading - {len(fut)} futures / {len(spo)} spot - auto-updates")
+    return embed
+
+
 async def refresh_board():
     if not OPEN_BOARD_CHANNEL_ID:
         return
     ch = bot.get_channel(OPEN_BOARD_CHANNEL_ID)
     if ch is None:
         return
-    embed = build_board_embed()
+    embed = build_combined_board_embed()
+    # one-time cleanup: the old standalone spot board message is retired
+    sb = load_spot_board()
+    if sb.get("message_id"):
+        try:
+            old_sb = await ch.fetch_message(sb["message_id"])
+            await old_sb.delete()
+        except Exception:
+            pass
+        save_spot_board({})
     board = load_board()
     msg_id = board.get("message_id")
     if msg_id:
@@ -907,29 +963,8 @@ async def refresh_board():
 
 
 async def refresh_spot_board():
-    if not OPEN_BOARD_CHANNEL_ID:
-        return
-    ch = bot.get_channel(OPEN_BOARD_CHANNEL_ID)
-    if ch is None:
-        return
-    embed = build_spot_board_embed()
-    board = load_spot_board()
-    msg_id = board.get("message_id")
-    if msg_id:
-        try:
-            msg = await ch.fetch_message(msg_id)
-            await msg.edit(embed=embed)
-            return
-        except discord.NotFound:
-            pass
-        except discord.HTTPException:
-            pass
-    msg = await ch.send(embed=embed)
-    try:
-        await msg.pin()
-    except discord.HTTPException:
-        pass
-    save_spot_board({"message_id": msg.id, "channel_id": ch.id})
+    # spot rows live inside the combined board now
+    await refresh_board()
 
 
 async def tg_send(text: str, disable_preview: bool = True) -> bool:
@@ -2072,7 +2107,7 @@ def build_pro_dm() -> discord.Embed:
     embed.add_field(
         name="\U0001F4C8 Live Analyst Setups",
         value=(
-            "Every trade our analysts take is posted in **#future-trades** and **#spot-trades** with "
+            "Every setup our analysts take - futures and spot - is posted in **#trades** with "
             "entry, stop loss, targets, and the reasoning in a thread. Updates (TP hits, SL moves, closes) "
             "are tracked live on the card and in **#trade-updates**."
         ),
@@ -3087,8 +3122,7 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
 @bot.tree.command(name="open", description="See all live positions (futures + spot)")
 async def open_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    embeds = [build_board_embed(), build_spot_board_embed()]
-    await interaction.followup.send(embeds=embeds, ephemeral=True)
+    await interaction.followup.send(embed=build_combined_board_embed(), ephemeral=True)
 
 
 @bot.tree.command(name="recent", description="Latest closed trades with results")
@@ -7123,6 +7157,7 @@ def make_analyst_month_image(s: dict) -> io.BytesIO:
     fams = _sigma_fonts()
     DISP, MONO = fams["disp"], fams["mono"]
     TXT = fams.get("txt", MONO)
+    SIGMA_ASH = "#A9B7C6"  # journal card: brighter labels for readability
 
     rows = s["log"][:40]
     rowh = 3.0
@@ -7139,28 +7174,28 @@ def make_analyst_month_image(s: dict) -> io.BytesIO:
     box(8, T-14, 7, 7, fc=SIGMA_CYAN, ec=SIGMA_CYAN)
     ax.plot([13.2,9.4,11.4,9.4,13.2],[T-8.6,T-8.6,T-10.5,T-12.4,T-12.4],color=SIGMA_BG,lw=2.6,solid_capstyle="butt")
     ax.text(17.5, T-9.2, "SIGMA TRADING", color=SIGMA_PAPER, fontsize=12, family=DISP, va="center")
-    ax.text(17.5, T-12.6, "the month, logged", color=SIGMA_ASH, fontsize=7.5, family=MONO, va="center")
+    ax.text(17.5, T-12.6, "the month, logged", color=SIGMA_ASH, fontsize=8.4, family=MONO, va="center")
     ax.text(92, T-10.8, s["month"].upper(), color=SIGMA_CYAN, fontsize=11, family=MONO, ha="right", va="center")
     ax.text(8, T-24, s["analyst"], color=SIGMA_PAPER, fontsize=30, family=DISP)
     ax.text(8, T-29, "every number below is from the public board \u2014 nothing typed in by hand",
-            color=SIGMA_ASH, fontsize=7.4, family=TXT)
+            color=SIGMA_ASH, fontsize=8.4, family=TXT)
 
     # ── hero: NET giant + counters ──
     hy = T-36
     ax.text(8, hy-11, f"{s['net']:+.2f}R", color=(SIGMA_GREEN if s["net"]>=0 else SIGMA_RED), fontsize=42, family=MONO)
-    ax.text(8, hy-16.5, "NET \u00b7 SUM OF ALL CLOSES", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    ax.text(8, hy-16.5, "NET \u00b7 SUM OF ALL CLOSES", color=SIGMA_ASH, fontsize=8.6, family=MONO)
     for i,(k,v) in enumerate([("SETUPS CLOSED", str(s["n"])),
                                ("WIN RATE, DECIDED", f"{s['wr']:.0f}%"),
                                ("W / L / BE / INV", f"{s['w']}/{s['l']}/{s['be']}/{s['inv']}")]):
         x = 55 + 0
         yy = hy - 3 - i*5.6
-        ax.text(55, yy, k, color=SIGMA_ASH, fontsize=8, family=MONO)
+        ax.text(55, yy, k, color=SIGMA_ASH, fontsize=8.8, family=MONO)
         ax.text(92, yy, v, color=SIGMA_PAPER, fontsize=11, family=MONO, ha="right")
 
     # ── R-TAPE: one bar per close, in order ──
     ty = hy-25
-    ax.text(8, ty, "THE TAPE", color=SIGMA_CYAN, fontsize=8.5, family=MONO)
-    ax.text(92, ty, "one bar per close, in order \u00b7 height = R", color=SIGMA_ASH, fontsize=7, family=MONO, ha="right")
+    ax.text(8, ty, "THE TAPE", color=SIGMA_CYAN, fontsize=9.3, family=MONO)
+    ax.text(92, ty, "one bar per close, in order \u00b7 height = R", color=SIGMA_ASH, fontsize=8, family=MONO, ha="right")
     base_y = ty-11
     ax.plot([8,92],[base_y,base_y], color=SIGMA_SLATE, lw=1)
     rs = [r.get("rv") for r in rows]
@@ -7181,26 +7216,26 @@ def make_analyst_month_image(s: dict) -> io.BytesIO:
     # ── direction split: two panels ──
     dy = base_y-14
     box(8, dy-14, 41, 12.5)
-    ax.text(10.5, dy-4.5, "LONGS", color=SIGMA_GREEN, fontsize=8.5, family=MONO)
+    ax.text(10.5, dy-4.5, "LONGS", color=SIGMA_GREEN, fontsize=9.3, family=MONO)
     ax.text(10.5, dy-9.5, f"{s['longs']}", color=SIGMA_PAPER, fontsize=15, family=MONO)
     ax.text(47, dy-4.5, "WIN RATE", color=SIGMA_ASH, fontsize=7.4, family=MONO, ha="right")
     ax.text(47, dy-9.5, f"{s['wr_long']:.0f}%", color=SIGMA_PAPER, fontsize=15, family=MONO, ha="right")
     box(51, dy-14, 41, 12.5)
-    ax.text(53.5, dy-4.5, "SHORTS", color=SIGMA_RED, fontsize=8.5, family=MONO)
+    ax.text(53.5, dy-4.5, "SHORTS", color=SIGMA_RED, fontsize=9.3, family=MONO)
     ax.text(53.5, dy-9.5, f"{s['shorts']}", color=SIGMA_PAPER, fontsize=15, family=MONO)
     ax.text(90, dy-4.5, "WIN RATE", color=SIGMA_ASH, fontsize=7.4, family=MONO, ha="right")
     ax.text(90, dy-9.5, f"{s['wr_short']:.0f}%", color=SIGMA_PAPER, fontsize=15, family=MONO, ha="right")
 
     # ── the shape of it: avg win vs avg loss + payoff ──
     sy = dy-20
-    ax.text(8, sy, "THE SHAPE OF IT", color=SIGMA_CYAN, fontsize=8.5, family=MONO)
+    ax.text(8, sy, "THE SHAPE OF IT", color=SIGMA_CYAN, fontsize=9.3, family=MONO)
     aw, al = s["avg_w"], abs(s["avg_l"]) or 0.0001
     payoff = aw/al if al else 0
-    ax.text(8, sy-5.5, "AVG WIN", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    ax.text(8, sy-5.5, "AVG WIN", color=SIGMA_ASH, fontsize=8.6, family=MONO)
     ax.text(30, sy-5.5, f"{aw:+.2f}R", color=SIGMA_GREEN, fontsize=10.5, family=MONO, ha="right")
-    ax.text(38, sy-5.5, "AVG LOSS", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    ax.text(38, sy-5.5, "AVG LOSS", color=SIGMA_ASH, fontsize=8.6, family=MONO)
     ax.text(60, sy-5.5, f"{s['avg_l']:+.2f}R", color=SIGMA_RED, fontsize=10.5, family=MONO, ha="right")
-    ax.text(68, sy-5.5, "PAYOFF", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    ax.text(68, sy-5.5, "PAYOFF", color=SIGMA_ASH, fontsize=8.6, family=MONO)
     ax.text(92, sy-5.5, f"{payoff:.1f} : 1", color=SIGMA_CYAN, fontsize=10.5, family=MONO, ha="right")
     # proportional bars
     tot = aw+al
@@ -7211,39 +7246,39 @@ def make_analyst_month_image(s: dict) -> io.BytesIO:
 
     # ── worth noting ──
     wy = sy-15
-    ax.text(8, wy, "WORTH NOTING", color=SIGMA_CYAN, fontsize=8.5, family=MONO)
-    ax.text(8, wy-5.5, "BEST CLOSE", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    ax.text(8, wy, "WORTH NOTING", color=SIGMA_CYAN, fontsize=9.3, family=MONO)
+    ax.text(8, wy-5.5, "BEST CLOSE", color=SIGMA_ASH, fontsize=8.6, family=MONO)
     ax.text(8, wy-10.5, s["hl1_value"], color=SIGMA_GREEN, fontsize=13, family=MONO)
-    ax.text(8, wy-14, s["hl1_sub"], color=SIGMA_ASH, fontsize=7.2, family=TXT)
-    ax.text(51, wy-5.5, "MOST VISITED", color=SIGMA_ASH, fontsize=7.6, family=MONO)
+    ax.text(8, wy-14, s["hl1_sub"], color=SIGMA_ASH, fontsize=8.2, family=TXT)
+    ax.text(51, wy-5.5, "MOST VISITED", color=SIGMA_ASH, fontsize=8.6, family=MONO)
     ax.text(51, wy-10.5, s["hl2_value"], color=SIGMA_PAPER, fontsize=13, family=MONO)
-    ax.text(51, wy-14, s["hl2_sub"], color=SIGMA_ASH, fontsize=7.2, family=TXT)
+    ax.text(51, wy-14, s["hl2_sub"], color=SIGMA_ASH, fontsize=8.2, family=TXT)
 
     # ── the log ──
     ly = wy-20
-    ax.text(8, ly, "THE LOG", color=SIGMA_CYAN, fontsize=8.5, family=MONO)
-    ax.text(92, ly, "as recorded \u00b7 closed order", color=SIGMA_ASH, fontsize=7, family=MONO, ha="right")
+    ax.text(8, ly, "THE LOG", color=SIGMA_CYAN, fontsize=9.3, family=MONO)
+    ax.text(92, ly, "as recorded \u00b7 closed order", color=SIGMA_ASH, fontsize=8, family=MONO, ha="right")
     ty2 = ly-5
     box(8, ty2-3.2, 84, 4, fc="#1B222C", ec=SIGMA_SLATE)
     for lab, x, ha in [("CLOSED",12,"left"),("SETUP",32,"left"),("SIDE",58,"center"),("CLOSE",72,"center"),("R",88,"right")]:
-        ax.text(x, ty2-1.9, lab, color=SIGMA_CYAN, fontsize=7.6, family=MONO, ha=ha)
+        ax.text(x, ty2-1.9, lab, color=SIGMA_CYAN, fontsize=8.6, family=MONO, ha=ha)
     ry = ty2-6.6
     for i,r in enumerate(rows):
         if i % 2 == 0:
             ax.add_patch(mpatches.Rectangle((8, ry-1.1), 84, rowh, facecolor="#10161E", edgecolor="none"))
-        ax.text(12, ry, r.get("date","\u2014"), color=SIGMA_ASH, fontsize=7.8, family=MONO)
-        ax.text(32, ry, r["pair"], color=SIGMA_PAPER, fontsize=8.2, family=MONO)
-        ax.text(58, ry, r["side"][0] if r["side"] else "?", color=(SIGMA_GREEN if r["side"]=="Long" else (SIGMA_RED if r["side"]=="Short" else SIGMA_ASH)), fontsize=8.2, family=MONO, ha="center")
+        ax.text(12, ry, r.get("date","\u2014"), color=SIGMA_ASH, fontsize=8.8, family=MONO)
+        ax.text(32, ry, r["pair"], color=SIGMA_PAPER, fontsize=9.0, family=MONO)
+        ax.text(58, ry, r["side"][0] if r["side"] else "?", color=(SIGMA_GREEN if r["side"]=="Long" else (SIGMA_RED if r["side"]=="Short" else SIGMA_ASH)), fontsize=9.0, family=MONO, ha="center")
         rescol = {"W":SIGMA_GREEN,"L":SIGMA_RED}.get(r["res"], SIGMA_ASH)
-        ax.text(72, ry, r["res"], color=rescol, fontsize=8.2, family=MONO, ha="center")
+        ax.text(72, ry, r["res"], color=rescol, fontsize=9.0, family=MONO, ha="center")
         rc = SIGMA_GREEN if r["r"].startswith("+") else (SIGMA_RED if r["r"].startswith("-") else SIGMA_ASH)
-        ax.text(88, ry, r["r"], color=rc, fontsize=8.2, family=MONO, ha="right")
+        ax.text(88, ry, r["r"], color=rc, fontsize=9.0, family=MONO, ha="right")
         ry -= rowh
 
     ax.plot([8,92],[ry+0.5,ry+0.5], color=SIGMA_SLATE, lw=1)
     ax.text(50, ry-4, "logged at post time \u00b7 the full board is public \u00b7 CSV export in results-board",
-            color=SIGMA_ASH, fontsize=7.4, family=TXT, ha="center")
-    ax.text(50, ry-8.5, "SETUPS, NOT SIGNALS", color=SIGMA_CYAN, fontsize=8, family=MONO, ha="center")
+            color=SIGMA_ASH, fontsize=8.4, family=TXT, ha="center")
+    ax.text(50, ry-8.5, "SETUPS, NOT SIGNALS", color=SIGMA_CYAN, fontsize=8.8, family=MONO, ha="center")
     buf = io.BytesIO(); fig.savefig(buf, dpi=140, facecolor=SIGMA_BG); plt.close(fig); buf.seek(0)
     return buf
 
