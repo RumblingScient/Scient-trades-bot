@@ -899,6 +899,183 @@ def build_spot_board_embed() -> discord.Embed:
     return embed
 
 
+# ─── AUTO PRICE TRACKER (live feed -> entry fills / TP hits / SL alerts) ────
+PRICE_WATCH_ENABLED = True
+PRICE_WATCH_SEC = 60
+AUTO_CLOSE_ON_HARD_SL = True    # plain numeric SL: auto-close on touch. Soft SL ("4h close below X"): notify only.
+_pw_unsupported: set = set()
+_pw_lock = asyncio.Lock()
+
+
+def _pw_symbol(pair: str):
+    s = (pair or "").upper().replace("/", "").replace("-", "").strip()
+    if not s.endswith(("USDT", "USDC")):
+        s = s + "USDT"
+    return s
+
+
+async def _pw_klines(symbol: str, since_ms: int):
+    """1m Binance USDT-perp klines since since_ms. Returns [(open_ms, high, low, close)] or None."""
+    url = (f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}"
+           f"&interval=1m&startTime={since_ms}&limit=1000")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return None
+                rows = await r.json()
+        return [(int(k[0]), float(k[2]), float(k[3]), float(k[4])) for k in rows]
+    except Exception:
+        return None
+
+
+async def _pw_announce(t, title, color, line):
+    try:
+        await post_update_feed(t, title, color, line)
+    except Exception as ex:
+        print(f"[watch] announce error: {ex}", flush=True)
+
+
+async def _pw_process_trade(tid: str, t: dict, candles):
+    """Walk candles chronologically; mutate t; return list of (title,color,line) events."""
+    events = []
+    is_long = t.get("direction") == "LONG"
+    e1 = first_num(t.get("entry"))
+    e2 = first_num(t.get("entry2")) if t.get("entry2") else None
+    slv = sl_num(t)
+    plan = t.get("tp_split") or []
+    soft_sl = bool(t.get("sl_condition"))
+
+    def crossed_entry(px, lo, hi):
+        return (lo <= px) if is_long else (hi >= px)
+
+    def crossed_tp(px, lo, hi):
+        return (hi >= px) if is_long else (lo <= px)
+
+    def crossed_sl(px, lo, hi):
+        return (lo <= px) if is_long else (hi >= px)
+
+    for open_ms, hi, lo, close in candles:
+        if t.get("closed"):
+            break
+        # entry fills (limit only - market fills at post)
+        if e1 and not t.get("entry1_filled") and t.get("entry_type") != "MARKET" and crossed_entry(e1, lo, hi):
+            t["entry1_filled"] = True
+            events.append(("Entry 1 filled" if e2 else "Entry filled", BLUE,
+                           f"Filled @ {fnum(e1)} - auto-tracked"))
+        if e2 and not t.get("entry2_filled") and crossed_entry(e2, lo, hi):
+            t["entry2_filled"] = True
+            t["entry1_filled"] = True
+            events.append(("DCA entry filled - full position live", BLUE,
+                           f"Filled @ {fnum(e2)} - auto-tracked"))
+        # TP hits, in order, only once in a position
+        if any_entry_filled(t):
+            for idx, key in enumerate(("tp1", "tp2", "tp3")):
+                tp_px = first_num(t.get(key))
+                if not tp_px or t.get(f"{key}_hit"):
+                    continue
+                if crossed_tp(tp_px, lo, hi):
+                    t[f"{key}_hit"] = True
+                    for prev in ("tp1", "tp2", "tp3")[:idx]:
+                        t[f"{prev}_hit"] = True
+                    pct = float(plan[idx]) if idx < len(plan) else 0.0
+                    room = max(0.0, 100.0 - fills_pct(t))
+                    pct = min(pct, room)
+                    if pct > 0:
+                        t.setdefault("fills", []).append({"price": tp_px, "pct": pct, "label": key.upper()})
+                        events.append((f"{key.upper()} hit @ {fnum(tp_px)} ({pct:g}%)", GREEN,
+                                       f"Auto-tracked · {fills_pct(t):g}% closed, {100 - fills_pct(t):g}% running"))
+                    else:
+                        events.append((f"{key.upper()} tagged @ {fnum(tp_px)}", GREEN,
+                                       "Auto-tracked - no split % on the card, record size with /update"))
+        # SL
+        if slv and not t.get("closed") and any_entry_filled(t) and crossed_sl(slv, lo, hi):
+            if soft_sl:
+                warned = t.get("watch_sl_warned_ms") or 0
+                if open_ms - warned > 4 * 3600 * 1000:
+                    t["watch_sl_warned_ms"] = open_ms
+                    events.append(("Price at soft invalidation", GREY,
+                                   f"Traded through {fnum(slv)} ({t.get('sl_condition')}) - your call, confirm with /update if it closes there."))
+            elif AUTO_CLOSE_ON_HARD_SL:
+                exit_px = entry_num(t) if t.get("be") else slv
+                t["sl_hit"] = not t.get("be")
+                avg_exit, r = finalize_close(t, exit_px)
+                t["closed"] = True
+                t["avg_exit"] = avg_exit
+                t["result_r"] = round(r, 2) if r is not None else None
+                t["result"] = ("WIN" if r > 0.05 else "LOSS" if r < -0.05 else "BE") if r is not None else "LOSS"
+                t["closed_at"] = datetime.now(timezone.utc).isoformat()
+                t["close_note"] = "Auto-tracked stop"
+                rtxt = f" ({t['result_r']:+.2f}R)" if isinstance(t.get("result_r"), (int, float)) else ""
+                if t.get("be"):
+                    events.append((f"Closed - Breakeven{rtxt}", GREY, f"Stop at entry hit @ {fnum(exit_px)} - auto-tracked"))
+                else:
+                    events.append((f"Closed - Loss{rtxt}", RED, f"Stop hit @ {fnum(exit_px)} - auto-tracked"))
+                break
+    return events
+
+
+@tasks.loop(seconds=PRICE_WATCH_SEC)
+async def price_watch_loop():
+    try:
+        await _price_watch_tick()
+    except Exception as ex:
+        import traceback
+        print(f"[watch] tick error: {ex}", flush=True)
+        traceback.print_exc()
+
+
+@price_watch_loop.before_loop
+async def _before_price_watch():
+    await bot.wait_until_ready()
+
+
+async def _price_watch_tick():
+    if not PRICE_WATCH_ENABLED or _pw_lock.locked():
+        return
+    async with _pw_lock:
+        data = load_trades()
+        open_trades = {tid: t for tid, t in data.items() if not t.get("closed")}
+        if not open_trades:
+            return
+        now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        by_sym = {}
+        for tid, t in open_trades.items():
+            sym = _pw_symbol(t.get("pair"))
+            if sym in _pw_unsupported:
+                continue
+            by_sym.setdefault(sym, []).append((tid, t))
+        changed = False
+        for sym, items in by_sym.items():
+            since = min(int(t.get("watch_ms") or (now_ms - 120_000)) for _, t in items)
+            candles = await _pw_klines(sym, since)
+            if candles is None:
+                _pw_unsupported.add(sym)
+                print(f"[watch] no feed for {sym} - manual tracking only", flush=True)
+                continue
+            for tid, t in items:
+                t_since = int(t.get("watch_ms") or (now_ms - 120_000))
+                mine = [c for c in candles if c[0] >= t_since]
+                events = await _pw_process_trade(tid, t, mine)
+                t["watch_ms"] = now_ms
+                if events:
+                    changed = True
+                    data[tid] = t
+                    save_trades(data)
+                    try:
+                        await refresh_and_edit(t)
+                    except Exception as ex:
+                        print(f"[watch] edit error {tid}: {ex}", flush=True)
+                    for title, color, line in events:
+                        await _pw_announce(t, title, color, line)
+                    await asyncio.sleep(0.6)
+        if changed:
+            save_trades(data)
+            await refresh_board()
+        else:
+            save_trades(data)   # persist watch_ms cursors
+
+
 # ─── POSITION SIZE CALCULATOR (buttons under every futures setup) ───────────
 
 def _sizer_compute(entry: float, stop: float, risk_usd: float, pair: str, direction: str):
@@ -7799,6 +7976,9 @@ async def _sigma_results_on_ready():
         sigma_recap_loop.start()
     if not sigma_monthly_loop.is_running():
         sigma_monthly_loop.start()
+    if not price_watch_loop.is_running():
+        price_watch_loop.start()
+        print("[watch] auto price tracker armed", flush=True)
     try:
         await refresh_results_summary()   # re-attach buttons + fresh numbers on every boot
     except Exception as e:
