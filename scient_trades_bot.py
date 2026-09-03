@@ -908,7 +908,15 @@ _pw_lock = asyncio.Lock()
 
 
 def _pw_symbol(pair: str):
-    s = (pair or "").upper().replace("/", "").replace("-", "").strip()
+    s = (pair or "").upper().strip()
+    if ":" in s:                       # BINANCE:BTCUSDT.P -> BTCUSDT.P
+        s = s.split(":", 1)[1]
+    s = s.replace("/", "").replace("-", "").replace(" ", "")
+    for suf in (".P", "PERP", ".PS"):
+        if s.endswith(suf):
+            s = s[: -len(suf)]
+    if s.endswith("USD") and not s.endswith(("USDT", "USDC")):
+        s = s + "T"                    # BTCUSD -> BTCUSDT
     if not s.endswith(("USDT", "USDC")):
         s = s + "USDT"
     return s
