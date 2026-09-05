@@ -731,7 +731,7 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
         color = discord.Color.from_str(t.get("analyst_color") or "#1C4E80")
     except Exception:
         color = NAVY
-    arrow = "\U0001F7E2 LONG" if is_long else "\U0001F534 SHORT"
+    arrow = "\u25b2 LONG" if is_long else "\u25bc SHORT"
     prefix = ""
     if closed:
         prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "")
@@ -805,7 +805,7 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
     prefix = ""
     if closed:
         prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "")
-    title = f"{prefix}\U0001F7E2 SPOT | {p['pair'].upper()}"
+    title = f"{prefix}\u25c6 SPOT | {p['pair'].upper()}"
     embed = discord.Embed(title=title, color=color)
 
     if closed:
@@ -864,7 +864,7 @@ def build_board_embed() -> discord.Embed:
         name = trades[0].get("analyst_name", k.capitalize())
         lines = []
         for t in trades:
-            d = "\U0001F7E2 L" if t["direction"] == "LONG" else "\U0001F534 S"
+            d = emo("longR", "\u25b2") + " L" if t["direction"] == "LONG" else emo("shortR", "\u25bc") + " S"
             e = entry_display(t, marks=False)
             lines.append(f"{d} **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "") + f" - entry `{e}` - {short_status(t)} - [view]({jump_url(t)})")
         embed.add_field(name=f"{name} ({len(trades)})", value="\n".join(lines)[:1024], inline=False)
@@ -1229,7 +1229,7 @@ def build_combined_board_embed() -> discord.Embed:
     for name, trades in _grouped(fut):
         lines = []
         for t in trades:
-            d = "\U0001F7E2 L" if t["direction"] == "LONG" else "\U0001F534 S"
+            d = emo("longR", "\u25b2") + " L" if t["direction"] == "LONG" else emo("shortR", "\u25bc") + " S"
             e = entry_display(t, marks=False)
             lines.append(f"{d} **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "")
                          + f" - entry `{e}` - {short_status(t)} - [view]({jump_url(t)})")
@@ -2852,7 +2852,7 @@ def _ac_label(t: dict, spot: bool = False) -> str:
     who = t.get("analyst_name", "?")
     if spot:
         return f"{who} · \U0001F48E SPOT · {t['pair'].upper()} - {spot_status_line(t)}"
-    side = "\U0001F7E2 LONG" if str(t.get("direction", "")).upper() == "LONG" else "\U0001F534 SHORT"
+    side = "\u25b2 LONG" if str(t.get("direction", "")).upper() == "LONG" else "\u25bc SHORT"
     return f"{who} · {side} · {t['pair'].upper()} {tf(t)} - {short_status(t)}"
 
 
@@ -2883,16 +2883,17 @@ async def open_trades_ac(interaction: discord.Interaction, current: str):
 async def open_spot_ac(interaction: discord.Interaction, current: str):
     data = load_spot()
     is_admin = interaction.user.guild_permissions.administrator
-    out = []
+    rows = []
     for mid, p in data.items():
         if p.get("closed"):
             continue
         if not is_admin and p.get("analyst_id") != interaction.user.id:
             continue
-        label = f"{p['pair'].upper()} SPOT - {spot_status_line(p)}"
+        label = _ac_label(p, spot=True)
         if current.lower() in label.lower():
-            out.append(app_commands.Choice(name=label[:100], value=mid))
-    return out[:25]
+            rows.append((_ac_sortkey(p, spot=True, uid=interaction.user.id), label, mid))
+    rows.sort(key=lambda r: r[0])
+    return [app_commands.Choice(name=lbl[:100], value=mid) for _, lbl, mid in rows[:25]]
 
 
 async def editable_any_ac(interaction: discord.Interaction, current: str):
@@ -3476,7 +3477,7 @@ async def recent(interaction: discord.Interaction, analyst: discord.Member = Non
     if closed:
         lines = []
         for t in closed:
-            d = "\U0001F7E2 L" if t["direction"] == "LONG" else "\U0001F534 S"
+            d = emo("longR", "\u25b2") + " L" if t["direction"] == "LONG" else emo("shortR", "\u25bc") + " S"
             res = t.get("result", "?")
             r = t.get("result_r")
             rtxt = f" ({r:+g}R)" if isinstance(r, (int, float)) else ""
