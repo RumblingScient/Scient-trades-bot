@@ -576,7 +576,7 @@ def entry_display(t: dict, marks: bool = True) -> str:
 
 
 def display_rr(t: dict):
-    for key in ("tp3", "tp2", "tp1"):
+    for key in ("tp4", "tp3", "tp2", "tp1"):
         if t.get(key):
             r = signed_r(t, first_num(t[key]))
             if r is not None:
@@ -596,6 +596,8 @@ def full_status(t: dict) -> str:
         }.get(t.get("result"), "CLOSED")
     closed_pct = fills_pct(t)
     pct_txt = f" - {closed_pct:g}% closed" if closed_pct > 0 else ""
+    if t.get("tp4_hit"):
+        return f"TP4 HIT{pct_txt}"
     if t.get("tp3_hit"):
         return f"TP3 HIT{pct_txt}"
     if t.get("tp2_hit"):
@@ -764,7 +766,7 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     # Targets (full width)
     tps = []
     plan = t.get("tp_split") or []
-    for idx, (key, hit) in enumerate((("tp1", "tp1_hit"), ("tp2", "tp2_hit"), ("tp3", "tp3_hit"))):
+    for idx, (key, hit) in enumerate((("tp1", "tp1_hit"), ("tp2", "tp2_hit"), ("tp3", "tp3_hit"), ("tp4", "tp4_hit"))):
         if t.get(key):
             r = signed_r(t, first_num(t[key]))
             rtxt = f" ({r:.1f}R)" if r is not None else ""
@@ -978,13 +980,13 @@ async def _pw_process_trade(tid: str, t: dict, candles):
                            f"Filled @ {fnum(e2)} - auto-tracked"))
         # TP hits, in order, only once in a position
         if any_entry_filled(t):
-            for idx, key in enumerate(("tp1", "tp2", "tp3")):
+            for idx, key in enumerate(("tp1", "tp2", "tp3", "tp4")):
                 tp_px = first_num(t.get(key))
                 if not tp_px or t.get(f"{key}_hit"):
                     continue
                 if crossed_tp(tp_px, lo, hi):
                     t[f"{key}_hit"] = True
-                    for prev in ("tp1", "tp2", "tp3")[:idx]:
+                    for prev in ("tp1", "tp2", "tp3", "tp4")[:idx]:
                         t[f"{prev}_hit"] = True
                     pct = float(plan[idx]) if idx < len(plan) else 0.0
                     room = max(0.0, 100.0 - fills_pct(t))
@@ -2655,6 +2657,7 @@ async def setup_follow_panel(interaction: discord.Interaction):
     setup_detail="Extra specifics (optional)",
     tp2="TP2 (optional)",
     tp3="TP3 (optional)",
+    tp4="TP4 (optional)",
     notes="Reasoning (optional, posted in the trade thread)",
 )
 @app_commands.choices(
@@ -2667,7 +2670,7 @@ async def setup_follow_panel(interaction: discord.Interaction):
         app_commands.Choice(name="Limit - Range/DCA (two entries)", value="DCA"),
     ],
 )
-async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry_type: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, sl_condition: str = None, entry2: str = None, entry_split: str = None, tp_split: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, notes: str = None):
+async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry_type: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, sl_condition: str = None, entry2: str = None, entry_split: str = None, tp_split: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, tp4: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message(f"Only members with the **{ANALYST_ROLE_NAME}** role can post setups.", ephemeral=True)
         return
@@ -2702,7 +2705,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     tp_plan = None
     if tp_split:
         nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", tp_split)]
-        n_tps = sum(1 for x in (tp1, tp2, tp3) if x)
+        n_tps = sum(1 for x in (tp1, tp2, tp3, tp4) if x)
         if not nums or len(nums) != n_tps:
             await interaction.followup.send(
                 f"tp_split has {len(nums)} number(s) but you set {n_tps} TP level(s) - they must match (e.g. `25/50/25` for 3 TPs).",
@@ -2725,7 +2728,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
         "pair": pair, "direction": direction.value, "timeframe": timeframe,
         "framework": frameworks[0] if frameworks else None, "frameworks": frameworks, "setup_detail": setup_detail,
         "entry": entry, "entry2": entry2, "entry_split": split_disp, "tp_split": tp_plan, "sl": stop_loss, "entry_type": "MARKET" if is_market else "LIMIT",
-        "tp1": tp1, "tp2": tp2, "tp3": tp3, "risk": risk, "notes": notes,
+        "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4, "risk": risk, "notes": notes,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "entry1_filled": bool(is_market), "entry2_filled": False,
         "tp1_hit": False, "tp2_hit": False, "tp3_hit": False, "sl_hit": False, "be": False,
@@ -2965,15 +2968,17 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
     await ch.send(embed=e)
 
 
-@bot.tree.command(name="spot_update", description="Update a spot play (avg, status, target hit, note)")
+@bot.tree.command(name="spot_update", description="Update or close a spot play - fills, sells, targets, status, close/invalidate")
 @app_commands.describe(
     play="Pick an active spot play",
-    avg_entry="New average entry after DCA (optional)",
+    avg_entry="New average entry after a DCA fill (optional)",
     status="New phase (optional)",
     target_hit="Mark a target as reached (optional)",
     sold_pct="Partial sell - % of the bag sold (e.g. 30). Pair with sell_price",
     sell_price="Partial sell - price sold at (required with sold_pct)",
     zone_filled="Mark DCA zone fully filled (optional)",
+    close="CLOSE the play right here - Win / Loss / BE / Invalidated (zone never filled)",
+    avg_exit="With close: average exit price (auto from partial sells if blank)",
     note="Update note (optional)",
 )
 @app_commands.choices(
@@ -2984,9 +2989,15 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
         app_commands.Choice(name="Target 3", value="t3"),
     ],
     zone_filled=[app_commands.Choice(name="Yes", value="yes")],
+    close=[
+        app_commands.Choice(name="Close - Win", value="WIN"),
+        app_commands.Choice(name="Close - Loss", value="LOSS"),
+        app_commands.Choice(name="Close - Breakeven", value="BE"),
+        app_commands.Choice(name="Invalidated - zone never filled / thesis gone", value="INVALID"),
+    ],
 )
 @app_commands.autocomplete(play=open_spot_ac)
-async def spot_update(interaction: discord.Interaction, play: str, avg_entry: str = None, status: app_commands.Choice[str] = None, target_hit: app_commands.Choice[str] = None, sold_pct: str = None, sell_price: str = None, zone_filled: app_commands.Choice[str] = None, note: str = None):
+async def spot_update(interaction: discord.Interaction, play: str, avg_entry: str = None, status: app_commands.Choice[str] = None, target_hit: app_commands.Choice[str] = None, sold_pct: str = None, sell_price: str = None, zone_filled: app_commands.Choice[str] = None, close: app_commands.Choice[str] = None, avg_exit: str = None, note: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -3020,6 +3031,13 @@ async def spot_update(interaction: discord.Interaction, play: str, avg_entry: st
             return
         p.setdefault("sells", []).append({"pct": round(sp, 1), "price": px})
         changes.append(f"sold {sp:g}% @ {px:g}")
+    if close is not None:
+        if changes:
+            data[play] = p
+            save_spot(data)
+        await _spot_do_close(interaction, data, play, p, close.value,
+                             result_pct=None, avg_exit=avg_exit, note=note)
+        return
     if not changes and not note:
         await interaction.followup.send("Nothing to update - fill at least one field.", ephemeral=True)
         return
@@ -3035,13 +3053,65 @@ async def spot_update(interaction: discord.Interaction, play: str, avg_entry: st
     await interaction.followup.send(f"Play updated: {', '.join(changes) if changes else 'note added'}", ephemeral=True)
 
 
-@bot.tree.command(name="spot_close", description="Close a spot play")
+async def _spot_do_close(interaction, data, play, p, result_value, result_pct=None, avg_exit=None, note=None):
+    """Shared close/invalidate flow for /spot_close and /spot_update close option."""
+    if avg_exit is None and spot_weighted_exit(p):
+        avg_exit = f"{spot_weighted_exit(p):g}"
+    had_position = bool(spot_num(p.get("avg_entry")) or p.get("zone_filled") or (p.get("sells") or []))
+    if result_value == "INVALID" and had_position and spot_num(avg_exit) is None:
+        await interaction.followup.send(
+            "This play had fills - **avg_exit is required** on invalidation so the journal records where you cut.",
+            ephemeral=True,
+        )
+        return False
+    if result_value in ("WIN", "LOSS", "BE") and not had_position:
+        await interaction.followup.send(
+            "This play never filled - close it as **Invalidated** (zone never filled) instead of a result.",
+            ephemeral=True,
+        )
+        return False
+    if result_pct is None:
+        ref = spot_ref_entry(p)
+        ex = spot_num(avg_exit)
+        if ref and ex and ref > 0:
+            result_pct = f"{(ex - ref) / ref * 100:+.1f}%"
+    p["closed"] = True
+    p["result"] = result_value
+    p["result_pct"] = result_pct
+    p["avg_exit"] = avg_exit
+    p["closed_at"] = datetime.now(timezone.utc).isoformat()
+    if note:
+        p["close_note"] = note
+    elif result_value == "INVALID" and not had_position:
+        p["close_note"] = "Zone never filled - play cancelled before entry"
+        p["status"] = "INVALIDATED"
+    data[play] = p
+    save_spot(data)
+    await refresh_and_edit(p, spot_mode=True)
+    await refresh_spot_board()
+    ptxt = f" ({result_pct})" if result_pct else ""
+    feed = {
+        "WIN": (f"Spot Closed - Win{ptxt}", GREEN, "Play closed in profit."),
+        "LOSS": (f"Spot Closed - Loss{ptxt}", RED, "Play closed at a loss."),
+        "BE": ("Spot Closed - Breakeven", GREY, "Play closed flat."),
+        "INVALID": ("Spot Invalidated", DGREY, "Thesis invalidated."),
+    }
+    title, color, line = feed[result_value]
+    if note:
+        line += f"\n> {note}"
+    await post_update_feed(p, title, color, line, footer="Sigma Trading - Spot Plays")
+    await thread_note(p, f"**Closed - {result_value}{ptxt}**" + (f" - {note}" if note else ""))
+    await interaction.followup.send(f"Play closed: {result_value}{ptxt}", ephemeral=True)
+    return True
+
+
+@bot.tree.command(name="spot_close", description="Close OR invalidate a spot play (win / loss / BE / zone never filled)")
 @app_commands.describe(play="Pick an active spot play", result="Outcome", result_pct="Manual override - auto-calculated from entry/exit if blank", avg_exit="Average exit price (auto from partial sells if blank)", note="Closing note (optional)")
 @app_commands.choices(result=[
     app_commands.Choice(name="Win", value="WIN"),
     app_commands.Choice(name="Loss", value="LOSS"),
     app_commands.Choice(name="Breakeven", value="BE"),
-    app_commands.Choice(name="Invalidated", value="INVALID"),
+    app_commands.Choice(name="Invalidated - zone never filled / thesis gone", value="INVALID"),
 ])
 @app_commands.autocomplete(play=open_spot_ac)
 async def spot_close(interaction: discord.Interaction, play: str, result: app_commands.Choice[str], result_pct: str = None, avg_exit: str = None, note: str = None):
@@ -3054,46 +3124,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     if not p:
         await interaction.followup.send("Play not found.", ephemeral=True)
         return
-    # auto avg_exit from recorded partial sells if not given
-    if avg_exit is None and spot_weighted_exit(p):
-        avg_exit = f"{spot_weighted_exit(p):g}"
-    had_position = bool(spot_num(p.get("avg_entry")) or p.get("zone_filled") or (p.get("sells") or []))
-    if result.value == "INVALID" and had_position and spot_num(avg_exit) is None:
-        await interaction.followup.send(
-            "This play had fills - **avg_exit is required** on invalidation so the journal records where you cut.",
-            ephemeral=True,
-        )
-        return
-    # auto result % from entry vs exit when not manually given
-    if result_pct is None:
-        ref = spot_ref_entry(p)
-        ex = spot_num(avg_exit)
-        if ref and ex and ref > 0:
-            result_pct = f"{(ex - ref) / ref * 100:+.1f}%"
-    p["closed"] = True
-    p["result"] = result.value
-    p["result_pct"] = result_pct
-    p["avg_exit"] = avg_exit
-    p["closed_at"] = datetime.now(timezone.utc).isoformat()
-    if note:
-        p["close_note"] = note
-    data[play] = p
-    save_spot(data)
-    await refresh_and_edit(p, spot_mode=True)
-    await refresh_spot_board()
-    ptxt = f" ({result_pct})" if result_pct else ""
-    feed = {
-        "WIN": (f"Spot Closed - Win{ptxt}", GREEN, "Play closed in profit."),
-        "LOSS": (f"Spot Closed - Loss{ptxt}", RED, "Play closed at a loss."),
-        "BE": ("Spot Closed - Breakeven", GREY, "Play closed flat."),
-        "INVALID": ("Spot Invalidated", DGREY, "Thesis invalidated."),
-    }
-    title, color, line = feed[result.value]
-    if note:
-        line += f"\n> {note}"
-    await post_update_feed(p, title, color, line, footer="Sigma Trading - Spot Plays")
-    await thread_note(p, f"**Closed - {result.value}{ptxt}**" + (f" - {note}" if note else ""))
-    await interaction.followup.send(f"Play closed: {result.value}{ptxt}", ephemeral=True)
+    await _spot_do_close(interaction, data, play, p, result.value, result_pct, avg_exit, note)
 
 
 @bot.tree.command(name="edit", description="Fix a mistake in a recently posted trade or spot play (within the edit window)")
@@ -3112,6 +3143,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     tp1="Corrected TP1 / Target 1 (optional)",
     tp2="Corrected TP2 / Target 2 (optional)",
     tp3="Corrected TP3 / Target 3 (optional)",
+    tp4="Corrected TP4 - futures only (optional)",
     timeframe="Corrected timeframe - futures only (optional)",
     setup_detail="Corrected setup detail - futures only (optional)",
     notes="Corrected reasoning / thesis (optional, posted in the thread)",
@@ -3126,7 +3158,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     ],
 )
 @app_commands.autocomplete(trade=editable_any_ac)
-async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, entry_split: str = None, tp_split: str = None, stop_loss: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
+async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, entry_split: str = None, tp_split: str = None, stop_loss: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, tp4: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -3189,7 +3221,7 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
                 t["tp_split"] = None; changes.append("TP split removed")
             else:
                 nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", raw)]
-                n_tps = sum(1 for k2 in ("tp1", "tp2", "tp3") if t.get(k2))
+                n_tps = sum(1 for k2 in ("tp1", "tp2", "tp3", "tp4") if t.get(k2))
                 if nums and len(nums) == n_tps and 0 < sum(nums) <= 100.5:
                     t["tp_split"] = [round(x, 1) for x in nums]; changes.append("TP split")
         if stop_loss is not None:
@@ -3215,6 +3247,8 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
             t["tp2"] = tp2; changes.append("TP2")
         if tp3 is not None:
             t["tp3"] = tp3; changes.append("TP3")
+        if tp4 is not None:
+            t["tp4"] = tp4; changes.append("TP4")
         if timeframe is not None:
             t["timeframe"] = timeframe; changes.append("timeframe")
         if setup_detail is not None:
@@ -3280,6 +3314,7 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     app_commands.Choice(name="TP1 Hit", value="TP1"),
     app_commands.Choice(name="TP2 Hit", value="TP2"),
     app_commands.Choice(name="TP3 Hit", value="TP3"),
+    app_commands.Choice(name="TP4 Hit", value="TP4"),
     app_commands.Choice(name="Partial TP (custom price)", value="PTP"),
     app_commands.Choice(name="SL Moved to Entry (Risk-Free)", value="BE"),
     app_commands.Choice(name="SL Updated (new level/condition)", value="SLU"),
@@ -3336,15 +3371,14 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         t["entry2_filled"] = True
         t["entry1_filled"] = True
         desc = "DCA entry filled - full position live"
-    elif ev in ("TP1", "TP2", "TP3"):
-        keymap = {"TP1": "tp1", "TP2": "tp2", "TP3": "tp3"}
+    elif ev in ("TP1", "TP2", "TP3", "TP4"):
+        keymap = {"TP1": "tp1", "TP2": "tp2", "TP3": "tp3", "TP4": "tp4"}
         k = keymap[ev]
         t[f"{k}_hit"] = True
         t["entry1_filled"] = True
-        if ev == "TP2":
-            t["tp1_hit"] = True
-        if ev == "TP3":
-            t["tp1_hit"] = True; t["tp2_hit"] = True
+        order = ("TP1", "TP2", "TP3", "TP4")
+        for prev in order[:order.index(ev)]:
+            t[f"{keymap[prev]}_hit"] = True
         fill_price = px if px is not None else first_num(t.get(k))
         if fill_price is None:
             await interaction.followup.send(f"{ev} has no price set on the trade - pass `price` with this update.", ephemeral=True)
@@ -3352,7 +3386,7 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         t["fills"].append({"price": fill_price, "pct": pct, "label": ev})
         desc = f"{ev} hit @ {fnum(fill_price)} ({pct:g}%)"
     elif ev == "PTP":
-        slot = next((k for k in ("tp1", "tp2", "tp3") if t.get(k) and not t.get(f"{k}_hit")), None)
+        slot = next((k for k in ("tp1", "tp2", "tp3", "tp4") if t.get(k) and not t.get(f"{k}_hit")), None)
         if slot:
             t[f"{slot}_hit"] = True
             label = slot.upper()
@@ -6738,7 +6772,7 @@ def build_trades_csv(trades: list, analyst_name: str) -> io.BytesIO:
     buf = io.StringIO()
     w = _csv.writer(buf)
     w.writerow(["date", "analyst", "pair", "direction", "timeframe", "entry_type",
-                "entry", "entry2", "sl", "risk_pct", "tp1", "tp2", "tp3",
+                "entry", "entry2", "sl", "risk_pct", "tp1", "tp2", "tp3", "tp4",
                 "fills", "avg_exit", "result", "result_r", "status", "frameworks", "edited"])
     for t in trades:
         fills = "; ".join(f"{f.get('label','')}@{f.get('price','')}x{f.get('pct','')}%" for f in t.get("fills", []) or [])
@@ -6748,7 +6782,7 @@ def build_trades_csv(trades: list, analyst_name: str) -> io.BytesIO:
             created[:10], analyst_name, t.get("pair", ""), t.get("direction", ""),
             t.get("timeframe", ""), t.get("entry_type", ""),
             t.get("entry", ""), t.get("entry2", ""), t.get("sl", ""), t.get("risk", ""),
-            t.get("tp1", ""), t.get("tp2", ""), t.get("tp3", ""),
+            t.get("tp1", ""), t.get("tp2", ""), t.get("tp3", ""), t.get("tp4", ""),
             fills, t.get("avg_exit", ""), t.get("result", ""), t.get("result_r", ""),
             status, " + ".join(t.get("frameworks", []) or []), "yes" if t.get("edited") else "",
         ])
@@ -6772,22 +6806,47 @@ class StatsCSVView(View):
         await interaction.response.send_message(file=f, ephemeral=True)
 
 
-@bot.tree.command(name="stats", description="Trade journal scorecard (futures)")
-@app_commands.describe(analyst="Whose stats? (blank = your own)")
-async def stats(interaction: discord.Interaction, analyst: discord.Member = None):
+_PERIOD_CHOICES = [
+    app_commands.Choice(name="All time", value=0),
+    app_commands.Choice(name="Last 7 days", value=7),
+    app_commands.Choice(name="Last 30 days", value=30),
+    app_commands.Choice(name="Last 90 days", value=90),
+]
+
+
+def _in_period(item: dict, days: int) -> bool:
+    """True if the item's close falls inside the last `days` days (0 = all time)."""
+    if not days:
+        return True
+    try:
+        d = datetime.fromisoformat(item["closed_at"])
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d >= datetime.now(timezone.utc) - timedelta(days=days)
+    except Exception:
+        return False
+
+
+@bot.tree.command(name="stats", description="Trade journal scorecard (futures) - all time / last week / last month")
+@app_commands.describe(analyst="Whose stats? (blank = your own)", period="Time window (blank = all time)")
+@app_commands.choices(period=_PERIOD_CHOICES)
+async def stats(interaction: discord.Interaction, analyst: discord.Member = None,
+                period: app_commands.Choice[int] = None):
     await interaction.response.defer(ephemeral=True)
     target = analyst or interaction.user
+    days = period.value if period else 0
+    plabel = period.name if period else "All time"
     data = load_trades()
     mine = [t for t in data.values() if t.get("analyst_id") == target.id]
     total = len(mine)
-    closed = [t for t in mine if t.get("closed")]
+    closed = [t for t in mine if t.get("closed") and _in_period(t, days)]
     wins = [t for t in closed if t["result"] == "WIN"]
     losses = [t for t in closed if t["result"] == "LOSS"]
     be = [t for t in closed if t["result"] == "BE"]
     invalid = [t for t in closed if t["result"] == "INVALID"]
     decided = len(wins) + len(losses)
     wr = (len(wins) / decided * 100) if decided else 0
-    tp1_rate = (sum(1 for t in mine if t.get("tp1_hit")) / total * 100) if total else 0
+    tp1_rate = (sum(1 for t in closed if t.get("tp1_hit")) / len(closed) * 100) if closed else 0
     rs = [t["result_r"] for t in closed if isinstance(t.get("result_r"), (int, float))]
     total_r = sum(rs) if rs else None
     avg_r = (sum(rs) / len(rs)) if rs else None
@@ -6797,10 +6856,10 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
         ecolor = discord.Color.from_str(analyst_color_hex(target))
     except Exception:
         ecolor = NAVY
-    embed = discord.Embed(title=f"Scorecard - {target.display_name}", color=ecolor)
-    embed.add_field(name="Total setups", value=str(total), inline=True)
-    embed.add_field(name="Closed", value=str(len(closed)), inline=True)
-    embed.add_field(name="Open", value=str(total - len(closed)), inline=True)
+    embed = discord.Embed(title=f"Scorecard - {target.display_name} \u00b7 {plabel}", color=ecolor)
+    embed.add_field(name="Total setups (all time)", value=str(total), inline=True)
+    embed.add_field(name=f"Closed ({plabel.lower()})", value=str(len(closed)), inline=True)
+    embed.add_field(name="Open now", value=str(sum(1 for t in mine if not t.get("closed"))), inline=True)
     embed.add_field(name="Win rate", value=(f"{wr:.0f}% ({len(wins)}W/{len(losses)}L)" if decided else "-"), inline=True)
     embed.add_field(name="TP1 hit rate", value=(f"{tp1_rate:.0f}%" if total else "-"), inline=True)
     embed.add_field(name="BE / Invalid", value=f"{len(be)} / {len(invalid)}", inline=True)
@@ -6813,15 +6872,19 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     await interaction.followup.send(embed=embed, view=StatsCSVView(mine, target.display_name), ephemeral=True)
 
 
-@bot.tree.command(name="spot_stats", description="Spot plays scorecard")
-@app_commands.describe(analyst="Whose stats? (blank = your own)")
-async def spot_stats(interaction: discord.Interaction, analyst: discord.Member = None):
+@bot.tree.command(name="spot_stats", description="Spot plays scorecard - all time / last week / last month")
+@app_commands.describe(analyst="Whose stats? (blank = your own)", period="Time window (blank = all time)")
+@app_commands.choices(period=_PERIOD_CHOICES)
+async def spot_stats(interaction: discord.Interaction, analyst: discord.Member = None,
+                     period: app_commands.Choice[int] = None):
     await interaction.response.defer(ephemeral=True)
     target = analyst or interaction.user
+    days = period.value if period else 0
+    plabel = period.name if period else "All time"
     data = load_spot()
     mine = [p for p in data.values() if p.get("analyst_id") == target.id]
     total = len(mine)
-    closed = [p for p in mine if p.get("closed")]
+    closed = [p for p in mine if p.get("closed") and _in_period(p, days)]
     wins = [p for p in closed if p["result"] == "WIN"]
     losses = [p for p in closed if p["result"] == "LOSS"]
     be = [p for p in closed if p["result"] == "BE"]
@@ -6832,7 +6895,7 @@ async def spot_stats(interaction: discord.Interaction, analyst: discord.Member =
         ecolor = discord.Color.from_str(analyst_color_hex(target))
     except Exception:
         ecolor = NAVY
-    embed = discord.Embed(title=f"Spot Scorecard - {target.display_name}", color=ecolor)
+    embed = discord.Embed(title=f"Spot Scorecard - {target.display_name} \u00b7 {plabel}", color=ecolor)
     embed.add_field(name="Total plays", value=str(total), inline=True)
     embed.add_field(name="Closed", value=str(len(closed)), inline=True)
     embed.add_field(name="Active", value=str(total - len(closed)), inline=True)
@@ -7352,306 +7415,80 @@ def make_monthly_recap_image(stats: dict) -> io.BytesIO:
     import matplotlib.patches as mpatches
     fams = _sigma_fonts()
     DISP, MONO = fams["disp"], fams["mono"]
+    LBL = "#A9B7C6"
     fig = plt.figure(figsize=(16, 9), facecolor=SIGMA_BG)
     ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 160); ax.set_ylim(0, 90); ax.axis("off")
 
     def box(x, y, w, h, fc=SIGMA_CARD, ec=SIGMA_SLATE):
-        ax.add_patch(mpatches.FancyBboxPatch((x, y), w, h,
-                     boxstyle="round,pad=0,rounding_size=1.6",
-                     facecolor=fc, edgecolor=ec, linewidth=1.4))
+        ax.add_patch(mpatches.FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0,rounding_size=1.4",
+                     facecolor=fc, edgecolor=ec, linewidth=1.3))
 
-    box(6, 80, 6.5, 6.5, fc=SIGMA_CYAN, ec=SIGMA_CYAN)
-    ax.plot([11.2, 7.5, 9.5, 7.5, 11.2], [85.2, 85.2, 83.25, 81.3, 81.3],
-            color=SIGMA_BG, lw=3.0, solid_capstyle="butt")
-    ax.text(14.5, 84.6, "SIGMA TRADING", color=SIGMA_PAPER, fontsize=17, family=DISP, va="center")
-    ax.text(14.5, 81.9, "setups, not signals", color=SIGMA_ASH, fontsize=9.5, family=MONO, va="center")
-    ax.text(154, 85.2, stats["month"].upper(), color=SIGMA_CYAN, fontsize=21, family=DISP, ha="right", va="center")
-    ax.text(154, 81.7, "MONTHLY RECAP", color=SIGMA_PAPER, fontsize=11, family=MONO, ha="right", va="center")
+    box(8, 80, 6.2, 6.2, fc=SIGMA_CYAN, ec=SIGMA_CYAN)
+    ax.plot([12.7, 9.3, 11.1, 9.3, 12.7], [84.9, 84.9, 83.1, 81.3, 81.3],
+            color=SIGMA_BG, lw=2.5, solid_capstyle="butt")
+    ax.text(16.5, 83.1, "SIGMA TRADING", color=SIGMA_PAPER, fontsize=15, family=DISP, va="center")
+    ax.text(152, 84.6, stats["month"].upper(), color=SIGMA_CYAN, fontsize=12, family=MONO, ha="right", va="center")
+    ax.text(152, 81.6, "MONTHLY RECAP \u00b7 THE DESK", color=LBL, fontsize=9, family=MONO, ha="right", va="center")
 
-    box(6, 14, 98, 60)
-    for name, x, al in [("ANALYST", 10, "left"), ("SETUPS", 42, "center"), ("WINS", 56, "center"),
-                        ("LOSS", 68, "center"), ("WR", 81, "center"), ("NET", 96, "right")]:
-        ax.text(x, 68.5, name, color=SIGMA_CYAN, fontsize=10.5, family=MONO, ha=al)
-    ax.plot([10, 100], [66, 66], color=SIGMA_SLATE, lw=1.2)
-    y = 60
-    for r in stats["rows"][:5]:
-        ax.text(10, y, r["name"], color=SIGMA_PAPER, fontsize=14, family=DISP, va="center")
-        ax.text(42, y, str(r["n"]), color=SIGMA_PAPER, fontsize=13.5, family=MONO, ha="center", va="center")
-        ax.text(56, y, str(r["w"]), color=SIGMA_GREEN, fontsize=13.5, family=MONO, ha="center", va="center")
-        ax.text(68, y, str(r["l"]), color=SIGMA_RED, fontsize=13.5, family=MONO, ha="center", va="center")
-        ax.text(81, y, f"{r['wr']:.0f}%", color=SIGMA_PAPER, fontsize=13.5, family=MONO, ha="center", va="center")
-        col = SIGMA_GREEN if r["r"] >= 0 else SIGMA_RED
-        ax.text(96, y, f"{r['r']:+.2f}R", color=col, fontsize=13.5, family=MONO, ha="right", va="center")
-        y -= 9.2
-    ax.text(10, 17.5, "BE / invalidated setups excluded from W-L \u00b7 every entry timestamped at post time",
-            color=SIGMA_ASH, fontsize=8.5, family=fams.get("txt", MONO))
-
-    box(110, 14, 44, 60)
-    ax.text(114, 68, stats["month"].split()[0].upper(), color=SIGMA_CYAN, fontsize=16, family=DISP)
-    ax.text(114, 63.5, "TRADING RECAP", color=SIGMA_PAPER, fontsize=11, family=DISP)
-    ax.plot([114, 150], [60.5, 60.5], color=SIGMA_SLATE, lw=1.2)
-    ax.text(114, 55, "SETUPS", color=SIGMA_ASH, fontsize=9, family=MONO)
-    ax.text(114, 50, str(stats["n"]), color=SIGMA_PAPER, fontsize=22, family=MONO)
-    ax.text(134, 55, "WIN RATE", color=SIGMA_ASH, fontsize=9, family=MONO)
-    ax.text(134, 50, f"{stats['wr']:.0f}%", color=SIGMA_PAPER, fontsize=22, family=MONO)
-    ax.text(114, 41, "NET", color=SIGMA_ASH, fontsize=9, family=MONO)
+    nrows = len(stats.get("rows", []))
+    ax.text(8, 70, "THE DESK", color=SIGMA_PAPER, fontsize=30, family=DISP)
     ncol = SIGMA_GREEN if stats["total_r"] >= 0 else SIGMA_RED
-    ax.text(114, 34.5, f"{stats['total_r']:+.2f}R", color=ncol, fontsize=30, family=MONO)
-    ax.text(114, 26, "BE / INVALIDATED", color=SIGMA_ASH, fontsize=9, family=MONO)
-    ax.text(114, 21.5, f"{stats['be']} / {stats['inv']}", color=SIGMA_PAPER, fontsize=16, family=MONO)
+    ax.text(7.6, 54, f"{stats['total_r']:+.2f}R", color=ncol, fontsize=46, family=MONO)
+    ax.text(8, 48.5, f"NET \u00b7 SUM OF ALL CLOSES \u00b7 {nrows} ANALYSTS", color=LBL, fontsize=8.6, family=MONO)
+    rows_l = [("SETUPS CLOSED", str(stats["n"])), ("WIN RATE, DECIDED", f"{stats['wr']:.0f}%"),
+              ("BE / INVALIDATED", f"{stats['be']} / {stats['inv']}")]
+    yy = 40
+    for k, v in rows_l:
+        ax.text(8, yy, k, color=LBL, fontsize=8.8, family=MONO)
+        ax.text(56, yy, v, color=SIGMA_PAPER, fontsize=11.5, family=MONO, ha="right")
+        yy -= 5.4
 
-    ax.text(80, 7, "wins and losses both logged \u00b7 the log is public in results-board \u00b7 not financial advice",
-            color=SIGMA_ASH, fontsize=10, family=fams.get("txt", MONO), ha="center")
+    # right: BY ANALYST table
+    tx = 68
+    ax.text(tx, 70, "BY ANALYST", color=SIGMA_CYAN, fontsize=9.5, family=MONO)
+    ax.text(152, 70, "every row from the public board", color=LBL, fontsize=8, family=MONO, ha="right")
+    cols = [("ANALYST", tx, "left"), ("SETUPS", tx + 42, "center"), ("W", tx + 54, "center"),
+            ("L", tx + 62, "center"), ("WR", tx + 72, "center"), ("NET", 152, "right")]
+    hy = 64
+    for lab, x, ha in cols:
+        ax.text(x, hy, lab, color=SIGMA_CYAN, fontsize=7.8, family=MONO, ha=ha)
+    ax.plot([tx, 152], [hy - 2, hy - 2], color=SIGMA_SLATE, lw=1.1)
+    ry = hy - 8.5
+    for r in stats["rows"][:5]:
+        ax.text(tx, ry, r["name"], color=SIGMA_PAPER, fontsize=13, family=DISP)
+        ax.text(tx + 42, ry, str(r["n"]), color=SIGMA_PAPER, fontsize=11, family=MONO, ha="center")
+        ax.text(tx + 54, ry, str(r["w"]), color=SIGMA_GREEN, fontsize=11, family=MONO, ha="center")
+        ax.text(tx + 62, ry, str(r["l"]), color=SIGMA_RED, fontsize=11, family=MONO, ha="center")
+        ax.text(tx + 72, ry, f"{r['wr']:.0f}%", color=SIGMA_PAPER, fontsize=11, family=MONO, ha="center")
+        rcol = SIGMA_GREEN if r["r"] >= 0 else SIGMA_RED
+        ax.text(152, ry, f"{r['r']:+.2f}R", color=rcol, fontsize=11.5, family=MONO, ha="right")
+        ax.plot([tx, 152], [ry - 2.6, ry - 2.6], color=SIGMA_SLATE, lw=0.8, alpha=0.5)
+        ry -= 8.2
+    ax.text(tx, ry - 1, "losses on the board too \u2014 that's the point.",
+            color=LBL, fontsize=8.6, family=fams.get("txt", MONO))
+
+    ax.plot([8, 152], [30, 30], color=SIGMA_SLATE, lw=1.2)
+    cells = [
+        ("ANALYSTS", str(nrows), SIGMA_PAPER),
+        ("SETUPS", str(stats["n"]), SIGMA_PAPER),
+        ("WIN RATE", f"{stats['wr']:.0f}%", SIGMA_PAPER),
+        ("NET", f"{stats['total_r']:+.2f}R", ncol),
+        ("EVERY RESULT", "logged", SIGMA_CYAN),
+    ]
+    for i, (k, v, col) in enumerate(cells):
+        x = 8 + i * 29.6
+        box(x, 12, 26.6, 12.5)
+        ax.text(x + 2.4, 20.6, k, color=LBL, fontsize=7.4, family=MONO)
+        ax.text(x + 2.4, 15.6, v, color=col, fontsize=10.4, family=MONO)
+
+    ax.text(80, 7, "every setup logged by a bot at post time \u00b7 the full log is public \u00b7 CSV export in results-board",
+            color=LBL, fontsize=8.2, family=MONO, ha="center")
+    ax.text(80, 3.2, "SETUPS, NOT SIGNALS", color=SIGMA_CYAN, fontsize=8.2, family=MONO, ha="center")
     buf = io.BytesIO()
-    fig.savefig(buf, dpi=120, facecolor=SIGMA_BG)
+    fig.savefig(buf, dpi=110, facecolor=SIGMA_BG)
     plt.close(fig)
     buf.seek(0)
     return buf
-
-
-ANALYST_JOURNAL_CHANNEL_IDS: dict[int, int] = {}   # analyst_id -> channel_id; empty = post to RECAP_CHANNEL_ID
-
-
-def _analyst_month_stats(analyst_id: int, start, end):
-    entries = []
-    for k, mid, t in _res_all_closed():
-        if t.get("analyst_id") != analyst_id:
-            continue
-        try:
-            d = datetime.fromisoformat(t["closed_at"])
-            if d.tzinfo is None:
-                d = d.replace(tzinfo=timezone.utc)
-            if start <= d.astimezone(IST) < end:
-                entries.append((k, mid, t))
-        except Exception:
-            continue
-    if not entries:
-        return None
-    tot = _res_totals(entries)
-    longs  = [(k, m, t) for k, m, t in entries if t.get("direction") == "LONG"]
-    shorts = [(k, m, t) for k, m, t in entries if t.get("direction") == "SHORT"]
-    def _wr(sub):
-        w = sum(1 for _, _, t in sub if t.get("result") == "WIN")
-        l = sum(1 for _, _, t in sub if t.get("result") == "LOSS")
-        return (w / (w + l) * 100) if (w + l) else 0
-    win_rs  = [t.get("result_r") for k, _, t in entries if k == "fut"
-               and t.get("result") == "WIN" and isinstance(t.get("result_r"), (int, float))]
-    loss_rs = [t.get("result_r") for k, _, t in entries if k == "fut"
-               and t.get("result") == "LOSS" and isinstance(t.get("result_r"), (int, float))]
-    best = None
-    for k, _, t in entries:
-        if k == "fut" and isinstance(t.get("result_r"), (int, float)):
-            if best is None or t["result_r"] > best[0]:
-                best = (t["result_r"], t.get("pair", "?"), t.get("direction", ""))
-    pair_counts = {}
-    for _, _, t in entries:
-        p = (t.get("pair") or "?").upper()
-        pair_counts[p] = pair_counts.get(p, 0) + 1
-    top_pair, top_n = max(pair_counts.items(), key=lambda x: x[1]) if pair_counts else ("\u2014", 0)
-    log = []
-    for k, _, t in sorted(entries, key=lambda x: x[2].get("closed_at") or ""):
-        res = {"WIN": "W", "LOSS": "L", "BE": "BE", "INVALID": "INV"}.get(t.get("result"), "?")
-        rv = None
-        if k == "fut" and isinstance(t.get("result_r"), (int, float)):
-            rtxt = f"{t['result_r']:+.2f}"; rv = float(t["result_r"])
-        elif k == "spot" and isinstance(t.get("result_pct"), (int, float)):
-            rtxt = f"{t['result_pct']:+.1f}%"
-        else:
-            rtxt = "\u2014"
-        try:
-            dtxt = datetime.fromisoformat(t["closed_at"]).astimezone(IST).strftime("%d %b")
-        except Exception:
-            dtxt = "\u2014"
-        log.append({"pair": t.get("pair", "?"), "side": (t.get("direction") or "").title() or "Spot",
-                    "res": res, "r": rtxt, "rv": rv, "date": dtxt})
-    an = next((t.get("analyst_name") for _, _, t in entries if t.get("analyst_name")), "Analyst")
-    return {"analyst": an.upper(), "n": tot["n"], "w": tot["wins"], "l": tot["losses"],
-            "be": tot["be"], "inv": tot["inv"], "wr": tot["wr"], "net": tot["total_r"],
-            "longs": len(longs), "shorts": len(shorts),
-            "wr_long": _wr(longs), "wr_short": _wr(shorts),
-            "avg_w": (sum(win_rs) / len(win_rs)) if win_rs else 0.0,
-            "avg_l": (sum(loss_rs) / len(loss_rs)) if loss_rs else 0.0,
-            "hl1_label": "BEST SETUP",
-            "hl1_value": (f"{best[0]:+.2f}R" if best else "\u2014"),
-            "hl1_sub": (f"{best[1]} {best[2].lower()}" if best else ""),
-            "hl2_label": "MOST TRADED", "hl2_value": top_pair.split("/")[0],
-            "hl2_sub": f"{top_n} of {tot['n']} setups", "log": log}
-
-
-def make_analyst_month_image(s: dict) -> io.BytesIO:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    fams = _sigma_fonts()
-    DISP, MONO = fams["disp"], fams["mono"]
-    TXT = fams.get("txt", MONO)
-    SIGMA_ASH = "#A9B7C6"  # journal card: brighter labels for readability
-
-    rows = s["log"][:40]
-    rowh = 3.0
-    H = 130 + 10 + len(rows)*rowh
-    W = 100
-    fig = plt.figure(figsize=(W/10, H/10), facecolor=SIGMA_BG)
-    ax = fig.add_axes([0,0,1,1]); ax.set_xlim(0,W); ax.set_ylim(0,H); ax.axis("off")
-    def box(x,y,w,h,fc=SIGMA_CARD,ec=SIGMA_SLATE,lw=1.1):
-        ax.add_patch(mpatches.FancyBboxPatch((x,y),w,h,boxstyle="round,pad=0,rounding_size=1.2",
-                     facecolor=fc,edgecolor=ec,linewidth=lw))
-    T = H
-
-    # ── header: badge + analyst as the title, month under ──
-    box(8, T-14, 7, 7, fc=SIGMA_CYAN, ec=SIGMA_CYAN)
-    ax.plot([13.2,9.4,11.4,9.4,13.2],[T-8.6,T-8.6,T-10.5,T-12.4,T-12.4],color=SIGMA_BG,lw=2.6,solid_capstyle="butt")
-    ax.text(17.5, T-9.2, "SIGMA TRADING", color=SIGMA_PAPER, fontsize=12, family=DISP, va="center")
-    ax.text(17.5, T-12.6, "the month, logged", color=SIGMA_ASH, fontsize=8.4, family=MONO, va="center")
-    ax.text(92, T-10.8, s["month"].upper(), color=SIGMA_CYAN, fontsize=11, family=MONO, ha="right", va="center")
-    ax.text(8, T-24, s["analyst"], color=SIGMA_PAPER, fontsize=30, family=DISP)
-    ax.text(8, T-29, "every number below is from the public board \u2014 nothing typed in by hand",
-            color=SIGMA_ASH, fontsize=8.4, family=TXT)
-
-    # ── hero: NET giant + counters ──
-    hy = T-36
-    ax.text(8, hy-11, f"{s['net']:+.2f}R", color=(SIGMA_GREEN if s["net"]>=0 else SIGMA_RED), fontsize=42, family=MONO)
-    ax.text(8, hy-16.5, "NET \u00b7 SUM OF ALL CLOSES", color=SIGMA_ASH, fontsize=8.6, family=MONO)
-    for i,(k,v) in enumerate([("SETUPS CLOSED", str(s["n"])),
-                               ("WIN RATE, DECIDED", f"{s['wr']:.0f}%"),
-                               ("W / L / BE / INV", f"{s['w']}/{s['l']}/{s['be']}/{s['inv']}")]):
-        x = 55 + 0
-        yy = hy - 3 - i*5.6
-        ax.text(55, yy, k, color=SIGMA_ASH, fontsize=8.8, family=MONO)
-        ax.text(92, yy, v, color=SIGMA_PAPER, fontsize=11, family=MONO, ha="right")
-
-    # ── R-TAPE: one bar per close, in order ──
-    ty = hy-25
-    ax.text(8, ty, "THE TAPE", color=SIGMA_CYAN, fontsize=9.3, family=MONO)
-    ax.text(92, ty, "one bar per close, in order \u00b7 height = R", color=SIGMA_ASH, fontsize=8, family=MONO, ha="right")
-    base_y = ty-11
-    ax.plot([8,92],[base_y,base_y], color=SIGMA_SLATE, lw=1)
-    rs = [r.get("rv") for r in rows]
-    mx = max((abs(v) for v in rs if v is not None), default=1) or 1
-    bw = min(3.2, 84/max(len(rows),1) * 0.62)
-    step = 84/max(len(rows),1)
-    for i, r in enumerate(rows):
-        x = 8 + i*step + (step-bw)/2
-        v = r.get("rv")
-        if v is None:
-            ax.add_patch(mpatches.Rectangle((x, base_y-0.5), bw, 1.0, facecolor=SIGMA_SLATE, edgecolor="none"))
-            continue
-        h = max(0.6, abs(v)/mx*7.5)
-        col = SIGMA_GREEN if v > 0 else (SIGMA_RED if v < 0 else SIGMA_SLATE)
-        y = base_y if v >= 0 else base_y-h
-        ax.add_patch(mpatches.Rectangle((x, y), bw, h, facecolor=col, edgecolor="none"))
-
-    # ── direction split: two panels ──
-    dy = base_y-14
-    box(8, dy-14, 41, 12.5)
-    ax.text(10.5, dy-4.5, "LONGS", color=SIGMA_GREEN, fontsize=9.3, family=MONO)
-    ax.text(10.5, dy-9.5, f"{s['longs']}", color=SIGMA_PAPER, fontsize=15, family=MONO)
-    ax.text(47, dy-4.5, "WIN RATE", color=SIGMA_ASH, fontsize=7.4, family=MONO, ha="right")
-    ax.text(47, dy-9.5, f"{s['wr_long']:.0f}%", color=SIGMA_PAPER, fontsize=15, family=MONO, ha="right")
-    box(51, dy-14, 41, 12.5)
-    ax.text(53.5, dy-4.5, "SHORTS", color=SIGMA_RED, fontsize=9.3, family=MONO)
-    ax.text(53.5, dy-9.5, f"{s['shorts']}", color=SIGMA_PAPER, fontsize=15, family=MONO)
-    ax.text(90, dy-4.5, "WIN RATE", color=SIGMA_ASH, fontsize=7.4, family=MONO, ha="right")
-    ax.text(90, dy-9.5, f"{s['wr_short']:.0f}%", color=SIGMA_PAPER, fontsize=15, family=MONO, ha="right")
-
-    # ── the shape of it: avg win vs avg loss + payoff ──
-    sy = dy-20
-    ax.text(8, sy, "THE SHAPE OF IT", color=SIGMA_CYAN, fontsize=9.3, family=MONO)
-    aw, al = s["avg_w"], abs(s["avg_l"]) or 0.0001
-    payoff = aw/al if al else 0
-    ax.text(8, sy-5.5, "AVG WIN", color=SIGMA_ASH, fontsize=8.6, family=MONO)
-    ax.text(30, sy-5.5, f"{aw:+.2f}R", color=SIGMA_GREEN, fontsize=10.5, family=MONO, ha="right")
-    ax.text(38, sy-5.5, "AVG LOSS", color=SIGMA_ASH, fontsize=8.6, family=MONO)
-    ax.text(60, sy-5.5, f"{s['avg_l']:+.2f}R", color=SIGMA_RED, fontsize=10.5, family=MONO, ha="right")
-    ax.text(68, sy-5.5, "PAYOFF", color=SIGMA_ASH, fontsize=8.6, family=MONO)
-    ax.text(92, sy-5.5, f"{payoff:.1f} : 1", color=SIGMA_CYAN, fontsize=10.5, family=MONO, ha="right")
-    # proportional bars
-    tot = aw+al
-    if tot > 0:
-        wfrac = aw/tot*84
-        ax.add_patch(mpatches.Rectangle((8, sy-9.5), wfrac, 1.6, facecolor=SIGMA_GREEN, edgecolor="none"))
-        ax.add_patch(mpatches.Rectangle((8+wfrac, sy-9.5), 84-wfrac, 1.6, facecolor=SIGMA_RED, edgecolor="none", alpha=0.85))
-
-    # ── worth noting ──
-    wy = sy-15
-    ax.text(8, wy, "WORTH NOTING", color=SIGMA_CYAN, fontsize=9.3, family=MONO)
-    ax.text(8, wy-5.5, "BEST CLOSE", color=SIGMA_ASH, fontsize=8.6, family=MONO)
-    ax.text(8, wy-10.5, s["hl1_value"], color=SIGMA_GREEN, fontsize=13, family=MONO)
-    ax.text(8, wy-14, s["hl1_sub"], color=SIGMA_ASH, fontsize=8.2, family=TXT)
-    ax.text(51, wy-5.5, "MOST VISITED", color=SIGMA_ASH, fontsize=8.6, family=MONO)
-    ax.text(51, wy-10.5, s["hl2_value"], color=SIGMA_PAPER, fontsize=13, family=MONO)
-    ax.text(51, wy-14, s["hl2_sub"], color=SIGMA_ASH, fontsize=8.2, family=TXT)
-
-    # ── the log ──
-    ly = wy-20
-    ax.text(8, ly, "THE LOG", color=SIGMA_CYAN, fontsize=9.3, family=MONO)
-    ax.text(92, ly, "as recorded \u00b7 closed order", color=SIGMA_ASH, fontsize=8, family=MONO, ha="right")
-    ty2 = ly-5
-    box(8, ty2-3.2, 84, 4, fc="#1B222C", ec=SIGMA_SLATE)
-    for lab, x, ha in [("CLOSED",12,"left"),("SETUP",32,"left"),("SIDE",58,"center"),("CLOSE",72,"center"),("R",88,"right")]:
-        ax.text(x, ty2-1.9, lab, color=SIGMA_CYAN, fontsize=8.6, family=MONO, ha=ha)
-    ry = ty2-6.6
-    for i,r in enumerate(rows):
-        if i % 2 == 0:
-            ax.add_patch(mpatches.Rectangle((8, ry-1.1), 84, rowh, facecolor="#10161E", edgecolor="none"))
-        ax.text(12, ry, r.get("date","\u2014"), color=SIGMA_ASH, fontsize=8.8, family=MONO)
-        ax.text(32, ry, r["pair"], color=SIGMA_PAPER, fontsize=9.0, family=MONO)
-        ax.text(58, ry, r["side"][0] if r["side"] else "?", color=(SIGMA_GREEN if r["side"]=="Long" else (SIGMA_RED if r["side"]=="Short" else SIGMA_ASH)), fontsize=9.0, family=MONO, ha="center")
-        rescol = {"W":SIGMA_GREEN,"L":SIGMA_RED}.get(r["res"], SIGMA_ASH)
-        ax.text(72, ry, r["res"], color=rescol, fontsize=9.0, family=MONO, ha="center")
-        rc = SIGMA_GREEN if r["r"].startswith("+") else (SIGMA_RED if r["r"].startswith("-") else SIGMA_ASH)
-        ax.text(88, ry, r["r"], color=rc, fontsize=9.0, family=MONO, ha="right")
-        ry -= rowh
-
-    ax.plot([8,92],[ry+0.5,ry+0.5], color=SIGMA_SLATE, lw=1)
-    ax.text(50, ry-4, "logged at post time \u00b7 the full board is public \u00b7 CSV export in results-board",
-            color=SIGMA_ASH, fontsize=8.4, family=TXT, ha="center")
-    ax.text(50, ry-8.5, "SETUPS, NOT SIGNALS", color=SIGMA_CYAN, fontsize=8.8, family=MONO, ha="center")
-    buf = io.BytesIO(); fig.savefig(buf, dpi=140, facecolor=SIGMA_BG); plt.close(fig); buf.seek(0)
-    return buf
-
-
-async def post_analyst_journals(start=None, end=None, label=None) -> int:
-    if start is None:
-        start, end, _slug, label = _last_complete_month_range()
-    posted = 0
-    for aid in (RESULTS_ANALYST_IDS or set()):
-        stats = _analyst_month_stats(aid, start, end)
-        if not stats:
-            continue
-        stats["month"] = label or start.strftime("%B %Y")
-        ch = bot.get_channel(ANALYST_JOURNAL_CHANNEL_IDS.get(aid) or RECAP_CHANNEL_ID or RESULTS_CHANNEL_ID)
-        if ch is None:
-            continue
-        try:
-            buf = await asyncio.to_thread(make_analyst_month_image, stats)
-            await ch.send(content=f"**{stats['analyst'].title()} \u2014 {stats['month']}** \u00b7 "
-                                  f"{stats['n']} setups, {stats['net']:+.2f}R net.",
-                          file=discord.File(buf, filename=f"journal_{stats['analyst'].lower()}.png"))
-            posted += 1
-            await asyncio.sleep(1.5)
-        except Exception as e:
-            print(f"[journal] error for {aid}: {e}", flush=True)
-    return posted
-
-
-@bot.tree.command(name="journal_month",
-                  description="(Admin) Post per-analyst monthly journal cards (default: last complete month)")
-@app_commands.describe(days="Use last N days instead of last complete month")
-async def journal_month_cmd(interaction: discord.Interaction, days: int = 0):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Admins only.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    if days and days > 0:
-        end = datetime.now(IST)
-        start = end - timedelta(days=min(days, 365))
-        n = await post_analyst_journals(start, end, f"Last {min(days,365)} days")
-    else:
-        n = await post_analyst_journals()
-    await interaction.followup.send(f"Posted {n} journal card(s)." if n else
-                                    "No closed setups for any analyst in that range.", ephemeral=True)
 
 
 async def post_monthly_recap(start=None, end=None, label=None) -> bool:
