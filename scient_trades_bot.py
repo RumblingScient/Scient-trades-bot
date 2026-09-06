@@ -7491,6 +7491,201 @@ def make_monthly_recap_image(stats: dict) -> io.BytesIO:
     return buf
 
 
+ANALYST_JOURNAL_CHANNEL_IDS: dict[int, int] = {}   # analyst_id -> channel_id; empty = post to RECAP_CHANNEL_ID
+
+
+def _analyst_month_stats(analyst_id: int, start, end):
+    entries = []
+    for k, mid, t in _res_all_closed():
+        if t.get("analyst_id") != analyst_id:
+            continue
+        try:
+            d = datetime.fromisoformat(t["closed_at"])
+            if d.tzinfo is None:
+                d = d.replace(tzinfo=timezone.utc)
+            if start <= d.astimezone(IST) < end:
+                entries.append((k, mid, t))
+        except Exception:
+            continue
+    if not entries:
+        return None
+    tot = _res_totals(entries)
+    longs  = [(k, m, t) for k, m, t in entries if t.get("direction") == "LONG"]
+    shorts = [(k, m, t) for k, m, t in entries if t.get("direction") == "SHORT"]
+    def _wr(sub):
+        w = sum(1 for _, _, t in sub if t.get("result") == "WIN")
+        l = sum(1 for _, _, t in sub if t.get("result") == "LOSS")
+        return (w / (w + l) * 100) if (w + l) else 0
+    win_rs  = [t.get("result_r") for k, _, t in entries if k == "fut"
+               and t.get("result") == "WIN" and isinstance(t.get("result_r"), (int, float))]
+    loss_rs = [t.get("result_r") for k, _, t in entries if k == "fut"
+               and t.get("result") == "LOSS" and isinstance(t.get("result_r"), (int, float))]
+    best = None
+    for k, _, t in entries:
+        if k == "fut" and isinstance(t.get("result_r"), (int, float)):
+            if best is None or t["result_r"] > best[0]:
+                best = (t["result_r"], t.get("pair", "?"), t.get("direction", ""))
+    pair_counts = {}
+    for _, _, t in entries:
+        p = (t.get("pair") or "?").upper()
+        pair_counts[p] = pair_counts.get(p, 0) + 1
+    top_pair, top_n = max(pair_counts.items(), key=lambda x: x[1]) if pair_counts else ("\u2014", 0)
+    log = []
+    for k, _, t in sorted(entries, key=lambda x: x[2].get("closed_at") or ""):
+        res = {"WIN": "W", "LOSS": "L", "BE": "BE", "INVALID": "INV"}.get(t.get("result"), "?")
+        rv = None
+        if k == "fut" and isinstance(t.get("result_r"), (int, float)):
+            rtxt = f"{t['result_r']:+.2f}"; rv = float(t["result_r"])
+        elif k == "spot" and isinstance(t.get("result_pct"), (int, float)):
+            rtxt = f"{t['result_pct']:+.1f}%"
+        else:
+            rtxt = "\u2014"
+        try:
+            dtxt = datetime.fromisoformat(t["closed_at"]).astimezone(IST).strftime("%d %b")
+        except Exception:
+            dtxt = "\u2014"
+        log.append({"pair": t.get("pair", "?"), "side": (t.get("direction") or "").title() or "Spot",
+                    "res": res, "r": rtxt, "rv": rv, "date": dtxt})
+    an = next((t.get("analyst_name") for _, _, t in entries if t.get("analyst_name")), "Analyst")
+    return {"analyst": an.upper(), "n": tot["n"], "w": tot["wins"], "l": tot["losses"],
+            "be": tot["be"], "inv": tot["inv"], "wr": tot["wr"], "net": tot["total_r"],
+            "longs": len(longs), "shorts": len(shorts),
+            "wr_long": _wr(longs), "wr_short": _wr(shorts),
+            "avg_w": (sum(win_rs) / len(win_rs)) if win_rs else 0.0,
+            "avg_l": (sum(loss_rs) / len(loss_rs)) if loss_rs else 0.0,
+            "hl1_value": (f"{best[0]:+.2f}R" if best else "\u2014"),
+            "hl1_sub": (f"{best[1]} {best[2].lower()}" if best else "\u2014"),
+            "hl2_value": top_pair.split("/")[0], "hl2_sub": f"{top_n} of {tot['n']} setups",
+            "log": log}
+
+
+def make_analyst_month_image(s: dict) -> io.BytesIO:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    fams = _sigma_fonts()
+    DISP, MONO = fams["disp"], fams["mono"]
+    TXTF = fams.get("txt", MONO)
+    LBL = "#A9B7C6"
+    fig = plt.figure(figsize=(16, 9), facecolor=SIGMA_BG)
+    ax = fig.add_axes([0, 0, 1, 1]); ax.set_xlim(0, 160); ax.set_ylim(0, 90); ax.axis("off")
+
+    def box(x, y, w, h, fc=SIGMA_CARD, ec=SIGMA_SLATE):
+        ax.add_patch(mpatches.FancyBboxPatch((x, y), w, h, boxstyle="round,pad=0,rounding_size=1.4",
+                     facecolor=fc, edgecolor=ec, linewidth=1.3))
+
+    box(8, 80, 6.2, 6.2, fc=SIGMA_CYAN, ec=SIGMA_CYAN)
+    ax.plot([12.7, 9.3, 11.1, 9.3, 12.7], [84.9, 84.9, 83.1, 81.3, 81.3],
+            color=SIGMA_BG, lw=2.5, solid_capstyle="butt")
+    ax.text(16.5, 83.1, "SIGMA TRADING", color=SIGMA_PAPER, fontsize=15, family=DISP, va="center")
+    ax.text(152, 84.6, s["month"].upper(), color=SIGMA_CYAN, fontsize=12, family=MONO, ha="right", va="center")
+    ax.text(152, 81.6, "MONTHLY JOURNAL", color=LBL, fontsize=9, family=MONO, ha="right", va="center")
+
+    ax.text(8, 70, s["analyst"], color=SIGMA_PAPER, fontsize=30, family=DISP)
+    ncol = SIGMA_GREEN if s["net"] >= 0 else SIGMA_RED
+    ax.text(7.6, 54, f"{s['net']:+.2f}R", color=ncol, fontsize=46, family=MONO)
+    ax.text(8, 48.5, "NET \u00b7 SUM OF ALL CLOSES", color=LBL, fontsize=8.6, family=MONO)
+    rows = [("SETUPS CLOSED", str(s["n"])), ("WIN RATE, DECIDED", f"{s['wr']:.0f}%"),
+            ("W / L / BE / INV", f"{s['w']} / {s['l']} / {s['be']} / {s['inv']}")]
+    yy = 40
+    for k, v in rows:
+        ax.text(8, yy, k, color=LBL, fontsize=8.8, family=MONO)
+        ax.text(56, yy, v, color=SIGMA_PAPER, fontsize=11.5, family=MONO, ha="right")
+        yy -= 5.4
+
+    ax.text(68, 70, "THE TAPE", color=SIGMA_CYAN, fontsize=9.5, family=MONO)
+    ax.text(152, 70, "one bar per close \u00b7 height = R", color=LBL, fontsize=8, family=MONO, ha="right")
+    base_y = 55
+    ax.plot([68, 152], [base_y, base_y], color=SIGMA_SLATE, lw=1.2)
+    tape = s.get("log", [])[:60]
+    rs = [r.get("rv") for r in tape]
+    mx = max((abs(v) for v in rs if v), default=1) or 1
+    n = max(len(tape), 1)
+    step = 84 / n
+    bw = min(2.4, step * 0.62)
+    for i, r in enumerate(tape):
+        x = 68 + i * step + (step - bw) / 2
+        v = r.get("rv")
+        if v is None:
+            ax.add_patch(mpatches.Rectangle((x, base_y - 0.35), bw, 0.7, facecolor=SIGMA_SLATE, edgecolor="none"))
+            continue
+        h = max(0.5, abs(v) / mx * 11)
+        col = SIGMA_GREEN if v > 0 else (SIGMA_RED if v < 0 else SIGMA_SLATE)
+        y = base_y if v >= 0 else base_y - h
+        ax.add_patch(mpatches.Rectangle((x, y), bw, h, facecolor=col, edgecolor="none"))
+    ax.text(68, 38.5, "wins, losses, breakevens, invalidations \u2014 all of it, in order",
+            color=LBL, fontsize=8.6, family=TXTF)
+
+    ax.plot([8, 152], [30, 30], color=SIGMA_SLATE, lw=1.2)
+    aw, al = s["avg_w"], abs(s["avg_l"]) or 0.0001
+    payoff = aw / al if al else 0
+    best_pair = (s.get("hl1_sub") or "").split(" ")[0] or "\u2014"
+    cells = [
+        ("LONGS", f"{s['longs']} \u00b7 {s['wr_long']:.0f}% WR", SIGMA_PAPER),
+        ("SHORTS", f"{s['shorts']} \u00b7 {s['wr_short']:.0f}% WR", SIGMA_PAPER),
+        ("AVG WIN / LOSS", f"{s['avg_w']:+.2f} / {s['avg_l']:+.2f}R", SIGMA_PAPER),
+        ("PAYOFF", f"{payoff:.1f} : 1", SIGMA_CYAN),
+        ("BEST CLOSE", f"{s['hl1_value']} \u00b7 {best_pair}", SIGMA_GREEN),
+    ]
+    for i, (k, v, col) in enumerate(cells):
+        x = 8 + i * 29.6
+        box(x, 12, 26.6, 12.5)
+        ax.text(x + 2.4, 20.6, k, color=LBL, fontsize=7.4, family=MONO)
+        ax.text(x + 2.4, 15.6, v, color=col, fontsize=9.6, family=MONO)
+
+    ax.text(80, 7, "every setup logged by a bot at post time \u00b7 the full log is public \u00b7 CSV export in results-board",
+            color=LBL, fontsize=8.2, family=MONO, ha="center")
+    ax.text(80, 3.2, "SETUPS, NOT SIGNALS", color=SIGMA_CYAN, fontsize=8.2, family=MONO, ha="center")
+    buf = io.BytesIO()
+    fig.savefig(buf, dpi=110, facecolor=SIGMA_BG)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
+
+
+async def post_analyst_journals(start=None, end=None, label=None) -> int:
+    if start is None:
+        start, end, _slug, label = _last_complete_month_range()
+    posted = 0
+    for aid in (RESULTS_ANALYST_IDS or set()):
+        stats = _analyst_month_stats(aid, start, end)
+        if not stats:
+            continue
+        stats["month"] = label or start.strftime("%B %Y")
+        ch = bot.get_channel(ANALYST_JOURNAL_CHANNEL_IDS.get(aid) or RECAP_CHANNEL_ID or RESULTS_CHANNEL_ID)
+        if ch is None:
+            continue
+        try:
+            buf = await asyncio.to_thread(make_analyst_month_image, stats)
+            await ch.send(content=f"**{stats['analyst'].title()} \u2014 {stats['month']}** \u00b7 "
+                                  f"{stats['n']} setups, {stats['net']:+.2f}R net.",
+                          file=discord.File(buf, filename=f"journal_{stats['analyst'].lower()}.png"))
+            posted += 1
+            await asyncio.sleep(1.5)
+        except Exception as e:
+            print(f"[journal] error for {aid}: {e}", flush=True)
+    return posted
+
+
+@bot.tree.command(name="journal_month",
+                  description="(Admin) Post per-analyst monthly journal cards (default: last complete month)")
+@app_commands.describe(days="Use last N days instead of last complete month")
+async def journal_month_cmd(interaction: discord.Interaction, days: int = 0):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    if days and days > 0:
+        end = datetime.now(IST)
+        start = end - timedelta(days=min(days, 365))
+        n = await post_analyst_journals(start, end, f"Last {min(days,365)} days")
+    else:
+        n = await post_analyst_journals()
+    await interaction.followup.send(f"Posted {n} journal card(s)." if n else
+                                    "No closed setups for any analyst in that range.", ephemeral=True)
+
+
 async def post_monthly_recap(start=None, end=None, label=None) -> bool:
     if start is None:
         start, end, _slug, label = _last_complete_month_range()
