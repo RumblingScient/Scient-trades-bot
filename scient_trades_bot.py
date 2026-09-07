@@ -1064,6 +1064,27 @@ async def _price_watch_tick():
                 print(f"[watch] no feed for {sym} - manual tracking only", flush=True)
                 continue
             for tid, t in items:
+                if t.get("watch_disabled"):
+                    continue
+                # feed identity gate: Binance ka price is trade ke entry ke scale par hona chahiye
+                if not t.get("watch_verified"):
+                    ref = entry_num(t) or first_num(t.get("entry"))
+                    last_close = candles[-1][3] if candles else None
+                    if ref and last_close and not (0.5 <= last_close / ref <= 2.0):
+                        t["watch_disabled"] = True
+                        data[tid] = t
+                        save_trades(data)
+                        print(f"[watch] FEED MISMATCH {t.get('pair')} - binance {last_close} vs entry {ref}; auto-tracking OFF", flush=True)
+                        try:
+                            await post_update_feed(t, "Auto-tracking disabled", GREY,
+                                f"Price feed for **{t.get('pair','?').upper()}** on Binance doesn't match this setup "
+                                f"(feed {last_close:g} vs entry {ref:g}) - likely a different market with the same ticker. "
+                                f"This setup is now **manual tracking only**.")
+                        except Exception:
+                            pass
+                        continue
+                    t["watch_verified"] = True
+                    data[tid] = t
                 t_since = int(t.get("watch_ms") or (now_ms - 120_000))
                 mine = [c for c in candles if c[0] >= t_since]
                 events = await _pw_process_trade(tid, t, mine)
@@ -7666,6 +7687,104 @@ async def post_analyst_journals(start=None, end=None, label=None) -> int:
         except Exception as e:
             print(f"[journal] error for {aid}: {e}", flush=True)
     return posted
+
+
+@bot.tree.command(name="track", description="(Admin/Analyst) Auto price tracking on/off for a setup")
+@app_commands.describe(trade="Which setup", mode="on / off")
+@app_commands.choices(mode=[app_commands.Choice(name="Off - manual tracking only", value="off"),
+                            app_commands.Choice(name="On - re-arm auto tracking", value="on")])
+@app_commands.autocomplete(trade=open_trades_ac)
+async def track_cmd(interaction: discord.Interaction, trade: str, mode: app_commands.Choice[str]):
+    await interaction.response.defer(ephemeral=True)
+    data = load_trades()
+    t = data.get(trade)
+    if t is None:
+        await interaction.followup.send("Setup not found.", ephemeral=True)
+        return
+    if not (interaction.user.guild_permissions.administrator or t.get("analyst_id") == interaction.user.id):
+        await interaction.followup.send("Only the analyst or an admin can do this.", ephemeral=True)
+        return
+    if mode.value == "off":
+        t["watch_disabled"] = True
+    else:
+        t["watch_disabled"] = False
+        t["watch_verified"] = False   # re-verify feed on next tick
+        t["watch_ms"] = int(datetime.now(timezone.utc).timestamp() * 1000)
+    data[trade] = t
+    save_trades(data)
+    await interaction.followup.send(
+        f"Auto-tracking **{mode.value.upper()}** for {t.get('pair','?').upper()}.", ephemeral=True)
+
+
+@bot.tree.command(name="reopen", description="(Admin) Reopen a wrongly-closed setup and clean the results board")
+@app_commands.describe(trade="Closed setup to reopen (recent closes shown)")
+async def reopen_cmd(interaction: discord.Interaction, trade: str):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    data = load_trades()
+    t = data.get(trade)
+    if t is None or not t.get("closed"):
+        await interaction.followup.send("Closed setup not found with that id.", ephemeral=True)
+        return
+    # reset close state
+    for f in ("result", "result_r", "avg_exit", "closed_at", "close_note"):
+        t.pop(f, None)
+    t["closed"] = False
+    t["sl_hit"] = False
+    t["watch_disabled"] = True   # safety: manual tracking after a reopen
+    # drop auto-recorded stop fill if it was the last fill
+    fills = t.get("fills") or []
+    if fills and fills[-1].get("label") in ("SL", "STOP"):
+        fills.pop()
+        t["fills"] = fills
+    data[trade] = t
+    save_trades(data)
+    # results board cleanup: delete the wrong card + forget it
+    state = load_results()
+    removed = False
+    for kind in ("fut", "spot"):
+        key = f"{kind}:{trade}"
+        if key in set(state.get("posted", [])):
+            state["posted"] = [x for x in state.get("posted", []) if x != key]
+            msg_id = (state.get("posted_msgs") or {}).pop(key, None)
+            if msg_id and RESULTS_CHANNEL_ID:
+                ch = bot.get_channel(RESULTS_CHANNEL_ID)
+                if ch:
+                    try:
+                        m = await ch.fetch_message(msg_id)
+                        await m.delete()
+                    except Exception:
+                        pass
+            removed = True
+    save_results(state)
+    try:
+        await refresh_and_edit(t)
+    except Exception:
+        pass
+    await refresh_board()
+    await refresh_results_summary(repost=True)
+    await post_update_feed(t, "Setup reopened", BLUE,
+                           "Previous close was recorded in error and has been reversed. "
+                           "The setup is live again - auto-tracking is off for it (manual updates).")
+    await interaction.followup.send(
+        f"Reopened {t.get('pair','?').upper()}." + (" Wrong results card deleted, summary rebuilt." if removed else ""),
+        ephemeral=True)
+
+
+@reopen_cmd.autocomplete("trade")
+async def _reopen_ac(interaction: discord.Interaction, current: str):
+    data = load_trades()
+    rows = []
+    for mid, t in data.items():
+        if not t.get("closed"):
+            continue
+        label = f"[{t.get('result','?')}] {t.get('pair','?').upper()} - closed {str(t.get('closed_at',''))[:10]}"
+        if current.lower() in label.lower():
+            rows.append((t.get("closed_at") or "", label, mid))
+    rows.sort(reverse=True)
+    return [app_commands.Choice(name=lbl[:100], value=mid) for _, lbl, mid in rows[:25]]
 
 
 @bot.tree.command(name="journal_month",
