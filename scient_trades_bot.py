@@ -661,6 +661,36 @@ def spot_sells_summary(p: dict) -> str:
     return " · ".join(f"{s['pct']:g}% @ {s['price']:g}" for s in sells)
 
 
+def spot_zone_projection(p: dict):
+    """Projected avg entry if the DCA zone fully fills.
+    Even DCA across the zone ~ zone midpoint; blended with logged buys when pcts are known."""
+    import re as _re
+    nums = _re.findall(r"[0-9]*\.?[0-9]+", str(p.get("dca_zone") or ""))
+    if len(nums) < 2:
+        return None
+    try:
+        a, b = float(nums[0]), float(nums[1])
+    except Exception:
+        return None
+    mid = (a + b) / 2
+    buys = p.get("buys") or []
+    filled = sum(b_.get("pct") or 0 for b_ in buys)
+    cur = spot_weighted_entry(p)
+    if cur and 0 < filled < 100:
+        return (cur * filled + mid * (100 - filled)) / 100
+    return mid
+
+
+def spot_weighted_entry(p: dict):
+    buys = p.get("buys") or []
+    if not buys:
+        return None
+    if all(b.get("pct") for b in buys):
+        tot = sum(b["pct"] for b in buys)
+        return sum(b["pct"] * b["price"] for b in buys) / tot if tot > 0 else None
+    return sum(b["price"] for b in buys) / len(buys)
+
+
 def spot_weighted_exit(p: dict):
     sells = p.get("sells") or []
     tot = sum(s["pct"] for s in sells)
@@ -823,6 +853,12 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
             embed.add_field(name="Allocation", value=fmt_risk(p["allocation"]) or "-", inline=True)
         if p.get("avg_entry"):
             embed.add_field(name="Avg Entry", value=str(p["avg_entry"]), inline=True)
+        if p.get("horizon"):
+            embed.add_field(name="Horizon", value=str(p["horizon"]), inline=True)
+        if not p.get("zone_filled"):
+            proj = spot_zone_projection(p)
+            if proj:
+                embed.add_field(name="If Zone Fills", value=f"avg entry \u2248 {proj:g}", inline=True)
         tgs = []
         for key, hit in (("t1", "t1_hit"), ("t2", "t2_hit"), ("t3", "t3_hit")):
             if p.get(key):
@@ -2797,20 +2833,27 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     await interaction.followup.send(f"Setup posted in {channel.mention} ({msg.jump_url})", ephemeral=True)
 
 
-@bot.tree.command(name="spot", description="Post a long-term spot DCA play")
+@bot.tree.command(name="spot", description="Post a long-term spot play (DCA zone, targets, thesis)")
 @app_commands.describe(
-    pair="e.g. SOL, BTC",
-    dca_zone="Accumulation zone, e.g. 65 - 52",
-    target1="First target",
-    allocation="Portfolio allocation (just a number = %)",
-    avg_entry="Current average entry (optional, can update later)",
-    target2="Second target (optional)",
-    target3="Third target (optional)",
-    invalidation="Thesis invalidation, e.g. Weekly close below 48 (optional)",
+    pair="e.g. SOL, AAVE - just the coin, /USDT not needed",
+    play_type="Fresh (zone waiting), Scaling (part filled, still bidding), or Filled (position built)",
+    dca_zone="Buy zone, top - bottom, e.g. 65 - 52",
+    target1="Take-profit 1",
+    allocation="Suggested portfolio allocation - just a number = % (e.g. 5 shows as 5%)",
+    avg_entry="Your average entry so far - REQUIRED for Scaling/Filled, ignored for Fresh",
+    target2="Take-profit 2 (optional)",
+    target3="Take-profit 3 (optional)",
+    invalidation="Thesis kill switch, e.g. Weekly close below 48 (optional but recommended)",
+    horizon="Expected hold, e.g. 3-6 months (optional)",
     chart="Chart image (optional)",
-    thesis="Long-term thesis (optional, posted in the play thread)",
+    thesis="Long-term reasoning (optional, posted in the play thread)",
 )
-async def spot(interaction: discord.Interaction, pair: str, dca_zone: str, target1: str, allocation: str = None, avg_entry: str = None, target2: str = None, target3: str = None, invalidation: str = None, chart: discord.Attachment = None, thesis: str = None):
+@app_commands.choices(play_type=[
+    app_commands.Choice(name="Fresh - zone posted, buying starts now", value="FRESH"),
+    app_commands.Choice(name="Scaling - partially filled, still bidding the zone", value="SCALING"),
+    app_commands.Choice(name="Filled - position built, now holding", value="FILLED"),
+])
+async def spot(interaction: discord.Interaction, pair: str, play_type: app_commands.Choice[str], dca_zone: str, target1: str, allocation: str = None, avg_entry: str = None, target2: str = None, target3: str = None, invalidation: str = None, horizon: str = None, chart: discord.Attachment = None, thesis: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message(f"Only members with the **{ANALYST_ROLE_NAME}** role can post plays.", ephemeral=True)
         return
@@ -2819,6 +2862,12 @@ async def spot(interaction: discord.Interaction, pair: str, dca_zone: str, targe
     if channel is None:
         await interaction.followup.send("Spot channel not found - check SPOT_CHANNEL_ID.", ephemeral=True)
         return
+    pt = play_type.value
+    if pt in ("SCALING", "FILLED") and not avg_entry:
+        await interaction.followup.send(
+            f"**avg_entry is required** for a {pt.title()} play - that's the number members anchor to.",
+            ephemeral=True)
+        return
     akey, acfg = resolve_analyst(interaction.user)
     p = {
         "kind": "spot",
@@ -2826,11 +2875,14 @@ async def spot(interaction: discord.Interaction, pair: str, dca_zone: str, targe
         "analyst_avatar": interaction.user.display_avatar.url, "analyst_key": akey,
         "analyst_color": analyst_color_hex(interaction.user),
         "pair": pair, "dca_zone": dca_zone, "allocation": allocation,
-        "avg_entry": avg_entry, "avg_exit": None,
+        "avg_entry": (avg_entry if pt != "FRESH" else None), "avg_exit": None,
         "t1": target1, "t2": target2, "t3": target3,
         "t1_hit": False, "t2_hit": False, "t3_hit": False,
-        "invalidation": invalidation, "thesis": thesis,
-        "status": "ACCUMULATING", "zone_filled": False,
+        "invalidation": invalidation, "thesis": thesis, "horizon": horizon,
+        "buys": ([{"price": spot_num(avg_entry), "pct": None}]
+                 if pt != "FRESH" and spot_num(avg_entry) else []),
+        "status": ("HOLDING" if pt == "FILLED" else "ACCUMULATING"),
+        "zone_filled": (pt == "FILLED"),
         "created_at": datetime.now(timezone.utc).isoformat(),
         "closed": False, "result": None, "result_pct": None, "close_note": None,
         "edited": False, "edited_at": None,
@@ -2992,7 +3044,9 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
 @bot.tree.command(name="spot_update", description="Update or close a spot play - fills, sells, targets, status, close/invalidate")
 @app_commands.describe(
     play="Pick an active spot play",
-    avg_entry="New average entry after a DCA fill (optional)",
+    buy_price="Log a DCA buy - price you bought at. Avg entry auto-recalculates",
+    buy_pct="With buy_price: how much of the planned bag this buy was, e.g. 25 = 25% (optional)",
+    avg_entry="Set average entry MANUALLY (overrides the auto-calc) (optional)",
     status="New phase (optional)",
     target_hit="Mark a target as reached (optional)",
     sold_pct="Partial sell - % of the bag sold (e.g. 30). Pair with sell_price",
@@ -3018,7 +3072,7 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
     ],
 )
 @app_commands.autocomplete(play=open_spot_ac)
-async def spot_update(interaction: discord.Interaction, play: str, avg_entry: str = None, status: app_commands.Choice[str] = None, target_hit: app_commands.Choice[str] = None, sold_pct: str = None, sell_price: str = None, zone_filled: app_commands.Choice[str] = None, close: app_commands.Choice[str] = None, avg_exit: str = None, note: str = None):
+async def spot_update(interaction: discord.Interaction, play: str, buy_price: str = None, buy_pct: str = None, avg_entry: str = None, status: app_commands.Choice[str] = None, target_hit: app_commands.Choice[str] = None, sold_pct: str = None, sell_price: str = None, zone_filled: app_commands.Choice[str] = None, close: app_commands.Choice[str] = None, avg_exit: str = None, note: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -3029,8 +3083,27 @@ async def spot_update(interaction: discord.Interaction, play: str, avg_entry: st
         await interaction.followup.send("Play not found.", ephemeral=True)
         return
     changes = []
+    if buy_price is not None:
+        bp = spot_num(buy_price)
+        if bp is None:
+            await interaction.followup.send("buy_price must be a number.", ephemeral=True)
+            return
+        bpct = None
+        if buy_pct is not None:
+            try:
+                bpct = float(str(buy_pct).replace("%", ""))
+                assert 0 < bpct <= 100
+            except Exception:
+                await interaction.followup.send("buy_pct must be a number between 0 and 100.", ephemeral=True)
+                return
+        p.setdefault("buys", []).append({"price": bp, "pct": bpct})
+        auto = spot_weighted_entry(p)
+        if auto:
+            p["avg_entry"] = f"{auto:g}"
+        ptxt = f" ({bpct:g}% of the bag)" if bpct else ""
+        changes.append(f"buy @ {buy_price}{ptxt} -> avg {p.get('avg_entry')}")
     if avg_entry is not None:
-        p["avg_entry"] = avg_entry; changes.append(f"avg entry -> {avg_entry}")
+        p["avg_entry"] = avg_entry; changes.append(f"avg entry -> {avg_entry} (manual)")
     if status is not None:
         p["status"] = status.value; changes.append(f"status -> {status.value}")
     if target_hit is not None:
@@ -6828,11 +6901,42 @@ class StatsCSVView(View):
 
 
 _PERIOD_CHOICES = [
-    app_commands.Choice(name="All time", value=0),
+    app_commands.Choice(name="Last month (complete)", value=-1),
+    app_commands.Choice(name="This month (so far)", value=-2),
     app_commands.Choice(name="Last 7 days", value=7),
     app_commands.Choice(name="Last 30 days", value=30),
     app_commands.Choice(name="Last 90 days", value=90),
+    app_commands.Choice(name="All time", value=0),
 ]
+
+
+def _stats_window(val: int):
+    """(start_ist|None, end_ist|None, label). val: -1 last complete month, -2 this month so far,
+    0 all time, n>0 rolling days. Default (None) = last complete month."""
+    now = datetime.now(IST)
+    if val == 0:
+        return None, None, "All time"
+    if val == -2:
+        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        return start, now, now.strftime("%B %Y") + " (so far)"
+    if val == -1:
+        start, end, _slug, label = _last_complete_month_range()
+        return start, end, label
+    start = now - timedelta(days=val)
+    return start, now, f"Last {val} days"
+
+
+def _in_window(item: dict, start, end) -> bool:
+    if start is None:
+        return True
+    try:
+        d = datetime.fromisoformat(item["closed_at"])
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        d = d.astimezone(IST)
+        return start <= d < (end or datetime.now(IST) + timedelta(minutes=1))
+    except Exception:
+        return False
 
 
 def _in_period(item: dict, days: int) -> bool:
@@ -6848,19 +6952,18 @@ def _in_period(item: dict, days: int) -> bool:
         return False
 
 
-@bot.tree.command(name="stats", description="Trade journal scorecard (futures) - all time / last week / last month")
-@app_commands.describe(analyst="Whose stats? (blank = your own)", period="Time window (blank = all time)")
+@bot.tree.command(name="stats", description="Trade journal scorecard (futures) - default: last complete month")
+@app_commands.describe(analyst="Whose stats? (blank = your own)", period="Time window (blank = last complete month)")
 @app_commands.choices(period=_PERIOD_CHOICES)
 async def stats(interaction: discord.Interaction, analyst: discord.Member = None,
                 period: app_commands.Choice[int] = None):
     await interaction.response.defer(ephemeral=True)
     target = analyst or interaction.user
-    days = period.value if period else 0
-    plabel = period.name if period else "All time"
+    w_start, w_end, plabel = _stats_window(period.value if period else -1)
     data = load_trades()
     mine = [t for t in data.values() if t.get("analyst_id") == target.id]
     total = len(mine)
-    closed = [t for t in mine if t.get("closed") and _in_period(t, days)]
+    closed = [t for t in mine if t.get("closed") and _in_window(t, w_start, w_end)]
     wins = [t for t in closed if t["result"] == "WIN"]
     losses = [t for t in closed if t["result"] == "LOSS"]
     be = [t for t in closed if t["result"] == "BE"]
@@ -6893,19 +6996,18 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     await interaction.followup.send(embed=embed, view=StatsCSVView(mine, target.display_name), ephemeral=True)
 
 
-@bot.tree.command(name="spot_stats", description="Spot plays scorecard - all time / last week / last month")
-@app_commands.describe(analyst="Whose stats? (blank = your own)", period="Time window (blank = all time)")
+@bot.tree.command(name="spot_stats", description="Spot plays scorecard - default: last complete month")
+@app_commands.describe(analyst="Whose stats? (blank = your own)", period="Time window (blank = last complete month)")
 @app_commands.choices(period=_PERIOD_CHOICES)
 async def spot_stats(interaction: discord.Interaction, analyst: discord.Member = None,
                      period: app_commands.Choice[int] = None):
     await interaction.response.defer(ephemeral=True)
     target = analyst or interaction.user
-    days = period.value if period else 0
-    plabel = period.name if period else "All time"
+    w_start, w_end, plabel = _stats_window(period.value if period else -1)
     data = load_spot()
     mine = [p for p in data.values() if p.get("analyst_id") == target.id]
     total = len(mine)
-    closed = [p for p in mine if p.get("closed") and _in_period(p, days)]
+    closed = [p for p in mine if p.get("closed") and _in_window(p, w_start, w_end)]
     wins = [p for p in closed if p["result"] == "WIN"]
     losses = [p for p in closed if p["result"] == "LOSS"]
     be = [p for p in closed if p["result"] == "BE"]
