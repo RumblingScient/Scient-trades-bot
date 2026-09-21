@@ -3594,6 +3594,7 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     app_commands.Choice(name="TP3 Hit", value="TP3"),
     app_commands.Choice(name="TP4 Hit", value="TP4"),
     app_commands.Choice(name="Take Profit - any price (auto-numbered TP5, TP6...)", value="PTP"),
+    app_commands.Choice(name="Rebuild TP list from recorded fills", value="RTP"),
     app_commands.Choice(name="SL Moved to Entry (Risk-Free)", value="BE"),
     app_commands.Choice(name="SL Updated (new level/condition)", value="SLU"),
     app_commands.Choice(name="SL Hit (closes trade)", value="SL"),
@@ -3639,6 +3640,18 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         return
 
     desc = ""
+    if ev == "RTP":
+        before = {k: bool(t.get(f"{k}_hit")) for k in ("tp1", "tp2", "tp3", "tp4")}
+        _sync_tp_flags(t)
+        fixed = [k.upper() for k in before if before[k] != bool(t.get(f"{k}_hit"))]
+        data[trade] = t
+        save_trades(data)
+        await refresh_and_edit(t)
+        await refresh_board()
+        await interaction.followup.send(
+            "TP list rebuilt from recorded fills" + (f" - {', '.join(fixed)} adjusted." if fixed else " - no change needed."),
+            ephemeral=True)
+        return
     if ev == "EF1":
         t["entry1_filled"] = True
         desc = "Entry 1 filled" if t.get("entry2") else "Entry filled"
