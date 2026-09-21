@@ -495,6 +495,90 @@ def signed_r(t, price):
     return diff / rpu
 
 
+def _tp_presets(t: dict, spot: bool = False):
+    """[(idx, key, price, planned_pct|None)] from the card's preset targets."""
+    keys = ("t1", "t2", "t3") if spot else ("tp1", "tp2", "tp3", "tp4")
+    plan = t.get("tp_split") or []
+    out = []
+    for i, k in enumerate(keys):
+        px = spot_num(t.get(k)) if spot else first_num(t.get(k))
+        if px is None:
+            continue
+        out.append((i, k, px, (float(plan[i]) if i < len(plan) else None)))
+    return out
+
+
+def _tp_taken(t: dict, spot: bool = False):
+    """Profit-taking fills in the order they happened: [{'price','pct'}]."""
+    if spot:
+        return [s for s in (t.get("sells") or []) if s.get("price") is not None]
+    return [f for f in (t.get("fills") or []) if _is_tp_fill(f)]
+
+
+def _sync_tp_flags(t: dict, spot: bool = False):
+    """Preset N counts as done if (a) a taken TP already replaced its slot, or (b) any taken
+    price reached it. Keeps the tracker / status logic from re-firing replaced presets."""
+    taken = _tp_taken(t, spot)
+    n = len(taken)
+    is_long = True if spot else (t.get("direction") == "LONG")
+    best = None
+    if taken:
+        best = max(x["price"] for x in taken) if is_long else min(x["price"] for x in taken)
+    for i, k, px, _ in _tp_presets(t, spot):
+        reached = best is not None and ((best >= px) if is_long else (best <= px))
+        t[f"{k}_hit"] = bool(i < n or reached)
+
+
+def unified_tp_text(t: dict, spot: bool = False) -> str:
+    """ONE list: taken TPs (auto-numbered, ticked) then the presets still pending (plan)."""
+    taken = _tp_taken(t, spot)
+    presets = _tp_presets(t, spot)
+    tick = emo("tracked", chr(0x2705))
+    rows = []
+    n = 0
+    for f in taken:
+        n += 1
+        px = f["price"]
+        extra = ""
+        if spot:
+            extra = spot_pct_text(t, px)
+        else:
+            r = signed_r(t, px)
+            extra = f" ({r:+.1f}R)" if r is not None else ""
+        rows.append(f"TP{n} \u00b7 {f['pct']:g}% @ {(f'{px:g}' if spot else fnum(px))}{extra} {tick}")
+    for i, k, px, planned in presets:
+        if t.get(f"{k}_hit"):
+            continue
+        n += 1
+        extra = spot_pct_text(t, px) if spot else (f" ({signed_r(t, px):+.1f}R)" if signed_r(t, px) is not None else "")
+        ptxt = f" [{planned:g}%]" if planned is not None else ""
+        rows.append(f"TP{n} \u00b7 {(f'{px:g}' if spot else fnum(px))}{extra}{ptxt}")
+    if not rows:
+        return ""
+    done = sum(x["pct"] for x in taken)
+    if t.get("closed") or not taken:
+        return "\n".join(rows)
+    left = max(0.0, 100 - (fills_pct(t) if not spot else done))
+    return "\n".join(rows) + f"\n{done:g}% {'sold' if spot else 'closed'} \u00b7 {left:g}% {'still held' if spot else 'running'}"
+
+
+def _is_tp_fill(f: dict) -> bool:
+    lab = str(f.get("label") or "")
+    return lab.startswith("TP") or lab in ("Partial TP", "PTP")
+
+
+def take_profits_text(t: dict) -> str:
+    """Futures: every profit-taking fill, auto-numbered TP1..TPn in the order taken."""
+    tps = [f for f in (t.get("fills") or []) if _is_tp_fill(f)]
+    if not tps:
+        return ""
+    tick = emo("tracked", chr(0x2705))
+    rows = [f"TP{i} \u00b7 {f['pct']:g}% @ {fnum(f['price'])} {tick}" for i, f in enumerate(tps, 1)]
+    done = sum(f["pct"] for f in tps)
+    tail = "" if t.get("closed") else f"\n{done:g}% closed \u00b7 {max(0.0, 100 - fills_pct(t)):g}% running"
+    return "\n".join(rows) + tail
+
+
 def fills_pct(t) -> float:
     return sum(f.get("pct", 0) for f in t.get("fills", []))
 
@@ -654,11 +738,35 @@ def spot_pct_text(p: dict, target) -> str:
     return ""
 
 
+def parse_spot_split(raw: str, n_targets: int):
+    """'30/30/40' -> [30.0, 30.0, 40.0]. Sum may be under 100 (moonbag). Returns (list, error)."""
+    if not raw:
+        return [], None
+    try:
+        parts = [float(x.strip().replace("%", "")) for x in str(raw).replace(",", "/").split("/") if x.strip()]
+    except Exception:
+        return None, "tp_split must look like 30/30/40."
+    if not parts or any(x <= 0 for x in parts):
+        return None, "tp_split values must be positive numbers."
+    if len(parts) > n_targets:
+        return None, f"tp_split has {len(parts)} parts but the play only has {n_targets} target(s)."
+    if sum(parts) > 100.01:
+        return None, f"tp_split adds up to {sum(parts):g}% - it can't be more than 100%."
+    return parts, None
+
+
 def spot_sells_summary(p: dict) -> str:
     sells = p.get("sells") or []
     if not sells:
         return ""
-    return " · ".join(f"{s['pct']:g}% @ {s['price']:g}" for s in sells)
+    tick = emo("tracked", chr(0x2705))
+    rows = []
+    for i, s in enumerate(sells, 1):
+        at = f" \u00b7 at {s['label']}" if s.get("label") else ""
+        rows.append(f"TP{i} \u00b7 {s['pct']:g}% @ {s['price']:g} {tick}{at}")
+    done = sum(s["pct"] for s in sells)
+    tail = "" if p.get("closed") else f"\n{done:g}% sold \u00b7 {max(0.0, 100 - done):g}% still held"
+    return "\n".join(rows) + tail
 
 
 def spot_zone_projection(p: dict):
@@ -705,10 +813,14 @@ def spot_status_line(p: dict) -> str:
         rtxt = f" ({res})" if res else ""
         return {"WIN": f"CLOSED - WIN{rtxt}", "LOSS": f"CLOSED - LOSS{rtxt}", "BE": "CLOSED - BREAKEVEN", "INVALID": "INVALIDATED"}.get(p.get("result"), "CLOSED")
     s = p.get("status", "ACCUMULATING")
-    hits = sum(1 for k in ("t1_hit", "t2_hit", "t3_hit") if p.get(k))
-    if hits:
-        return f"{s} - Target {hits} hit"
-    return s
+    top = max((i for i, k in enumerate(("t1_hit", "t2_hit", "t3_hit"), 1) if p.get(k)), default=0)
+    sold = sum(x["pct"] for x in (p.get("sells") or []))
+    parts = [s]
+    if top:
+        parts.append(f"Target {top} reached")
+    if sold:
+        parts.append(f"{sold:g}% sold")
+    return " - ".join(parts)
 
 
 def resolve_analyst(user):
@@ -802,8 +914,9 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
             rtxt = f" ({r:.1f}R)" if r is not None else ""
             ptxt = f" [{plan[idx]:g}%]" if idx < len(plan) else ""
             tps.append(f"{t[key]}{rtxt}{ptxt}" + (f" {emo('tracked', chr(0x2705))}" if t.get(hit) else ""))
-    if tps:
-        embed.add_field(name="Targets", value=" · ".join(tps), inline=False)
+    _tpt = unified_tp_text(t)
+    if _tpt:
+        embed.add_field(name="Take Profits", value=_tpt[:1020], inline=False)
 
     # Setup (full width)
     fw = fmt_frameworks(t)
@@ -860,13 +973,14 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
             if proj:
                 embed.add_field(name="If Zone Fills", value=f"avg entry \u2248 {proj:g}", inline=True)
         tgs = []
-        for key, hit in (("t1", "t1_hit"), ("t2", "t2_hit"), ("t3", "t3_hit")):
+        splan = p.get("tp_split") or []
+        for idx, (key, hit) in enumerate((("t1", "t1_hit"), ("t2", "t2_hit"), ("t3", "t3_hit"))):
             if p.get(key):
-                tgs.append(f"{p[key]}{spot_pct_text(p, p[key])}" + (" \u2705" if p.get(hit) else ""))
-        if tgs:
-            embed.add_field(name="Targets", value=" · ".join(tgs), inline=False)
-        if p.get("sells"):
-            embed.add_field(name="Sold", value=spot_sells_summary(p), inline=False)
+                ptxt = f" [{splan[idx]:g}%]" if idx < len(splan) else ""
+                tgs.append(f"{p[key]}{spot_pct_text(p, p[key])}{ptxt}" + (f" {emo('tracked', chr(0x2705))}" if p.get(hit) else ""))
+        _spt = unified_tp_text(p, spot=True)
+        if _spt:
+            embed.add_field(name="Take Profits", value=_spt[:1020], inline=False)
         if p.get("invalidation"):
             embed.add_field(name="Invalidation", value=str(p["invalidation"]), inline=False)
     embed.add_field(name="Status", value=spot_status_line(p), inline=False)
@@ -1029,6 +1143,7 @@ async def _pw_process_trade(tid: str, t: dict, candles):
                     pct = min(pct, room)
                     if pct > 0:
                         t.setdefault("fills", []).append({"price": tp_px, "pct": pct, "label": key.upper()})
+                        _sync_tp_flags(t)
                         events.append((f"{key.upper()} hit @ {fnum(tp_px)} ({pct:g}%)", GREEN,
                                        f"Auto-tracked · {fills_pct(t):g}% closed, {100 - fills_pct(t):g}% running"))
                     else:
@@ -2843,6 +2958,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     avg_entry="Your average entry so far - REQUIRED for Scaling/Filled, ignored for Fresh",
     target2="Take-profit 2 (optional)",
     target3="Take-profit 3 (optional)",
+    tp_split="Planned % of the bag to sell at each target, e.g. 30/30/40 (optional - can stay under 100 for a moonbag)",
     invalidation="Thesis kill switch, e.g. Weekly close below 48 (optional but recommended)",
     horizon="Expected hold, e.g. 3-6 months (optional)",
     chart="Chart image (optional)",
@@ -2853,7 +2969,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     app_commands.Choice(name="Scaling - partially filled, still bidding the zone", value="SCALING"),
     app_commands.Choice(name="Filled - position built, now holding", value="FILLED"),
 ])
-async def spot(interaction: discord.Interaction, pair: str, play_type: app_commands.Choice[str], dca_zone: str, target1: str, allocation: str = None, avg_entry: str = None, target2: str = None, target3: str = None, invalidation: str = None, horizon: str = None, chart: discord.Attachment = None, thesis: str = None):
+async def spot(interaction: discord.Interaction, pair: str, play_type: app_commands.Choice[str], dca_zone: str, target1: str, allocation: str = None, avg_entry: str = None, target2: str = None, target3: str = None, tp_split: str = None, invalidation: str = None, horizon: str = None, chart: discord.Attachment = None, thesis: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message(f"Only members with the **{ANALYST_ROLE_NAME}** role can post plays.", ephemeral=True)
         return
@@ -2863,6 +2979,11 @@ async def spot(interaction: discord.Interaction, pair: str, play_type: app_comma
         await interaction.followup.send("Spot channel not found - check SPOT_CHANNEL_ID.", ephemeral=True)
         return
     pt = play_type.value
+    n_t = sum(1 for x in (target1, target2, target3) if x)
+    split_list, split_err = parse_spot_split(tp_split, n_t)
+    if split_err:
+        await interaction.followup.send(split_err, ephemeral=True)
+        return
     if pt in ("SCALING", "FILLED") and not avg_entry:
         await interaction.followup.send(
             f"**avg_entry is required** for a {pt.title()} play - that's the number members anchor to.",
@@ -2876,7 +2997,7 @@ async def spot(interaction: discord.Interaction, pair: str, play_type: app_comma
         "analyst_color": analyst_color_hex(interaction.user),
         "pair": pair, "dca_zone": dca_zone, "allocation": allocation,
         "avg_entry": (avg_entry if pt != "FRESH" else None), "avg_exit": None,
-        "t1": target1, "t2": target2, "t3": target3,
+        "t1": target1, "t2": target2, "t3": target3, "tp_split": split_list,
         "t1_hit": False, "t2_hit": False, "t3_hit": False,
         "invalidation": invalidation, "thesis": thesis, "horizon": horizon,
         "buys": ([{"price": spot_num(avg_entry), "pct": None}]
@@ -3048,10 +3169,11 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
     buy_pct="With buy_price: how much of the planned bag this buy was, e.g. 25 = 25% (optional)",
     avg_entry="Set average entry MANUALLY (overrides the auto-calc) (optional)",
     status="New phase (optional)",
-    target_hit="Mark a target as reached (optional)",
-    sold_pct="Partial sell - % of the bag sold (e.g. 30). Pair with sell_price",
-    sell_price="Partial sell - price sold at (required with sold_pct)",
+    target_hit="Only if price actually reached the target. Sells auto-tick targets they reach. Undo / re-check here too",
+    sold_pct="Take profit - % of the bag sold (e.g. 30). Numbered TP1, TP2... automatically, no limit",
+    sell_price="Take profit - price you sold at (goes with sold_pct)",
     zone_filled="Mark DCA zone fully filled (optional)",
+    tp_split="Set / change the planned sell % per target, e.g. 30/30/40",
     close="CLOSE the play right here - Win / Loss / BE / Invalidated (zone never filled)",
     avg_exit="With close: average exit price (auto from partial sells if blank)",
     note="Update note (optional)",
@@ -3059,9 +3181,13 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
 @app_commands.choices(
     status=[app_commands.Choice(name=s.capitalize(), value=s) for s in SPOT_STATUSES],
     target_hit=[
-        app_commands.Choice(name="Target 1", value="t1"),
-        app_commands.Choice(name="Target 2", value="t2"),
-        app_commands.Choice(name="Target 3", value="t3"),
+        app_commands.Choice(name="Target 1 reached", value="t1"),
+        app_commands.Choice(name="Target 2 reached", value="t2"),
+        app_commands.Choice(name="Target 3 reached", value="t3"),
+        app_commands.Choice(name="Undo Target 1 tick", value="u1"),
+        app_commands.Choice(name="Undo Target 2 tick", value="u2"),
+        app_commands.Choice(name="Undo Target 3 tick", value="u3"),
+        app_commands.Choice(name="Rebuild TP list from recorded sells", value="rs"),
     ],
     zone_filled=[app_commands.Choice(name="Yes", value="yes")],
     close=[
@@ -3072,7 +3198,7 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
     ],
 )
 @app_commands.autocomplete(play=open_spot_ac)
-async def spot_update(interaction: discord.Interaction, play: str, buy_price: str = None, buy_pct: str = None, avg_entry: str = None, status: app_commands.Choice[str] = None, target_hit: app_commands.Choice[str] = None, sold_pct: str = None, sell_price: str = None, zone_filled: app_commands.Choice[str] = None, close: app_commands.Choice[str] = None, avg_exit: str = None, note: str = None):
+async def spot_update(interaction: discord.Interaction, play: str, buy_price: str = None, buy_pct: str = None, avg_entry: str = None, status: app_commands.Choice[str] = None, target_hit: app_commands.Choice[str] = None, sold_pct: str = None, sell_price: str = None, zone_filled: app_commands.Choice[str] = None, tp_split: str = None, close: app_commands.Choice[str] = None, avg_exit: str = None, note: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -3106,8 +3232,62 @@ async def spot_update(interaction: discord.Interaction, play: str, buy_price: st
         p["avg_entry"] = avg_entry; changes.append(f"avg entry -> {avg_entry} (manual)")
     if status is not None:
         p["status"] = status.value; changes.append(f"status -> {status.value}")
+    sell_label = None
+    if tp_split is not None:
+        n_t = sum(1 for k in ("t1", "t2", "t3") if p.get(k))
+        sl, se = parse_spot_split(tp_split, n_t)
+        if se:
+            await interaction.followup.send(se, ephemeral=True)
+            return
+        p["tp_split"] = sl
+        changes.append(f"sell plan -> {'/'.join(f'{x:g}' for x in sl)}")
     if target_hit is not None:
-        p[f"{target_hit.value}_hit"] = True; changes.append(f"{target_hit.name} hit")
+        tv = target_hit.value
+        if tv.startswith("u"):
+            k = "t" + tv[1]
+            p[f"{k}_hit"] = False
+            lab = f"T{tv[1]}"
+            before = len(p.get("sells") or [])
+            p["sells"] = [s for s in (p.get("sells") or []) if s.get("label") != lab]
+            removed = before - len(p["sells"])
+            changes.append(f"Target {tv[1]} tick removed" + (" (its recorded sell removed too)" if removed else ""))
+        elif tv == "rs":
+            before = {k: bool(p.get(f"{k}_hit")) for k in ("t1", "t2", "t3")}
+            _sync_tp_flags(p, spot=True)
+            fixed = [k.upper() for k in before if before[k] != bool(p.get(f"{k}_hit"))]
+            changes.append("TP list rebuilt from recorded sells" + (f" ({', '.join(fixed)} adjusted)" if fixed else " (no change)"))
+        else:
+            tp = spot_num(p.get(tv))
+            if tp is None:
+                await interaction.followup.send(f"This play has no {target_hit.name.split(' reached')[0]}.", ephemeral=True)
+                return
+            px_guard = spot_num(sell_price)
+            if px_guard is not None and px_guard < tp:
+                await interaction.followup.send(
+                    f"Sold @ {px_guard:g} is **below** {tv.upper()} ({tp:g}) - that's a discretionary sell, not a target hit. "
+                    f"Run it again without `target_hit` and the sell is recorded on its own.", ephemeral=True)
+                return
+            p[f"{tv}_hit"] = True
+            changes.append(f"{tv.upper()} ({tp:g}) reached")
+            lab = tv.upper()
+            already_logged = any(s.get("label") == lab for s in (p.get("sells") or []))
+            if sold_pct is not None and sell_price is None:
+                sell_price = f"{tp:g}"          # sold at the target itself
+                sell_label = lab
+            elif sold_pct is None and sell_price is None and not already_logged:
+                plan = p.get("tp_split") or []
+                idx = int(tv[1]) - 1
+                if idx < len(plan):
+                    left = max(0.0, 100.0 - sum(s["pct"] for s in (p.get("sells") or [])))
+                    pct = min(plan[idx], left)
+                    if pct > 0:
+                        p.setdefault("sells", []).append({"pct": round(pct, 1), "price": tp, "label": lab})
+                        _sync_tp_flags(p, spot=True)
+                        changes.append(f"sold {pct:g}% @ {tp:g} (planned)")
+                else:
+                    changes.append("no planned % for this target - add sold_pct to record the sell")
+            elif sell_price is not None:
+                sell_label = lab
     if zone_filled is not None:
         p["zone_filled"] = True; changes.append("zone filled")
     if sold_pct is not None or sell_price is not None:
@@ -3123,8 +3303,12 @@ async def spot_update(interaction: discord.Interaction, play: str, buy_price: st
         if already + sp > 100.01:
             await interaction.followup.send(f"That totals {already + sp:g}% sold - only {100 - already:g}% of the bag is left.", ephemeral=True)
             return
-        p.setdefault("sells", []).append({"pct": round(sp, 1), "price": px})
-        changes.append(f"sold {sp:g}% @ {px:g}")
+        entry_ = {"pct": round(sp, 1), "price": px}
+        if sell_label:
+            entry_["label"] = sell_label
+        p.setdefault("sells", []).append(entry_)
+        _sync_tp_flags(p, spot=True)
+        changes.append(f"sold {sp:g}% @ {px:g}" + (f" ({sell_label})" if sell_label else ""))
     if close is not None:
         if changes:
             data[play] = p
@@ -3397,8 +3581,8 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
 @app_commands.describe(
     trade="Pick an open trade",
     event="What happened",
-    size_pct="TP/Partial TP only - % of position closed (e.g. 25). Skip for other events",
-    price="Partial TP, Closed - exit price. Required on SL Hit if the trade has a soft SL",
+    size_pct="Take profits - % of position closed (e.g. 25). Skip for other events",
+    price="Take Profit (any price) / Closed - exit price. Required on SL Hit if the trade has a soft SL",
     new_sl="SL Updated only - number for hard (64000) or full condition (4h close below 64000)",
     note="Optional note",
 )
@@ -3409,7 +3593,7 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     app_commands.Choice(name="TP2 Hit", value="TP2"),
     app_commands.Choice(name="TP3 Hit", value="TP3"),
     app_commands.Choice(name="TP4 Hit", value="TP4"),
-    app_commands.Choice(name="Partial TP (custom price)", value="PTP"),
+    app_commands.Choice(name="Take Profit - any price (auto-numbered TP5, TP6...)", value="PTP"),
     app_commands.Choice(name="SL Moved to Entry (Risk-Free)", value="BE"),
     app_commands.Choice(name="SL Updated (new level/condition)", value="SLU"),
     app_commands.Choice(name="SL Hit (closes trade)", value="SL"),
@@ -3435,10 +3619,10 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
     pct = parse_num(size_pct)
     px = parse_num(price)
 
-    if ev in ("TP1", "TP2", "TP3", "PTP"):
+    if ev in ("TP1", "TP2", "TP3", "TP4", "PTP"):
         if pct is None and ev != "PTP":
             plan = t.get("tp_split") or []
-            idx = {"TP1": 0, "TP2": 1, "TP3": 2}[ev]
+            idx = {"TP1": 0, "TP2": 1, "TP3": 2, "TP4": 3}[ev]
             if idx < len(plan):
                 pct = float(plan[idx])  # planned size from the trade card
         if pct is None:
@@ -3478,17 +3662,24 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
             await interaction.followup.send(f"{ev} has no price set on the trade - pass `price` with this update.", ephemeral=True)
             return
         t["fills"].append({"price": fill_price, "pct": pct, "label": ev})
+        _sync_tp_flags(t)
         desc = f"{ev} hit @ {fnum(fill_price)} ({pct:g}%)"
     elif ev == "PTP":
-        slot = next((k for k in ("tp1", "tp2", "tp3", "tp4") if t.get(k) and not t.get(f"{k}_hit")), None)
-        if slot:
-            t[f"{slot}_hit"] = True
-            label = slot.upper()
-        else:
-            label = "Partial TP"
+        is_long = t.get("direction") == "LONG"
+        reached = []
+        for k in ("tp1", "tp2", "tp3", "tp4"):
+            tpx = first_num(t.get(k))
+            if tpx is None or t.get(f"{k}_hit"):
+                continue
+            if (is_long and px >= tpx) or (not is_long and px <= tpx):
+                t[f"{k}_hit"] = True
+                reached.append(k.upper())
         t["entry1_filled"] = True
+        n = sum(1 for f in (t.get("fills") or []) if _is_tp_fill(f)) + 1
+        label = f"TP{n}"
         t["fills"].append({"price": px, "pct": pct, "label": label})
-        desc = f"{label} hit @ {fnum(px)} ({pct:g}%)"
+        _sync_tp_flags(t)
+        desc = f"{label} taken @ {fnum(px)} ({pct:g}%)" + (f" - planned {', '.join(reached)} reached" if reached else "")
     elif ev == "BE":
         t["be"] = True
         desc = "SL moved to entry - trade is risk-free"
@@ -3566,7 +3757,7 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         title, color, line = "Invalidated", DGREY, "Setup invalidated before trigger."
     else:
         title = desc
-        color = GREEN if ev in ("PTP", "TP1", "TP2", "TP3") else BLUE if ev in ("EF1", "EF2") else GREY
+        color = GREEN if ev in ("PTP", "TP1", "TP2", "TP3", "TP4") else BLUE if ev in ("EF1", "EF2") else GREY
         closed_pct = fills_pct(t)
         line = desc + (f"\n{closed_pct:g}% of position closed, {100 - closed_pct:g}% running" if closed_pct > 0 and not t.get("closed") else "")
     if note:
