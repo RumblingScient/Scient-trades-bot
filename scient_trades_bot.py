@@ -7798,9 +7798,15 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     embed.add_field(name="Futures", value=(f"{len(closed)} closed \u00b7 {len(wins)}W/{len(losses)}L \u00b7 {wr:.0f}%" if closed else "no closes"), inline=True)
     embed.add_field(name="Spot", value=(f"{len(s_closed)} closed \u00b7 {s_w}W/{s_l}L \u00b7 {s_wr:.0f}%" if s_closed else "no closes"), inline=True)
     embed.add_field(name="Open now", value=f"{sum(1 for t in mine if not t.get('closed'))} futures \u00b7 {sum(1 for p in s_all if not p.get('closed'))} spot", inline=True)
+    # best / worst across BOTH markets, tagged with the pair
+    graded = [(t.get("result_r"), f"{t.get('pair','?').upper()} fut") for t in closed
+              if isinstance(t.get("result_r"), (int, float))]
+    graded += [(spot_result_r(p), f"{p.get('pair','?').upper()} spot") for p in s_closed
+               if spot_result_r(p) is not None]
     tail = []
-    if best is not None:
-        tail.append(f"best {best:+g}R \u00b7 worst {worst:+g}R")
+    if graded:
+        b = max(graded, key=lambda x: x[0]); w_ = min(graded, key=lambda x: x[0])
+        tail.append(f"best {b[0]:+.2f}R ({b[1]}) \u00b7 worst {w_[0]:+.2f}R ({w_[1]})")
     tail.append(f"BE/invalidated {len(be)}/{len(invalid)}")
     embed.add_field(name="\u200b", value=" \u00b7 ".join(tail), inline=False)
     embed.set_footer(text="Sigma Trading - Journal \u00b7 R only counts graded closes")
