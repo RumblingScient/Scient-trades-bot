@@ -27,6 +27,25 @@ names = {c.name for c in cmds}
 for must in ("health","update","spot_update","edit","reopen","track","trade","spot","stats","journal_month","recap_month","results_debug","results_sync"):
     check(f"command /{must}", must in names)
 check("all 13 loops present", len(m._loops()) == 13)
+# Discord hard limits - a single violation makes the WHOLE command sync fail on boot
+def _walk_cmds(cmds):
+    for c in cmds:
+        yield c
+        for sub in getattr(c, "commands", []) or []:
+            yield sub
+lim_bad = []
+for c in _walk_cmds(cmds):
+    if len(c.name) > 32: lim_bad.append(f"/{c.name} name>32")
+    if len(c.description or "") > 100: lim_bad.append(f"/{c.name} description {len(c.description)}>100")
+    for prm in getattr(c, "parameters", []) or []:
+        if len(prm.description or "") > 100: lim_bad.append(f"/{c.name} param {prm.name} desc {len(prm.description)}>100")
+        for ch in getattr(prm, "choices", []) or []:
+            if len(ch.name) > 100: lim_bad.append(f"/{c.name} choice '{ch.name[:30]}...' >100")
+        if len(getattr(prm, "choices", []) or []) > 25: lim_bad.append(f"/{c.name} param {prm.name} >25 choices")
+    if len(getattr(c, "parameters", []) or []) > 25: lim_bad.append(f"/{c.name} >25 params")
+check("Discord limits (names/descriptions/choices)", not lim_bad, ("; ".join(lim_bad[:5]) if lim_bad else ""))
+check("command count <= 100", len(cmds) <= 100, f"({len(cmds)})")
+
 
 t = {"direction":"LONG","entry":"100","sl":"95","fills":[{"price":110,"pct":50,"label":"TP1"}]}
 ae, r = m.finalize_close(t, 120); check("R math long partial+close", abs(ae-115)<1e-9 and abs(r-3.0)<1e-9)

@@ -3201,7 +3201,7 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     avg_entry="Your average entry so far - REQUIRED for Scaling/Filled, ignored for Fresh",
     target2="Take-profit 2 (optional)",
     target3="Take-profit 3 (optional)",
-    tp_split="Planned % of the bag to sell at each target, e.g. 30/30/40 (optional - can stay under 100 for a moonbag)",
+    tp_split="Planned % to sell at each target, e.g. 30/30/40 (optional, under 100 = moonbag)",
     invalidation="Thesis kill switch, e.g. Weekly close below 48 (optional but recommended)",
     horizon="Expected hold, e.g. 3-6 months (optional)",
     chart="Chart image (optional)",
@@ -3557,6 +3557,22 @@ async def spot_update(interaction: discord.Interaction, play: str, tp_hit: app_c
         p.setdefault("sells", []).append(entry_)
         _sync_tp_flags(p, spot=True)
         changes.append(f"sold {sp:g}% @ {px:g}" + (f" ({sell_label})" if sell_label else ""))
+    # fully sold = play over: close it automatically with the result the sells imply
+    if close is None and not p.get("closed") and sum(s["pct"] for s in (p.get("sells") or [])) >= 99.99:
+        ax = spot_weighted_exit(p)
+        r = spot_signed_r(p, ax) if ax else None
+        if r is not None:
+            res = "WIN" if r > 0.05 else "LOSS" if r < -0.05 else "BE"
+        else:
+            ref = spot_ref_entry(p)
+            pc = ((ax - ref) / ref * 100) if (ref and ax) else None
+            res = "WIN" if (pc is not None and pc > 0.5) else "LOSS" if (pc is not None and pc < -0.5) else "BE"
+        data[play] = p
+        save_spot(data)
+        await _spot_do_close(interaction, data, play, p, res, result_pct=None,
+                             avg_exit=(f"{ax:g}" if ax else avg_exit),
+                             note=note or "Bag fully sold - closed automatically")
+        return
     if close is not None:
         if changes:
             data[play] = p
@@ -7065,7 +7081,7 @@ async def crowded_cmd(interaction: discord.Interaction):
     await interaction.followup.send(embed=e)
 
 
-@bot.tree.command(name="exitwatch", description="Bull-market heat gauge - structure + leverage + sentiment in one score. When to think about de-risking")
+@bot.tree.command(name="exitwatch", description="Bull-market heat gauge - structure, leverage, sentiment in one score. When to de-risk")
 async def exitwatch_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     def sma(v, n):
@@ -7778,7 +7794,21 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     embed.add_field(name="Graded on", value=(f"{len(rs)} closed" if rs else "-"), inline=True)
     embed.add_field(name="Best", value=(f"{best:+g}R" if best is not None else "-"), inline=True)
     embed.add_field(name="Worst", value=(f"{worst:+g}R" if worst is not None else "-"), inline=True)
-    embed.set_footer(text="Sigma Trading - Journal")
+    # spot, same window - so one card shows the analyst's whole month
+    s_closed = [p for p in load_spot().values()
+                if p.get("analyst_id") == target.id and p.get("closed") and _in_window(p, w_start, w_end)]
+    s_rs = [r for r in (spot_result_r(p) for p in s_closed) if r is not None]
+    if s_closed:
+        s_w = sum(1 for p in s_closed if p.get("result") == "WIN")
+        s_l = sum(1 for p in s_closed if p.get("result") == "LOSS")
+        embed.add_field(name=f"Spot ({plabel.lower()})",
+                        value=f"{len(s_closed)} closed \u00b7 {s_w}W/{s_l}L \u00b7 "
+                              + (f"**{sum(s_rs):+.2f}R** ({len(s_rs)} graded)" if s_rs else "not graded"),
+                        inline=False)
+        if rs or s_rs:
+            comb = (total_r or 0) + sum(s_rs)
+            embed.add_field(name="Combined R (futures + spot)", value=f"**{comb:+.2f}R**", inline=False)
+    embed.set_footer(text="Sigma Trading - Journal \u00b7 spot R = (exit - entry) / (entry - invalidation)")
     await interaction.followup.send(embed=embed, view=StatsCSVView(mine, target.display_name), ephemeral=True)
 
 
