@@ -7782,33 +7782,28 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
         ecolor = discord.Color.from_str(analyst_color_hex(target))
     except Exception:
         ecolor = NAVY
-    embed = discord.Embed(title=f"Scorecard - {target.display_name} \u00b7 {plabel}", color=ecolor)
-    embed.add_field(name="Total setups (all time)", value=str(total), inline=True)
-    embed.add_field(name=f"Closed ({plabel.lower()})", value=str(len(closed)), inline=True)
-    embed.add_field(name="Open now", value=str(sum(1 for t in mine if not t.get("closed"))), inline=True)
-    embed.add_field(name="Win rate", value=(f"{wr:.0f}% ({len(wins)}W/{len(losses)}L)" if decided else "-"), inline=True)
-    embed.add_field(name="TP1 hit rate", value=(f"{tp1_rate:.0f}%" if total else "-"), inline=True)
-    embed.add_field(name="BE / Invalid", value=f"{len(be)} / {len(invalid)}", inline=True)
-    embed.add_field(name="Total R", value=(f"{total_r:+.2f}R" if total_r is not None else "-"), inline=True)
-    embed.add_field(name="Avg R", value=(f"{avg_r:+.2f}R" if avg_r is not None else "-"), inline=True)
-    embed.add_field(name="Graded on", value=(f"{len(rs)} closed" if rs else "-"), inline=True)
-    embed.add_field(name="Best", value=(f"{best:+g}R" if best is not None else "-"), inline=True)
-    embed.add_field(name="Worst", value=(f"{worst:+g}R" if worst is not None else "-"), inline=True)
-    # spot, same window - so one card shows the analyst's whole month
-    s_closed = [p for p in load_spot().values()
-                if p.get("analyst_id") == target.id and p.get("closed") and _in_window(p, w_start, w_end)]
+    # spot, same window
+    s_all = [p for p in load_spot().values() if p.get("analyst_id") == target.id]
+    s_closed = [p for p in s_all if p.get("closed") and _in_window(p, w_start, w_end)]
     s_rs = [r for r in (spot_result_r(p) for p in s_closed) if r is not None]
-    if s_closed:
-        s_w = sum(1 for p in s_closed if p.get("result") == "WIN")
-        s_l = sum(1 for p in s_closed if p.get("result") == "LOSS")
-        embed.add_field(name=f"Spot ({plabel.lower()})",
-                        value=f"{len(s_closed)} closed \u00b7 {s_w}W/{s_l}L \u00b7 "
-                              + (f"**{sum(s_rs):+.2f}R** ({len(s_rs)} graded)" if s_rs else "not graded"),
-                        inline=False)
-        if rs or s_rs:
-            comb = (total_r or 0) + sum(s_rs)
-            embed.add_field(name="Combined R (futures + spot)", value=f"**{comb:+.2f}R**", inline=False)
-    embed.set_footer(text="Sigma Trading - Journal \u00b7 spot R = (exit - entry) / (entry - invalidation)")
+    s_w = sum(1 for p in s_closed if p.get("result") == "WIN")
+    s_l = sum(1 for p in s_closed if p.get("result") == "LOSS")
+    s_wr = (s_w / (s_w + s_l) * 100) if (s_w + s_l) else 0
+    fut_r = total_r if total_r is not None else 0.0
+    spot_r = sum(s_rs) if s_rs else 0.0
+    embed = discord.Embed(title=f"Scorecard - {target.display_name} \u00b7 {plabel}", color=ecolor)
+    embed.add_field(name="Futures R", value=(f"**{fut_r:+.2f}R**" if rs else "-"), inline=True)
+    embed.add_field(name="Spot R", value=(f"**{spot_r:+.2f}R**" if s_rs else "-"), inline=True)
+    embed.add_field(name="Total R", value=(f"**{fut_r + spot_r:+.2f}R**" if (rs or s_rs) else "-"), inline=True)
+    embed.add_field(name="Futures", value=(f"{len(closed)} closed \u00b7 {len(wins)}W/{len(losses)}L \u00b7 {wr:.0f}%" if closed else "no closes"), inline=True)
+    embed.add_field(name="Spot", value=(f"{len(s_closed)} closed \u00b7 {s_w}W/{s_l}L \u00b7 {s_wr:.0f}%" if s_closed else "no closes"), inline=True)
+    embed.add_field(name="Open now", value=f"{sum(1 for t in mine if not t.get('closed'))} futures \u00b7 {sum(1 for p in s_all if not p.get('closed'))} spot", inline=True)
+    tail = []
+    if best is not None:
+        tail.append(f"best {best:+g}R \u00b7 worst {worst:+g}R")
+    tail.append(f"BE/invalidated {len(be)}/{len(invalid)}")
+    embed.add_field(name="\u200b", value=" \u00b7 ".join(tail), inline=False)
+    embed.set_footer(text="Sigma Trading - Journal \u00b7 R only counts graded closes")
     await interaction.followup.send(embed=embed, view=StatsCSVView(mine, target.display_name), ephemeral=True)
 
 
