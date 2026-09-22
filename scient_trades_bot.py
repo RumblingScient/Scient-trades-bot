@@ -7,6 +7,48 @@ from discord.ext import tasks
 import os, json, re, hashlib, aiohttp, io, asyncio, csv
 from pathlib import Path
 from datetime import datetime, timezone, timedelta, time as dt_time
+import logging, logging.handlers, builtins, time as _time, traceback as _tb
+
+# ─── OPS: structured logging (journalctl + rotating file) ───────────────────
+_LOG_DIR = Path(__file__).resolve().parent / "logs"
+_LOG_DIR.mkdir(exist_ok=True)
+log = logging.getLogger("sigma")
+log.setLevel(logging.INFO)
+_fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%M:%S")
+_fh = logging.handlers.RotatingFileHandler(_LOG_DIR / "sigma_bot.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
+_fh.setFormatter(_fmt); log.addHandler(_fh)
+_sh = logging.StreamHandler(); _sh.setFormatter(_fmt); log.addHandler(_sh)
+def print(*args, **kwargs):  # every existing print() lands in the log file too
+    log.info(" ".join(str(a) for a in args))
+builtins.print = print
+
+OPS_CHANNEL_ID = int(os.getenv("SIGMA_OPS_CHANNEL_ID", "0") or 0)   # BACKSTAGE ops channel for alerts
+_ops_recent: dict = {}
+_ERR_LOG: list = []           # (ts, where, msg) - last 200 for /health
+BOOT_TS = _time.time()
+HEARTBEAT: dict = {}          # loop name -> last successful tick ts
+
+
+def _note_error(where: str, err):
+    _ERR_LOG.append((_time.time(), where, str(err)[:300]))
+    del _ERR_LOG[:-200]
+    log.error(f"[{where}] {err}\n{_tb.format_exc()}")
+
+
+async def ops_alert(text: str, key: str = None, cooldown: int = 600):
+    """Post to the ops channel (deduped per key for `cooldown` seconds). Never raises."""
+    key = key or text[:80]
+    now = _time.time()
+    if now - _ops_recent.get(key, 0) < cooldown:
+        return
+    _ops_recent[key] = now
+    log.warning(f"[ops] {text}")
+    try:
+        ch = bot.get_channel(OPS_CHANNEL_ID) if OPS_CHANNEL_ID else None
+        if ch:
+            await ch.send(f"\u26a0 **ops** \u00b7 {text[:1800]}")
+    except Exception:
+        pass
 
 _env_file = Path(__file__).with_name(".env")
 if _env_file.exists():
@@ -16,6 +58,7 @@ if _env_file.exists():
             os.environ.setdefault(_k.strip(), _v.strip())
 
 BOT_TOKEN = os.getenv("SCIENT_BOT_TOKEN", "PASTE_TOKEN_HERE")
+OPS_CHANNEL_ID = int(os.getenv("SIGMA_OPS_CHANNEL_ID", "0") or 0)   # re-read now that .env is loaded
 TWITTERAPIS_KEY = os.getenv("TWITTERAPIS_KEY", "")
 GUILD_ID = 1213101801675554846
 TRADES_CHANNEL_ID = 1525147189360332840
@@ -186,18 +229,40 @@ intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 
+_CORRUPT: set = set()   # paths that failed to parse - saves to them are refused until fixed
+
+
 def _load(path: Path) -> dict:
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except Exception:
-            return {}
-    return {}
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception as e:
+        bak = path.with_suffix(path.suffix + ".bak")
+        if bak.exists():
+            try:
+                data = json.loads(bak.read_text())
+                log.error(f"[data] {path.name} is corrupt ({e}) - served from {bak.name}")
+                _CORRUPT.add(str(path))
+                return data
+            except Exception:
+                pass
+        _CORRUPT.add(str(path))
+        _note_error("data-load", f"{path.name} unreadable and no valid .bak: {e}")
+        return {}
 
 
 def _save(path: Path, data: dict):
+    if str(path) in _CORRUPT:
+        _note_error("data-save", f"REFUSED write to {path.name}: file was corrupt at load")
+        raise RuntimeError(f"{path.name} is marked corrupt - restore from backup, then restart")
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    if path.exists():
+        try:
+            os.replace(path, path.with_suffix(path.suffix + ".bak"))   # last-good copy, always
+        except Exception:
+            pass
     os.replace(tmp, path)  # atomic on POSIX - never leaves a half-written file
 
 
@@ -542,6 +607,9 @@ def unified_tp_text(t: dict, spot: bool = False) -> str:
         extra = ""
         if spot:
             extra = spot_pct_text(t, px)
+            rr = spot_signed_r(t, px)
+            if rr is not None:
+                extra += f" {rr:+.1f}R"
         else:
             r = signed_r(t, px)
             extra = f" ({r:+.1f}R)" if r is not None else ""
@@ -728,6 +796,40 @@ def spot_ref_entry(p: dict):
     if not nums:
         return None
     return sum(nums[:2]) / min(2, len(nums))
+
+
+def spot_inv_num(p: dict):
+    """Invalidation level for a spot play - last standalone number in the invalidation text."""
+    num, _cond = parse_sl(p.get("invalidation"))
+    return spot_num(num) if num else None
+
+
+def spot_signed_r(p: dict, price) -> float | None:
+    """R for a spot play: (price - entry) / (entry - invalidation). None if it can't be graded."""
+    ref = spot_ref_entry(p)
+    inv = spot_inv_num(p)
+    px = spot_num(price)
+    if not ref or not inv or px is None or ref <= inv:
+        return None
+    return (px - ref) / (ref - inv)
+
+
+def spot_result_r(p: dict):
+    """Stored result_r, else computed from avg_exit - so plays closed before R existed are graded too."""
+    if isinstance(p.get("result_r"), (int, float)):
+        return p["result_r"]
+    if p.get("result") == "INVALID":
+        return None
+    r = spot_signed_r(p, p.get("avg_exit"))
+    return round(r, 2) if r is not None else None
+
+
+def _rec_r(kind: str, t: dict):
+    """Graded R for any closed record - futures stored, spot stored-or-computed."""
+    if kind == "spot":
+        return spot_result_r(t)
+    r = t.get("result_r")
+    return r if isinstance(r, (int, float)) else None
 
 
 def spot_pct_text(p: dict, target) -> str:
@@ -957,8 +1059,9 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
         embed.add_field(name="Avg Entry", value=str(p.get("avg_entry") or "-"), inline=True)
         if p.get("avg_exit"):
             embed.add_field(name="Avg Exit", value=str(p["avg_exit"]), inline=True)
-        if p.get("result_pct"):
-            embed.add_field(name="Result", value=str(p["result_pct"]), inline=True)
+        _rr = spot_result_r(p)
+        if p.get("result_pct") or _rr is not None:
+            embed.add_field(name="Result", value=" \u00b7 ".join(x for x in (str(p.get("result_pct") or ""), f"{_rr:+.2f}R" if _rr is not None else "") if x), inline=True)
     else:
         zone_mark = " (filled)" if p.get("zone_filled") else ""
         embed.add_field(name="DCA Zone", value=f"{p['dca_zone']}{zone_mark}", inline=True)
@@ -1019,7 +1122,7 @@ def build_board_embed() -> discord.Embed:
             d = emo("longR", "\u25b2") + " L" if t["direction"] == "LONG" else emo("shortR", "\u25bc") + " S"
             e = entry_display(t, marks=False)
             lines.append(f"{d} **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "") + f" - entry `{e}` - {short_status(t)} - [view]({jump_url(t)})")
-        embed.add_field(name=f"{name} ({len(trades)})", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(name=f"{name} ({len(trades)})", value=_fit_lines(lines), inline=False)
     return embed
 
 
@@ -1047,7 +1150,7 @@ def build_spot_board_embed() -> discord.Embed:
         for p in plays:
             avg = f" - avg `{p['avg_entry']}`" if p.get("avg_entry") else ""
             lines.append(f"\U0001FA99 **{p['pair'].upper()}** - zone `{p['dca_zone']}`{avg} - {spot_status_line(p)} - [view]({jump_url(p)})")
-        embed.add_field(name=f"{name} ({len(plays)})", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(name=f"{name} ({len(plays)})", value=_fit_lines(lines), inline=False)
     return embed
 
 
@@ -1056,7 +1159,17 @@ PRICE_WATCH_ENABLED = True
 PRICE_WATCH_SEC = 60
 AUTO_CLOSE_ON_HARD_SL = True    # plain numeric SL: auto-close on touch. Soft SL ("4h close below X"): notify only.
 _pw_unsupported: set = set()
+_pw_fail: dict = {}            # symbol -> consecutive transient failures
 _pw_lock = asyncio.Lock()
+STATE_LOCK = asyncio.Lock()    # serialises read-modify-write on trades between the tracker and commands
+import functools as _functools
+def _with_state_lock(fn):
+    """Run a mutating slash command under STATE_LOCK so it can't race the price tracker."""
+    @_functools.wraps(fn)
+    async def _w(*a, **kw):
+        async with STATE_LOCK:
+            return await fn(*a, **kw)
+    return _w
 
 
 def _pw_symbol(pair: str):
@@ -1081,12 +1194,14 @@ async def _pw_klines(symbol: str, since_ms: int):
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status in (400, 404):
+                    return "BAD_SYMBOL"          # permanent: not listed on Binance futures
                 if r.status != 200:
-                    return None
+                    return None                  # transient: 429 / 5xx
                 rows = await r.json()
         return [(int(k[0]), float(k[2]), float(k[3]), float(k[4])) for k in rows]
     except Exception:
-        return None
+        return None                              # transient: network
 
 
 async def _pw_announce(t, title, color, line):
@@ -1194,7 +1309,8 @@ async def _before_price_watch():
 async def _price_watch_tick():
     if not PRICE_WATCH_ENABLED or _pw_lock.locked():
         return
-    async with _pw_lock:
+    async with _pw_lock, STATE_LOCK:
+        HEARTBEAT["price_watch"] = _time.time()
         data = load_trades()
         open_trades = {tid: t for tid, t in data.items() if not t.get("closed")}
         if not open_trades:
@@ -1210,10 +1326,16 @@ async def _price_watch_tick():
         for sym, items in by_sym.items():
             since = min(int(t.get("watch_ms") or (now_ms - 120_000)) for _, t in items)
             candles = await _pw_klines(sym, since)
-            if candles is None:
+            if candles == "BAD_SYMBOL":
                 _pw_unsupported.add(sym)
-                print(f"[watch] no feed for {sym} - manual tracking only", flush=True)
+                print(f"[watch] {sym} not on Binance futures - manual tracking only", flush=True)
                 continue
+            if candles is None:
+                n = _pw_fail[sym] = _pw_fail.get(sym, 0) + 1
+                if n == 5:
+                    await ops_alert(f"price feed for {sym} failing ({n} ticks in a row) - auto-tracking paused, will keep retrying", key=f"feed:{sym}")
+                continue
+            _pw_fail.pop(sym, None)
             for tid, t in items:
                 if t.get("watch_disabled"):
                     continue
@@ -1378,6 +1500,17 @@ async def _sizer_router(interaction: discord.Interaction):
             pass
 
 
+def _fit_lines(lines, limit=1024):
+    """Keep whole lines under Discord's 1024-char field cap; note how many were cut."""
+    out, used = [], 0
+    for i, ln in enumerate(lines):
+        if used + len(ln) + 1 > limit - 24:
+            out.append(f"*+{len(lines) - i} more*")
+            break
+        out.append(ln); used += len(ln) + 1
+    return "\n".join(out) if out else "\u200b"
+
+
 def build_combined_board_embed() -> discord.Embed:
     """One pinned card: FUTURES section on top, SPOT section below, per-analyst rows in each."""
     fut = [t for t in load_trades().values() if not t.get("closed")]
@@ -1407,7 +1540,7 @@ def build_combined_board_embed() -> discord.Embed:
             e = entry_display(t, marks=False)
             lines.append(f"{d} **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "")
                          + f" - entry `{e}` - {short_status(t)} - [view]({jump_url(t)})")
-        embed.add_field(name=f"{name} ({len(trades)})", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(name=f"{name} ({len(trades)})", value=_fit_lines(lines), inline=False)
 
     # ── SPOT ──
     embed.add_field(name="\u2500\u2500\u2500  SPOT  \u2500\u2500\u2500", value="\u200b", inline=False)
@@ -1419,9 +1552,15 @@ def build_combined_board_embed() -> discord.Embed:
             avg = f" - avg `{p['avg_entry']}`" if p.get("avg_entry") else ""
             lines.append(f"\U0001FA99 **{p['pair'].upper()}** - zone `{p['dca_zone']}`{avg}"
                          f" - {spot_status_line(p)} - [view]({jump_url(p)})")
-        embed.add_field(name=f"{name} ({len(plays)})", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(name=f"{name} ({len(plays)})", value=_fit_lines(lines), inline=False)
 
     embed.set_footer(text=f"Sigma Trading - {len(fut)} futures / {len(spo)} spot - auto-updates")
+    # Discord rejects embeds over 6000 chars - trim the longest fields until it fits
+    while len(embed) > 5900 and any(len(f.value) > 300 for f in embed.fields):
+        idx = max(range(len(embed.fields)), key=lambda i: len(embed.fields[i].value))
+        f = embed.fields[idx]
+        keep = f.value.splitlines()[:-2]
+        embed.set_field_at(idx, name=f.name, value=_fit_lines(keep, limit=max(300, len(f.value) - 200)), inline=False)
     return embed
 
 
@@ -2684,11 +2823,115 @@ async def on_member_update(before: discord.Member, after: discord.Member):
             print(f"[welcome] PRO DM error for {after.id}: {e}")
 
 
+async def on_app_command_error(interaction: discord.Interaction, error: Exception):
+    """Every slash-command failure: user gets a real message, ops gets a ping, log gets the trace."""
+    root = getattr(error, "original", error)
+    cmd = interaction.command.qualified_name if interaction.command else "?"
+    _note_error(f"cmd:/{cmd}", root)
+    await ops_alert(f"/{cmd} failed for {interaction.user} - `{type(root).__name__}: {str(root)[:160]}`", key=f"cmd:{cmd}:{type(root).__name__}")
+    msg = "Something broke on that command - it's logged and the admin has been pinged. Nothing was changed."
+    try:
+        if interaction.response.is_done():
+            await interaction.followup.send(msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(msg, ephemeral=True)
+    except Exception:
+        pass
+
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    tail = _tb.format_exc().strip().splitlines()
+    _note_error(f"event:{event}", tail[-1] if tail else "unknown")
+    await ops_alert(f"event handler `{event}` raised - see logs", key=f"event:{event}")
+
+
+def _self_heal(loop_obj, name: str, delay: int = 30):
+    """discord.py stops a tasks.loop on an unhandled exception. This restarts it after `delay`s."""
+    async def _on_err(*args):
+        exc = args[-1]
+        _note_error(f"loop:{name}", exc)
+        await ops_alert(f"loop `{name}` crashed: `{type(exc).__name__}: {str(exc)[:160]}` - restarting in {delay}s", key=f"loop:{name}")
+        await asyncio.sleep(delay)
+        try:
+            loop_obj.restart()
+        except Exception as e2:
+            _note_error(f"loop-restart:{name}", e2)
+    loop_obj.error(_on_err)
+    return loop_obj
+
+
+def _validate_startup():
+    problems = []
+    for name, cid in (("TRADES_CHANNEL_ID", TRADES_CHANNEL_ID), ("RESULTS_CHANNEL_ID", RESULTS_CHANNEL_ID),
+                      ("OPEN_BOARD_CHANNEL_ID", OPEN_BOARD_CHANNEL_ID)):
+        if cid and bot.get_channel(cid) is None:
+            problems.append(f"{name}={cid} not visible to the bot")
+    if _CORRUPT:
+        problems.append("corrupt data files: " + ", ".join(Path(p).name for p in _CORRUPT))
+    return problems
+
+
+_ALL_LOOPS = None
+def _loops():
+    global _ALL_LOOPS
+    if _ALL_LOOPS is None:
+        _ALL_LOOPS = (("price_watch", price_watch_loop), ("results", results_watch_loop), ("subs", subs_check_loop),
+                      ("monthly", sigma_monthly_loop), ("weekly", sigma_recap_loop), ("backup", backup_loop),
+                      ("x_poll", x_poll_loop), ("alerts", alert_check_loop), ("tg_move", tg_move_loop),
+                      ("tg_brief", tg_brief_loop), ("tg_sources", tg_sources_loop), ("tg_digest", tg_digest_loop),
+                      ("funding", funding_guard_loop))
+    return _ALL_LOOPS
+
+
+@bot.tree.command(name="health", description="(Admin) Bot health - loops, feed, data files, recent errors")
+async def health_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    now = _time.time()
+    up = int(now - BOOT_TS)
+    e = discord.Embed(title="SigmaBot health", color=NAVY)
+    e.add_field(name="Uptime", value=f"{up // 86400}d {(up % 86400) // 3600}h {(up % 3600) // 60}m", inline=True)
+    e.add_field(name="Latency", value=f"{bot.latency * 1000:.0f} ms", inline=True)
+    rows = []
+    for nm, lp in _loops():
+        hb = HEARTBEAT.get(nm)
+        age = f"{int(now - hb)}s ago" if hb else "-"
+        rows.append(f"{'\u2705' if lp.is_running() else '\u274c'} {nm} \u00b7 {age}")
+    e.add_field(name="Loops", value="\n".join(rows), inline=False)
+    files = []
+    for nm, pth in (("trades", JOURNAL_FILE), ("spot", SPOT_FILE), ("results", RESULTS_FILE)):
+        try:
+            d = _load(pth)
+            files.append(f"{nm}: {len(d)} records \u00b7 {pth.stat().st_size // 1024} KB" + ("  \u26a0 CORRUPT" if str(pth) in _CORRUPT else ""))
+        except Exception as ex:
+            files.append(f"{nm}: {ex}")
+    e.add_field(name="Data", value="\n".join(files), inline=False)
+    e.add_field(name="Feed", value=(f"unsupported: {', '.join(sorted(_pw_unsupported)) or 'none'}\n"
+                                    f"failing: {', '.join(f'{k}({v})' for k, v in _pw_fail.items()) or 'none'}"), inline=False)
+    recent = [x for x in _ERR_LOG if now - x[0] < 86400]
+    e.add_field(name=f"Errors (24h): {len(recent)}",
+                value=("\n".join(f"`{w}` {m[:80]}" for _, w, m in recent[-6:]) if recent else "none"), inline=False)
+    probs = _validate_startup()
+    e.add_field(name="Config", value=("\n".join(probs) if probs else "ok"), inline=False)
+    e.set_footer(text=f"ops channel: {'set' if OPS_CHANNEL_ID else 'NOT SET (SIGMA_OPS_CHANNEL_ID)'} \u00b7 log: logs/sigma_bot.log")
+    await interaction.response.send_message(embed=e, ephemeral=True)
+
+
 @bot.event
 async def on_ready():
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
+    bot.tree.on_error = on_app_command_error
     await bot.tree.sync(guild=guild)
+    for nm, lp in _loops():
+        if not getattr(lp, "_sigma_healed", False):
+            _self_heal(lp, nm); lp._sigma_healed = True
+    probs = _validate_startup()
+    if probs:
+        await ops_alert("startup problems: " + "; ".join(probs), key="startup")
+    log.info(f"[boot] ready - ops_channel={'set' if OPS_CHANNEL_ID else 'unset'}, corrupt={sorted(_CORRUPT) or 'none'}")
     bot.add_view(FollowPanel())
     await refresh_board()
     await refresh_spot_board()
@@ -3169,9 +3412,9 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
     buy_pct="With buy_price: how much of the planned bag this buy was, e.g. 25 = 25% (optional)",
     avg_entry="Set average entry MANUALLY (overrides the auto-calc) (optional)",
     status="New phase (optional)",
-    target_hit="Only if price actually reached the target. Sells auto-tick targets they reach. Undo / re-check here too",
-    sold_pct="Take profit - % of the bag sold (e.g. 30). Numbered TP1, TP2... automatically, no limit",
-    sell_price="Take profit - price you sold at (goes with sold_pct)",
+    tp_hit="Preset TP reached - bot logs the planned % at that price. Undo / rebuild here too",
+    manual_tp="Manual take profit - the price you sold at. Auto-numbered TP1, TP2... no limit",
+    tp_pct="% of the bag sold at this TP (with manual_tp, or to override the plan on tp_hit)",
     zone_filled="Mark DCA zone fully filled (optional)",
     tp_split="Set / change the planned sell % per target, e.g. 30/30/40",
     close="CLOSE the play right here - Win / Loss / BE / Invalidated (zone never filled)",
@@ -3180,7 +3423,7 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
 )
 @app_commands.choices(
     status=[app_commands.Choice(name=s.capitalize(), value=s) for s in SPOT_STATUSES],
-    target_hit=[
+    tp_hit=[
         app_commands.Choice(name="Target 1 reached", value="t1"),
         app_commands.Choice(name="Target 2 reached", value="t2"),
         app_commands.Choice(name="Target 3 reached", value="t3"),
@@ -3198,7 +3441,9 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
     ],
 )
 @app_commands.autocomplete(play=open_spot_ac)
-async def spot_update(interaction: discord.Interaction, play: str, buy_price: str = None, buy_pct: str = None, avg_entry: str = None, status: app_commands.Choice[str] = None, target_hit: app_commands.Choice[str] = None, sold_pct: str = None, sell_price: str = None, zone_filled: app_commands.Choice[str] = None, tp_split: str = None, close: app_commands.Choice[str] = None, avg_exit: str = None, note: str = None):
+@_with_state_lock
+async def spot_update(interaction: discord.Interaction, play: str, tp_hit: app_commands.Choice[str] = None, manual_tp: str = None, tp_pct: str = None, buy_price: str = None, buy_pct: str = None, avg_entry: str = None, zone_filled: app_commands.Choice[str] = None, tp_split: str = None, status: app_commands.Choice[str] = None, close: app_commands.Choice[str] = None, avg_exit: str = None, note: str = None):
+    target_hit, sell_price, sold_pct = tp_hit, manual_tp, tp_pct
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -3207,6 +3452,9 @@ async def spot_update(interaction: discord.Interaction, play: str, buy_price: st
     p = data.get(play)
     if not p:
         await interaction.followup.send("Play not found.", ephemeral=True)
+        return
+    if not (interaction.user.guild_permissions.administrator or p.get("analyst_id") == interaction.user.id):
+        await interaction.followup.send("Only the analyst who posted this play (or an admin) can update it.", ephemeral=True)
         return
     changes = []
     if buy_price is not None:
@@ -3265,7 +3513,7 @@ async def spot_update(interaction: discord.Interaction, play: str, buy_price: st
             if px_guard is not None and px_guard < tp:
                 await interaction.followup.send(
                     f"Sold @ {px_guard:g} is **below** {tv.upper()} ({tp:g}) - that's a discretionary sell, not a target hit. "
-                    f"Run it again without `target_hit` and the sell is recorded on its own.", ephemeral=True)
+                    f"Log it with `manual_tp` + `tp_pct` instead (no `tp_hit`).", ephemeral=True)
                 return
             p[f"{tv}_hit"] = True
             changes.append(f"{tv.upper()} ({tp:g}) reached")
@@ -3285,7 +3533,7 @@ async def spot_update(interaction: discord.Interaction, play: str, buy_price: st
                         _sync_tp_flags(p, spot=True)
                         changes.append(f"sold {pct:g}% @ {tp:g} (planned)")
                 else:
-                    changes.append("no planned % for this target - add sold_pct to record the sell")
+                    changes.append("no planned % for this target - add tp_pct to record the sell")
             elif sell_price is not None:
                 sell_label = lab
     if zone_filled is not None:
@@ -3294,10 +3542,10 @@ async def spot_update(interaction: discord.Interaction, play: str, buy_price: st
         sp = spot_num(sold_pct)
         px = spot_num(sell_price)
         if sp is None or px is None:
-            await interaction.followup.send("Partial sell needs **both** `sold_pct` and `sell_price`.", ephemeral=True)
+            await interaction.followup.send("A manual take profit needs **both** `manual_tp` (price) and `tp_pct` (% sold).", ephemeral=True)
             return
         if sp <= 0 or sp > 100:
-            await interaction.followup.send("sold_pct must be between 0 and 100.", ephemeral=True)
+            await interaction.followup.send("tp_pct must be between 0 and 100.", ephemeral=True)
             return
         already = sum(s["pct"] for s in (p.get("sells") or []))
         if already + sp > 100.01:
@@ -3357,6 +3605,8 @@ async def _spot_do_close(interaction, data, play, p, result_value, result_pct=No
     p["result"] = result_value
     p["result_pct"] = result_pct
     p["avg_exit"] = avg_exit
+    _r = spot_signed_r(p, avg_exit) if result_value != "INVALID" else None
+    p["result_r"] = round(_r, 2) if _r is not None else None
     p["closed_at"] = datetime.now(timezone.utc).isoformat()
     if note:
         p["close_note"] = note
@@ -3367,7 +3617,8 @@ async def _spot_do_close(interaction, data, play, p, result_value, result_pct=No
     save_spot(data)
     await refresh_and_edit(p, spot_mode=True)
     await refresh_spot_board()
-    ptxt = f" ({result_pct})" if result_pct else ""
+    ptxt = f" ({result_pct}" + (f" \u00b7 {p['result_r']:+.2f}R" if isinstance(p.get("result_r"), (int, float)) else "") + ")" if result_pct else \
+           (f" ({p['result_r']:+.2f}R)" if isinstance(p.get("result_r"), (int, float)) else "")
     feed = {
         "WIN": (f"Spot Closed - Win{ptxt}", GREEN, "Play closed in profit."),
         "LOSS": (f"Spot Closed - Loss{ptxt}", RED, "Play closed at a loss."),
@@ -3392,6 +3643,7 @@ async def _spot_do_close(interaction, data, play, p, result_value, result_pct=No
     app_commands.Choice(name="Invalidated - zone never filled / thesis gone", value="INVALID"),
 ])
 @app_commands.autocomplete(play=open_spot_ac)
+@_with_state_lock
 async def spot_close(interaction: discord.Interaction, play: str, result: app_commands.Choice[str], result_pct: str = None, avg_exit: str = None, note: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
@@ -3401,6 +3653,9 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     p = data.get(play)
     if not p:
         await interaction.followup.send("Play not found.", ephemeral=True)
+        return
+    if not (interaction.user.guild_permissions.administrator or p.get("analyst_id") == interaction.user.id):
+        await interaction.followup.send("Only the analyst who posted this play (or an admin) can close it.", ephemeral=True)
         return
     await _spot_do_close(interaction, data, play, p, result.value, result_pct, avg_exit, note)
 
@@ -3436,6 +3691,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     ],
 )
 @app_commands.autocomplete(trade=editable_any_ac)
+@_with_state_lock
 async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, entry_split: str = None, tp_split: str = None, stop_loss: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, tp4: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
@@ -3602,6 +3858,7 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     app_commands.Choice(name="Invalidated (never triggered)", value="CI"),
 ])
 @app_commands.autocomplete(trade=open_trades_ac)
+@_with_state_lock
 async def update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str], size_pct: str = None, price: str = None, new_sl: str = None, note: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
@@ -3674,7 +3931,7 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         if fill_price is None:
             await interaction.followup.send(f"{ev} has no price set on the trade - pass `price` with this update.", ephemeral=True)
             return
-        t["fills"].append({"price": fill_price, "pct": pct, "label": ev})
+        t.setdefault("fills", []).append({"price": fill_price, "pct": pct, "label": ev})
         _sync_tp_flags(t)
         desc = f"{ev} hit @ {fnum(fill_price)} ({pct:g}%)"
     elif ev == "PTP":
@@ -3690,7 +3947,7 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
         t["entry1_filled"] = True
         n = sum(1 for f in (t.get("fills") or []) if _is_tp_fill(f)) + 1
         label = f"TP{n}"
-        t["fills"].append({"price": px, "pct": pct, "label": label})
+        t.setdefault("fills", []).append({"price": px, "pct": pct, "label": label})
         _sync_tp_flags(t)
         desc = f"{label} taken @ {fnum(px)} ({pct:g}%)" + (f" - planned {', '.join(reached)} reached" if reached else "")
     elif ev == "BE":
@@ -3815,7 +4072,7 @@ async def recent(interaction: discord.Interaction, analyst: discord.Member = Non
             rtxt = f" ({r:+g}R)" if isinstance(r, (int, float)) else ""
             emoji = {"WIN": "\u2705", "LOSS": "\u274C", "BE": "\u2796", "INVALID": "\U0001F6AB"}.get(res, "")
             lines.append(f"{emoji} {d} **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "") + f" - {res}{rtxt} - {t.get('analyst_name', '')} - [view]({jump_url(t)})")
-        embed.add_field(name="Futures", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(name="Futures", value=_fit_lines(lines), inline=False)
     if sclosed:
         lines = []
         for p in sclosed:
@@ -3823,7 +4080,7 @@ async def recent(interaction: discord.Interaction, analyst: discord.Member = Non
             pct = f" ({p['result_pct']})" if p.get("result_pct") else ""
             emoji = {"WIN": "\u2705", "LOSS": "\u274C", "BE": "\u2796", "INVALID": "\U0001F6AB"}.get(res, "")
             lines.append(f"{emoji} \U0001FA99 **{p['pair'].upper()}** - {res}{pct} - {p.get('analyst_name', '')} - [view]({jump_url(p)})")
-        embed.add_field(name="Spot", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(name="Spot", value=_fit_lines(lines), inline=False)
     if not closed and not sclosed:
         embed.description = "*No closed trades yet.*"
     embed.set_footer(text="Sigma Trading - Journal")
@@ -6615,9 +6872,323 @@ def make_compare_image(sym1: str, sym2: str, closes1: list, closes2: list, dates
     return buf
 
 
+# ═══════════════ SIGMA TERMINAL - BULL MARKET SCANNERS ═══════════════
+_SCAN_CACHE: dict = {"ts": 0, "rows": None}
+_STABLE_BASES = {"USDC", "BUSD", "FDUSD", "TUSD", "USDP", "DAI", "USDE", "EUR"}
+
+
+async def _scan_universe(n: int = 40):
+    """Top-n Binance USDT perps by 24h quote volume, each with 31 daily candles. Cached 5 min."""
+    now = _time.time()
+    if _SCAN_CACHE["rows"] is not None and now - _SCAN_CACHE["ts"] < 300:
+        return _SCAN_CACHE["rows"]
+    async with aiohttp.ClientSession() as s:
+        tick = await _get_json(s, "https://fapi.binance.com/fapi/v1/ticker/24hr", None, 15)
+        if not tick:
+            return None
+        syms = [x for x in tick if x.get("symbol", "").endswith("USDT")
+                and x["symbol"][:-4] not in _STABLE_BASES and not x["symbol"][:-4].endswith("DOWN")
+                and not x["symbol"][:-4].endswith("UP")]
+        syms.sort(key=lambda x: float(x.get("quoteVolume", 0) or 0), reverse=True)
+        syms = syms[:n]
+        sem = asyncio.Semaphore(8)
+
+        async def one(sym):
+            async with sem:
+                k = await _get_json(s, "https://fapi.binance.com/fapi/v1/klines",
+                                    {"symbol": sym, "interval": "1d", "limit": 31}, 15)
+                if not k or len(k) < 8:
+                    return None
+                closes = [float(c[4]) for c in k]
+                highs = [float(c[2]) for c in k]
+                vols = [float(c[7]) for c in k]      # quote volume
+                return {"symbol": sym, "base": sym[:-4], "closes": closes, "highs": highs, "vols": vols}
+        rows = [r for r in await asyncio.gather(*(one(x["symbol"]) for x in syms)) if r]
+        if "BTCUSDT" not in {r["symbol"] for r in rows}:
+            b = await one("BTCUSDT")
+            if b:
+                rows.append(b)
+    _SCAN_CACHE.update(ts=now, rows=rows)
+    return rows
+
+
+def _chg(closes, days):
+    if len(closes) <= days:
+        return None
+    return (closes[-1] / closes[-1 - days] - 1) * 100
+
+
+@bot.tree.command(name="rs", description="Relative strength scanner - which coins are beating BTC (7d / 30d), where rotation is")
+async def rs_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    rows = await _scan_universe(40)
+    if not rows:
+        await interaction.followup.send("Binance feed didn't answer - try again in a minute.")
+        return
+    btc = next((r for r in rows if r["symbol"] == "BTCUSDT"), None)
+    b7, b30 = (_chg(btc["closes"], 7), _chg(btc["closes"], 30)) if btc else (0, 0)
+    scored = []
+    for r in rows:
+        if r["symbol"] == "BTCUSDT":
+            continue
+        c7, c30 = _chg(r["closes"], 7), _chg(r["closes"], 30)
+        if c7 is None or c30 is None:
+            continue
+        scored.append((r["base"], c7, c30, c7 - (b7 or 0), c30 - (b30 or 0)))
+    scored.sort(key=lambda x: x[3], reverse=True)
+    e = discord.Embed(title="Relative strength vs BTC - top 40 by volume", color=NAVY)
+    e.description = f"BTC itself: **{b7:+.1f}%** 7d \u00b7 **{b30:+.1f}%** 30d. RS = coin minus BTC, in points."
+    lead = "\n".join(f"`{b:<7}` 7d {c7:+6.1f}%  30d {c30:+6.1f}%  \u2192 RS7 **{r7:+.1f}**" for b, c7, c30, r7, r30 in scored[:10])
+    lag = "\n".join(f"`{b:<7}` 7d {c7:+6.1f}%  30d {c30:+6.1f}%  \u2192 RS7 **{r7:+.1f}**" for b, c7, c30, r7, r30 in scored[-5:][::-1])
+    e.add_field(name="Leaders (money is rotating here)", value=lead or "-", inline=False)
+    e.add_field(name="Laggards (dead money or catch-up candidates)", value=lag or "-", inline=False)
+    e.set_footer(text="Sigma Terminal \u00b7 Binance perps \u00b7 strength is context, not a signal")
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="breakouts", description="Momentum scanner - coins at 30d highs on expanding volume")
+async def breakouts_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    rows = await _scan_universe(40)
+    if not rows:
+        await interaction.followup.send("Binance feed didn't answer - try again in a minute.")
+        return
+    hits = []
+    for r in rows:
+        hi30 = max(r["highs"][:-1]) if len(r["highs"]) > 1 else None
+        if not hi30:
+            continue
+        close = r["closes"][-1]
+        dist = (close / hi30 - 1) * 100
+        avgv = sum(r["vols"][:-1]) / max(1, len(r["vols"]) - 1)
+        vmult = r["vols"][-1] / avgv if avgv else 0
+        if dist >= -1.5:
+            hits.append((r["base"], dist, vmult, _chg(r["closes"], 7) or 0))
+    hits.sort(key=lambda x: (x[1] >= 0, x[2]), reverse=True)
+    e = discord.Embed(title="Breakout scanner - within 1.5% of a 30-day high", color=NAVY)
+    if not hits:
+        e.description = "Nothing at a 30d high right now. Quiet tape, or the market is pulling back - both are information."
+    else:
+        e.description = "\n".join(
+            f"`{b:<7}` {'**NEW HIGH**' if d >= 0 else f'{d:+.1f}% from high':<16} vol \u00d7{v:.1f}  7d {c7:+.1f}%"
+            for b, d, v, c7 in hits[:14])
+        e.add_field(name="Read it right", value="Volume \u00d72+ with a new high is expansion. A high on \u00d70.6 volume is a test, not a breakout. Levels first, then structure - the scanner just tells you where to look.", inline=False)
+    e.set_footer(text="Sigma Terminal \u00b7 Binance perps, top 40 by volume \u00b7 educational")
+    await interaction.followup.send(embed=e)
+
+
+_CROWD_CACHE: dict = {"ts": 0, "embed": None}
+CROWD_LONG_FLOOR = 0.03     # % per 8h  (~33% APR) - below this, longs are not "crowded" whatever the rank
+CROWD_SHORT_FLOOR = -0.02   # % per 8h
+CROWD_Z = 1.5               # current must be >= mean + 1.5 sigma of the coin's own 30d funding history
+
+
+def _pct_rank(hist, x):
+    if not hist:
+        return None
+    return sum(1 for h in hist if h <= x) / len(hist) * 100
+
+
+@bot.tree.command(name="crowded", description="Funding extremes vs each coin's own history - crowded longs (squeeze risk) and crowded shorts")
+async def crowded_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    now = _time.time()
+    if _CROWD_CACHE["embed"] is not None and now - _CROWD_CACHE["ts"] < 300:
+        await interaction.followup.send(embed=_CROWD_CACHE["embed"])
+        return
+    async with aiohttp.ClientSession() as s:
+        prem = await _get_json(s, "https://fapi.binance.com/fapi/v1/premiumIndex", None, 15)
+        if not prem:
+            await interaction.followup.send("Binance feed didn't answer - try again in a minute.")
+            return
+        cur = {}
+        for x in prem:
+            sym = x.get("symbol", "")
+            if not sym.endswith("USDT") or sym[:-4] in _STABLE_BASES:
+                continue
+            try:
+                cur[sym] = float(x.get("lastFundingRate") or 0) * 100
+            except Exception:
+                pass
+        btc_now = cur.get("BTCUSDT")
+        # pre-filter: only coins already past the absolute floor get a history pull (keeps it to ~50 calls)
+        cands = [s_ for s_, v in cur.items() if v >= CROWD_LONG_FLOOR or v <= CROWD_SHORT_FLOOR]
+        cands.sort(key=lambda s_: abs(cur[s_]), reverse=True)
+        cands = cands[:60]
+        sem = asyncio.Semaphore(8)
+
+        async def hist(sym):
+            async with sem:
+                h = await _get_json(s, "https://fapi.binance.com/fapi/v1/fundingRate", {"symbol": sym, "limit": 90}, 15)
+                if not h or len(h) < 24:
+                    return sym, None
+                return sym, [float(r["fundingRate"]) * 100 for r in h]
+        hists = dict(await asyncio.gather(*(hist(c) for c in cands)))
+
+    longs, shorts = [], []
+    for sym in cands:
+        h = hists.get(sym)
+        if not h:
+            continue
+        x = cur[sym]
+        mean = sum(h) / len(h)
+        var = sum((v - mean) ** 2 for v in h) / len(h)
+        sd = var ** 0.5 or 1e-9
+        z = (x - mean) / sd
+        pct = _pct_rank(h, x)
+        row = (sym[:-4], x, mean, z, pct)
+        if x >= CROWD_LONG_FLOOR and z >= CROWD_Z:
+            longs.append(row)
+        elif x <= CROWD_SHORT_FLOOR and z <= -CROWD_Z:
+            shorts.append(row)
+    longs.sort(key=lambda r: r[3], reverse=True)
+    shorts.sort(key=lambda r: r[3])
+
+    def fmt(rows):
+        return "\n".join(
+            f"`{b:<7}` now **{x:+.4f}%**  \u00b7 30d avg {m:+.4f}%  \u00b7 z {z:+.1f}  \u00b7 {p:.0f}th pct  (\u2248 {x * 3 * 365:+.0f}% APR)"
+            for b, x, m, z, p in rows[:8])
+
+    e = discord.Embed(title="Crowded trades - funding vs each coin's own 30-day history", color=NAVY)
+    e.description = (f"BTC funding now: **{btc_now:+.4f}%** per 8h.\n" if btc_now is not None else "") + \
+        f"A coin only counts as crowded when funding is past an absolute floor (longs \u2265 {CROWD_LONG_FLOOR}% / shorts \u2264 {CROWD_SHORT_FLOOR}% per 8h) **and** at least {CROWD_Z}\u03c3 above its own 30-day average. Rank alone means nothing."
+    e.add_field(name=f"Crowded longs - {len(longs)} coin(s) \u00b7 squeeze risk",
+                value=(fmt(longs) if longs else "None right now. Longs aren't overpaying anywhere - that's a calm tape, not a bullish one."), inline=False)
+    e.add_field(name=f"Crowded shorts - {len(shorts)} coin(s) \u00b7 short-squeeze fuel",
+                value=(fmt(shorts) if shorts else "None right now."), inline=False)
+    e.add_field(name="Read it right", value=(
+        "z is how unusual today's funding is *for that coin* - a meme coin at +0.05% may be normal, BTC at +0.05% is not. "
+        "Crowded long + price at resistance is where longs get flushed. Crowded short + price at support is where squeezes start. "
+        "Funding alone is never the trade."), inline=False)
+    e.set_footer(text=f"Sigma Terminal \u00b7 Binance perps \u00b7 {len(cands)} coins screened \u00b7 5-min cache \u00b7 educational")
+    _CROWD_CACHE.update(ts=now, embed=e)
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="exitwatch", description="Bull-market heat gauge - structure + leverage + sentiment in one score. When to think about de-risking")
+async def exitwatch_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    def sma(v, n):
+        return sum(v[-n:]) / n if len(v) >= n else None
+    async with aiohttp.ClientSession() as s:
+        daily = await _get_json(s, "https://api.binance.com/api/v3/klines", {"symbol": "BTCUSDT", "interval": "1d", "limit": 720}, 20)
+        weekly = await _get_json(s, "https://api.binance.com/api/v3/klines", {"symbol": "BTCUSDT", "interval": "1w", "limit": 210}, 20)
+        fund = await _get_json(s, "https://fapi.binance.com/fapi/v1/fundingRate", {"symbol": "BTCUSDT", "limit": 21}, 15)
+        ethbtc = await _get_json(s, "https://api.binance.com/api/v3/klines", {"symbol": "ETHBTC", "interval": "1d", "limit": 31}, 15)
+        fng = await _get_json(s, "https://api.alternative.me/fng/", {"limit": 1}, 15)
+    if not daily or not weekly:
+        await interaction.followup.send("Binance feed didn't answer - try again in a minute.")
+        return
+    closes = [float(c[4]) for c in daily]
+    wcl = [float(c[4]) for c in weekly]
+    price = closes[-1]
+    parts = []      # (label, value text, score 0-2)
+    mayer = price / sma(closes, 200) if sma(closes, 200) else None
+    if mayer:
+        parts.append(("Mayer multiple (price / 200d)", f"{mayer:.2f}", 2 if mayer >= 2.4 else 1 if mayer >= 1.8 else 0))
+    ma111, ma350x2 = sma(closes, 111), (sma(closes, 350) * 2 if sma(closes, 350) else None)
+    if ma111 and ma350x2:
+        gap = (ma350x2 - ma111) / ma350x2 * 100
+        parts.append(("Pi Cycle gap (111d vs 2\u00d7350d)", f"{gap:.1f}% apart" if gap > 0 else "CROSSED", 2 if gap <= 5 else 1 if gap <= 15 else 0))
+    ma200w = sma(wcl, 200) or (sma(wcl, len(wcl)) if wcl else None)
+    if ma200w:
+        dev = (price / ma200w - 1) * 100
+        parts.append(("Above 200-week MA", f"{dev:+.0f}%", 2 if dev >= 250 else 1 if dev >= 150 else 0))
+    if fund:
+        try:
+            avg = sum(float(x["fundingRate"]) for x in fund) / len(fund) * 100
+            parts.append(("BTC funding, 7d avg (per 8h)", f"{avg:+.4f}%", 2 if avg >= 0.05 else 1 if avg >= 0.03 else 0))
+        except Exception:
+            pass
+    if ethbtc and len(ethbtc) > 30:
+        ec = [float(c[4]) for c in ethbtc]
+        eb = (ec[-1] / ec[-31] - 1) * 100
+        parts.append(("ETH/BTC 30d (late-cycle rotation)", f"{eb:+.1f}%", 2 if eb >= 30 else 1 if eb >= 15 else 0))
+    if fng and fng.get("data"):
+        try:
+            v = int(fng["data"][0]["value"])
+            parts.append(("Fear & Greed", f"{v} ({fng['data'][0].get('value_classification', '')})", 2 if v >= 85 else 1 if v >= 75 else 0))
+        except Exception:
+            pass
+    score = sum(p[2] for p in parts)
+    mx = 2 * len(parts) or 1
+    pct = score / mx * 100
+    label, col = ("COOL", GREEN) if pct < 25 else ("WARMING", NAVY) if pct < 50 else ("HOT", discord.Color.orange()) if pct < 75 else ("EUPHORIC", RED)
+    e = discord.Embed(title=f"Exit watch - heat {score}/{mx} \u00b7 {label}", color=col)
+    e.description = ("\n".join(f"{'\U0001F534' if sc == 2 else '\U0001F7E0' if sc == 1 else '\u26aa'} **{lab}** \u2014 {val}" for lab, val, sc in parts))
+    e.add_field(name="How to use this", value=(
+        "This is a heat gauge, not a sell signal. COOL and WARMING is where trends live. HOT means size down and take profits on the plan, not on emotion. "
+        "EUPHORIC has historically been where tops form over weeks, not days - the plan is to be scaling out, not calling the top. "
+        "Every component is public data; check it yourself."), inline=False)
+    e.set_footer(text="Sigma Terminal \u00b7 Binance + alternative.me \u00b7 educational, not financial advice")
+    await interaction.followup.send(embed=e)
+
+
+@bot.tree.command(name="brief", description="Today's market brief - BTC, funding, sentiment, calendar, in one read")
+async def brief_cmd(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        text = await build_daily_brief()
+    except Exception as ex:
+        _note_error("cmd:/brief", ex)
+        text = None
+    if not text:
+        await interaction.followup.send("Brief couldn't be built right now - a data source is down. Try `/snapshot BTC` meanwhile.")
+        return
+    e = discord.Embed(title=f"Market brief \u00b7 {datetime.now(IST).strftime('%d %b, %H:%M')} IST", description=text[:4000], color=NAVY)
+    e.set_footer(text="Sigma Terminal \u00b7 educational, not financial advice")
+    await interaction.followup.send(embed=e)
+
+
+_TERMINAL_SOURCES = [
+    ("Binance spot", "https://api.binance.com/api/v3/ticker/price?symbol=BTCUSDT"),
+    ("Binance futures", "https://fapi.binance.com/fapi/v1/premiumIndex?symbol=BTCUSDT"),
+    ("Bybit", "https://api.bybit.com/v5/market/tickers?category=linear&symbol=BTCUSDT"),
+    ("OKX", "https://www.okx.com/api/v5/market/ticker?instId=BTC-USDT-SWAP"),
+    ("CoinGecko", "https://api.coingecko.com/api/v3/ping"),
+    ("Fear & Greed", "https://api.alternative.me/fng/?limit=1"),
+    ("Deribit", "https://www.deribit.com/api/v2/public/get_index_price?index_name=btc_usd"),
+    ("Coinbase", "https://api.exchange.coinbase.com/products/BTC-USD/ticker"),
+    ("blockchain.info", "https://api.blockchain.info/charts/hash-rate?timespan=7days&format=json"),
+    ("Yahoo (SPX/DXY)", "https://query1.finance.yahoo.com/v8/finance/chart/%5EGSPC?range=1d&interval=1d"),
+    ("DefiLlama stables", "https://stablecoins.llama.fi/stablecoins?includePrices=false"),
+    ("mempool.space", "https://mempool.space/api/v1/fees/recommended"),
+    ("er-api (FX)", "https://open.er-api.com/v6/latest/USD"),
+]
+
+
+@bot.tree.command(name="terminal_check", description="(Admin) Smoke-test every data source the terminal depends on")
+async def terminal_check_cmd(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    lines = []
+    bad = 0
+    async with aiohttp.ClientSession(headers={"User-Agent": "SigmaBot/1.0"}) as s:
+        async def probe(name, url):
+            t0 = _time.time()
+            try:
+                async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    ms = int((_time.time() - t0) * 1000)
+                    return name, r.status, ms
+            except Exception as ex:
+                return name, f"ERR {type(ex).__name__}", int((_time.time() - t0) * 1000)
+        res = await asyncio.gather(*(probe(n, u) for n, u in _TERMINAL_SOURCES))
+    for name, st, ms in res:
+        ok = st == 200
+        bad += (not ok)
+        lines.append(f"{'\u2705' if ok else '\u274c'} `{name:<18}` {st}  {ms} ms")
+    e = discord.Embed(title=f"Terminal data sources - {len(res) - bad}/{len(res)} healthy", color=(GREEN if not bad else RED))
+    e.description = "\n".join(lines)
+    if bad:
+        e.add_field(name="What breaks", value="A red source means the commands that read it will fail or show stale data until it's back. Binance down = tracker, scanners, most terminal commands. The others each cover one or two commands.", inline=False)
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
 def build_help_embed() -> discord.Embed:
     embed = discord.Embed(
-        title="\U0001F916 Quant Terminal - Command Guide",
+        title="\u03a3 Sigma Terminal - Command Guide",
         description="Everything the bot can do, grouped by what you need. All replies to market commands are public; anything marked *(private)* is visible only to you.",
         color=NAVY,
     )
@@ -6633,6 +7204,17 @@ def build_help_embed() -> discord.Embed:
             "`/fear` - Fear & Greed index\n"
             "`/calendar` - CPI / FOMC dates\n"
             "`/stables` - stablecoin supply, liquidity in or out"
+        ),
+        inline=False,
+    )
+    embed.add_field(
+        name="\U0001F525 Bull-market scanners",
+        value=(
+            "`/rs` - relative strength vs BTC, where rotation is\n"
+            "`/breakouts` - coins at 30d highs on expanding volume\n"
+            "`/crowded` - funding extremes, crowded longs and shorts\n"
+            "`/exitwatch` - heat gauge: structure + leverage + sentiment, one score\n"
+            "`/brief` - today's market read in one message"
         ),
         inline=False,
     )
@@ -7228,9 +7810,13 @@ async def spot_stats(interaction: discord.Interaction, analyst: discord.Member =
     embed.add_field(name="Active", value=str(total - len(closed)), inline=True)
     embed.add_field(name="Win rate", value=(f"{wr:.0f}% ({len(wins)}W/{len(losses)}L)" if decided else "-"), inline=True)
     embed.add_field(name="BE / Invalid", value=f"{len(be)} / {len(invalid)}", inline=True)
+    rs = [r for r in (spot_result_r(p) for p in closed) if r is not None]
+    embed.add_field(name="Total R", value=(f"{sum(rs):+.2f}R" if rs else "-"), inline=True)
+    embed.add_field(name="Avg R", value=(f"{sum(rs)/len(rs):+.2f}R" if rs else "-"), inline=True)
+    embed.add_field(name="Graded on", value=(f"{len(rs)} / {len(closed)} closed" if closed else "-"), inline=True)
     results = [p.get("result_pct") for p in closed if p.get("result_pct")]
-    embed.add_field(name="Results", value=(", ".join(results[:10]) if results else "-"), inline=False)
-    embed.set_footer(text="Sigma Trading - Spot Journal")
+    embed.add_field(name="Results (%)", value=(", ".join(results[:10]) if results else "-"), inline=False)
+    embed.set_footer(text="Sigma Trading - Spot Journal \u00b7 R = (exit - entry) / (entry - invalidation) \u00b7 plays without a numeric invalidation aren't graded")
     await interaction.followup.send(embed=embed, ephemeral=True)
 
 
@@ -7305,8 +7891,7 @@ def sigma_tracking_since():
 
 
 def _res_totals(entries):
-    rs = [t.get("result_r") for k, _, t in entries
-          if k == "fut" and isinstance(t.get("result_r"), (int, float))]
+    rs = [r for r in (_rec_r(k, t) for k, _, t in entries) if r is not None]
     wins = sum(1 for _, _, t in entries if t.get("result") == "WIN")
     losses = sum(1 for _, _, t in entries if t.get("result") == "LOSS")
     be = sum(1 for _, _, t in entries if t.get("result") == "BE")
@@ -7344,7 +7929,7 @@ def build_results_summary_embed() -> discord.Embed:
         s = _res_totals(ent)
         lines.append(f"**{name}** - {s['n']} closed - {s['wr']:.0f}% WR - {s['total_r']:+.2f}R")
     if lines:
-        embed.add_field(name="By analyst", value="\n".join(lines)[:1024], inline=False)
+        embed.add_field(name="By analyst", value=_fit_lines(lines), inline=False)
     embed.set_footer(text="Sigma Trading - setups, not signals - wins and losses both logged - not financial advice")
     return embed
 
@@ -7353,7 +7938,8 @@ def build_result_entry_embed(kind: str, t: dict) -> discord.Embed:
     res = t.get("result", "?")
     color = {"WIN": GREEN, "LOSS": RED, "BE": GREY, "INVALID": DGREY}.get(res, GREY)
     if kind == "spot":
-        rtxt = f" {t['result_pct']}" if t.get("result_pct") else ""
+        _sr = spot_result_r(t)
+        rtxt = (f" {_sr:+.2f}R" if _sr is not None else "") + (f" ({t['result_pct']})" if t.get("result_pct") else "")
         title = f"[{res}]{rtxt} - SPOT {t.get('pair', '?').upper()}"
     else:
         r = t.get("result_r")
@@ -7406,8 +7992,8 @@ def _results_csv(entries, label: str) -> discord.File:
         else:
             w.writerow([t.get("closed_at", ""), t.get("created_at", ""),
                         t.get("analyst_name", ""), "spot", t.get("pair", "").upper(),
-                        "", "", t.get("dca_zone", ""), "", t.get("avg_exit", ""),
-                        t.get("result", ""), "", t.get("result_pct", ""),
+                        "", "", t.get("dca_zone", ""), t.get("invalidation", ""), t.get("avg_exit", ""),
+                        t.get("result", ""), (spot_result_r(t) if spot_result_r(t) is not None else ""), t.get("result_pct", ""),
                         "yes" if t.get("override") else ""])
     data = buf.getvalue().encode("utf-8")
     return discord.File(io.BytesIO(data), filename=f"sigma_results_{label}.csv")
@@ -7508,6 +8094,7 @@ async def refresh_results_summary(repost: bool = False):
 @tasks.loop(minutes=RESULTS_POLL_MIN)
 async def results_watch_loop():
     """Never let an exception kill this loop - a dead loop silently stops the board."""
+    HEARTBEAT["results"] = _time.time()
     try:
         await _results_watch_tick()
     except Exception as e:
@@ -7686,19 +8273,16 @@ def _sigma_week_stats(days: int = 7) -> dict:
         except Exception:
             continue
     tot = _res_totals(entries)
-    futs = [(k, m, t) for k, m, t in entries
-            if k == "fut" and isinstance(t.get("result_r"), (int, float))]
-    futs.sort(key=lambda x: x[2]["result_r"], reverse=True)
+    futs = [(k, m, t, _rec_r(k, t)) for k, m, t in entries if _rec_r(k, t) is not None]
+    futs.sort(key=lambda x: x[3], reverse=True)
 
-    def _line(t):
-        d = "long" if t.get("direction") == "LONG" else "short"
+    def _line(k, t):
+        d = "spot" if k == "spot" else ("long" if t.get("direction") == "LONG" else "short")
         nm = t.get("analyst_name", "")
         return f"{t.get('pair', '?').upper()} {d}" + (f", {nm}" if nm else "")
 
-    tot["best_lines"] = [(_line(t), f"{t['result_r']:+.1f}R") for _, _, t in futs[:2]
-                         if t["result_r"] > 0]
-    tot["worst_lines"] = [(_line(t), f"{t['result_r']:+.1f}R") for _, _, t in futs[-2:]
-                          if t["result_r"] < 0]
+    tot["best_lines"] = [(_line(k, t), f"{r:+.1f}R") for k, _, t, r in futs[:2] if r > 0]
+    tot["worst_lines"] = [(_line(k, t), f"{r:+.1f}R") for k, _, t, r in futs[-2:] if r < 0]
     end = datetime.now(IST); start = end - timedelta(days=days)
     if days == 7:
         tot["range_txt"] = f"week of {start.strftime('%d')}-{end.strftime('%d %b %Y')}"
@@ -7843,15 +8427,13 @@ def _analyst_month_stats(analyst_id: int, start, end):
         w = sum(1 for _, _, t in sub if t.get("result") == "WIN")
         l = sum(1 for _, _, t in sub if t.get("result") == "LOSS")
         return (w / (w + l) * 100) if (w + l) else 0
-    win_rs  = [t.get("result_r") for k, _, t in entries if k == "fut"
-               and t.get("result") == "WIN" and isinstance(t.get("result_r"), (int, float))]
-    loss_rs = [t.get("result_r") for k, _, t in entries if k == "fut"
-               and t.get("result") == "LOSS" and isinstance(t.get("result_r"), (int, float))]
+    win_rs  = [r for r in (_rec_r(k, t) for k, _, t in entries if t.get("result") == "WIN") if r is not None]
+    loss_rs = [r for r in (_rec_r(k, t) for k, _, t in entries if t.get("result") == "LOSS") if r is not None]
     best = None
     for k, _, t in entries:
-        if k == "fut" and isinstance(t.get("result_r"), (int, float)):
-            if best is None or t["result_r"] > best[0]:
-                best = (t["result_r"], t.get("pair", "?"), t.get("direction", ""))
+        r = _rec_r(k, t)
+        if r is not None and (best is None or r > best[0]):
+            best = (r, t.get("pair", "?"), (t.get("direction") or ("spot" if k == "spot" else "")))
     pair_counts = {}
     for _, _, t in entries:
         p = (t.get("pair") or "?").upper()
@@ -7860,11 +8442,11 @@ def _analyst_month_stats(analyst_id: int, start, end):
     log = []
     for k, _, t in sorted(entries, key=lambda x: x[2].get("closed_at") or ""):
         res = {"WIN": "W", "LOSS": "L", "BE": "BE", "INVALID": "INV"}.get(t.get("result"), "?")
-        rv = None
-        if k == "fut" and isinstance(t.get("result_r"), (int, float)):
-            rtxt = f"{t['result_r']:+.2f}"; rv = float(t["result_r"])
-        elif k == "spot" and isinstance(t.get("result_pct"), (int, float)):
-            rtxt = f"{t['result_pct']:+.1f}%"
+        rv = _rec_r(k, t)
+        if rv is not None:
+            rtxt = f"{rv:+.2f}"; rv = float(rv)
+        elif k == "spot" and t.get("result_pct"):
+            rtxt = str(t["result_pct"])
         else:
             rtxt = "\u2014"
         try:
@@ -8000,6 +8582,7 @@ async def post_analyst_journals(start=None, end=None, label=None) -> int:
 @app_commands.choices(mode=[app_commands.Choice(name="Off - manual tracking only", value="off"),
                             app_commands.Choice(name="On - re-arm auto tracking", value="on")])
 @app_commands.autocomplete(trade=open_trades_ac)
+@_with_state_lock
 async def track_cmd(interaction: discord.Interaction, trade: str, mode: app_commands.Choice[str]):
     await interaction.response.defer(ephemeral=True)
     data = load_trades()
@@ -8024,6 +8607,7 @@ async def track_cmd(interaction: discord.Interaction, trade: str, mode: app_comm
 
 @bot.tree.command(name="reopen", description="(Admin) Reopen a wrongly-closed setup and clean the results board")
 @app_commands.describe(trade="Closed setup to reopen (recent closes shown)")
+@_with_state_lock
 async def reopen_cmd(interaction: discord.Interaction, trade: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admins only.", ephemeral=True)
@@ -8291,7 +8875,7 @@ async def results_override_cmd(interaction: discord.Interaction, trade: str,
     prev = {f: t.get(f) for f in ("result", "result_r", "avg_exit", "result_pct")}
     if result is not None:
         t["result"] = result
-    if result_r is not None and not spot:
+    if result_r is not None:
         t["result_r"] = round(result_r, 2)
     if avg_exit is not None:
         t["avg_exit"] = avg_exit
@@ -8454,4 +9038,6 @@ async def _sigma_results_on_ready():
 # ═════════════════════════════ END SIGMA RESULTS BOARD ═════════════════════════════
 
 
-bot.run(BOT_TOKEN)
+if not BOT_TOKEN or BOT_TOKEN == "PASTE_TOKEN_HERE":
+    raise SystemExit("SCIENT_BOT_TOKEN is not set - refusing to start.")
+bot.run(BOT_TOKEN, log_handler=None)
