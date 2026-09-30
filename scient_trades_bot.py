@@ -216,17 +216,78 @@ BLUE = discord.Color.from_str(SG_CYAN)
 GOLD = discord.Color.from_str("#C9A227")
 GREY = discord.Color.light_grey()
 DGREY = discord.Color.dark_grey()
+# Discord allows 25 choices per option - keep this list at 25 max.
 FRAMEWORKS = [
-    "FRVP / POC", "AMD", "Wyckoff Accumulation", "RSI Divergence",
-    "BOS / MSS", "Fib Pocket (0.75/0.786)", "Range (sweep-reclaim)",
-    "Three Drives", "Deviation Reclaim", "EMA Cross", "Other",
+    # levels / auction
+    "FRVP / POC", "Value Area (VAH/VAL)", "HVN / LVN", "Anchored VWAP",
+    # ranges
+    "Range (sweep-reclaim)", "Deviation Reclaim", "Range Breakout + Retest", "S/R Flip",
+    # structure / SMC
+    "BOS / MSS", "CHoCH", "Order Block", "FVG", "OTE (0.62-0.79)", "Liquidity Sweep",
+    # cycles / phases
+    "AMD", "Wyckoff Accumulation", "Wyckoff Distribution",
+    # exhaustion / momentum
+    "Three Drives", "RSI Divergence", "Fib Pocket (0.75/0.786)",
+    # trend / patterns
+    "EMA Cross", "Trendline Break", "Chart Pattern (H&S, wedge, flag)", "Higher-TF Level",
+    "Other",
 ]
+assert len(FRAMEWORKS) <= 25, "Discord caps choices at 25"
 SPOT_STATUSES = ["WATCHING", "ACCUMULATING", "HOLDING", "TRIMMED", "DISTRIBUTING"]
 ANALYST_CHOICES = [app_commands.Choice(name=k.capitalize(), value=k) for k in ANALYSTS.keys()]
 
 intents = discord.Intents.default()
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+
+# ─── ONE managed HTTP session for every provider call ───────────────────────
+# Created lazily on first use, reused everywhere (connection pool + DNS cache),
+# closed cleanly when the bot shuts down. Call sites keep their own per-request timeouts.
+_HTTP: "aiohttp.ClientSession | None" = None
+HTTP_STATS = {"requests": 0, "created_at": None}
+
+
+def _new_http_session() -> aiohttp.ClientSession:
+    return aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=25, connect=8, sock_read=20),
+        connector=aiohttp.TCPConnector(limit=48, limit_per_host=12, ttl_dns_cache=300, enable_cleanup_closed=True),
+        headers={"User-Agent": "SigmaBot/1.0 (+discord; sigma trading)"},
+        trust_env=True,
+    )
+
+
+class _SharedHTTP:
+    """`async with http() as s:` - hands out the shared session and never closes it."""
+    async def __aenter__(self):
+        global _HTTP
+        if _HTTP is None or _HTTP.closed:
+            _HTTP = _new_http_session()
+            HTTP_STATS["created_at"] = _time.time()
+        HTTP_STATS["requests"] += 1
+        return _HTTP
+
+    async def __aexit__(self, *exc):
+        return False
+
+
+def http() -> _SharedHTTP:
+    return _SharedHTTP()
+
+
+_orig_bot_close = bot.close
+
+
+async def _bot_close_with_http():
+    try:
+        if _HTTP is not None and not _HTTP.closed:
+            await _HTTP.close()
+            log.info("[http] shared session closed")
+    except Exception as e:
+        log.warning(f"[http] close error: {e}")
+    await _orig_bot_close()
+
+
+bot.close = _bot_close_with_http
 
 
 _CORRUPT: set = set()   # paths that failed to parse - saves to them are refused until fixed
@@ -336,7 +397,7 @@ async def _get_json(session, url, params=None, timeout=15):
 
 async def md_klines(pair: str, interval: str, limit: int = 220):
     """Return list of [openTime, o, h, l, c, v, ...] Binance-style. Tries Binance then Bybit."""
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         data = await _get_json(s, "https://api.binance.com/api/v3/klines",
                                {"symbol": pair, "interval": interval, "limit": limit}, 20)
         if data and isinstance(data, list) and len(data) > 0:
@@ -362,7 +423,7 @@ async def md_klines(pair: str, interval: str, limit: int = 220):
 
 async def md_ticker24(pair: str):
     """Return dict with lastPrice, priceChangePercent, highPrice, lowPrice, quoteVolume. Binance then Bybit."""
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         d = await _get_json(s, "https://api.binance.com/api/v3/ticker/24hr", {"symbol": pair}, 15)
         if d and "lastPrice" in d:
             return {
@@ -385,7 +446,7 @@ async def md_ticker24(pair: str):
 
 async def md_price(pair: str):
     """Return float last price. Binance then Bybit."""
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         d = await _get_json(s, "https://api.binance.com/api/v3/ticker/price", {"symbol": pair}, 15)
         if d and "price" in d:
             return float(d["price"])
@@ -433,7 +494,7 @@ def is_tradfi(sym: str) -> bool:
 
 async def md_funding(pair: str):
     """Return dict rate(%), mark, nextFundingTime(s). Binance perp then Bybit linear."""
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         d = await _get_json(s, "https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol": pair}, 15)
         if d and "lastFundingRate" in d:
             return {"rate": float(d["lastFundingRate"]) * 100, "mark": float(d["markPrice"]),
@@ -449,7 +510,7 @@ async def md_funding(pair: str):
 
 async def md_oi(pair: str):
     """Return dict oi(coins), source. Binance perp then Bybit linear."""
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         d = await _get_json(s, "https://fapi.binance.com/fapi/v1/openInterest", {"symbol": pair}, 15)
         hist = await _get_json(s, "https://fapi.binance.com/futures/data/openInterestHist",
                                {"symbol": pair, "period": "1h", "limit": 25}, 15)
@@ -635,17 +696,6 @@ def _is_tp_fill(f: dict) -> bool:
     return lab.startswith("TP") or lab in ("Partial TP", "PTP")
 
 
-def take_profits_text(t: dict) -> str:
-    """Futures: every profit-taking fill, auto-numbered TP1..TPn in the order taken."""
-    tps = [f for f in (t.get("fills") or []) if _is_tp_fill(f)]
-    if not tps:
-        return ""
-    tick = emo("tracked", chr(0x2705))
-    rows = [f"TP{i} \u00b7 {f['pct']:g}% @ {fnum(f['price'])} {tick}" for i, f in enumerate(tps, 1)]
-    done = sum(f["pct"] for f in tps)
-    tail = "" if t.get("closed") else f"\n{done:g}% closed \u00b7 {max(0.0, 100 - fills_pct(t)):g}% running"
-    return "\n".join(rows) + tail
-
 
 def fills_pct(t) -> float:
     return sum(f.get("pct", 0) for f in t.get("fills", []))
@@ -766,6 +816,8 @@ def full_status(t: dict) -> str:
 
 
 def short_status(t: dict) -> str:
+    if t.get("tp4_hit"):
+        return "TP4"
     if t.get("tp3_hit"):
         return "TP3"
     if t.get("tp2_hit"):
@@ -856,19 +908,6 @@ def parse_spot_split(raw: str, n_targets: int):
         return None, f"tp_split adds up to {sum(parts):g}% - it can't be more than 100%."
     return parts, None
 
-
-def spot_sells_summary(p: dict) -> str:
-    sells = p.get("sells") or []
-    if not sells:
-        return ""
-    tick = emo("tracked", chr(0x2705))
-    rows = []
-    for i, s in enumerate(sells, 1):
-        at = f" \u00b7 at {s['label']}" if s.get("label") else ""
-        rows.append(f"TP{i} \u00b7 {s['pct']:g}% @ {s['price']:g} {tick}{at}")
-    done = sum(s["pct"] for s in sells)
-    tail = "" if p.get("closed") else f"\n{done:g}% sold \u00b7 {max(0.0, 100 - done):g}% still held"
-    return "\n".join(rows) + tail
 
 
 def spot_zone_projection(p: dict):
@@ -1007,15 +1046,7 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
         risk_rr += f"  ·  R:R {rr}"
     embed.add_field(name="Risk", value=risk_rr, inline=True)
 
-    # Targets (full width)
-    tps = []
-    plan = t.get("tp_split") or []
-    for idx, (key, hit) in enumerate((("tp1", "tp1_hit"), ("tp2", "tp2_hit"), ("tp3", "tp3_hit"), ("tp4", "tp4_hit"))):
-        if t.get(key):
-            r = signed_r(t, first_num(t[key]))
-            rtxt = f" ({r:.1f}R)" if r is not None else ""
-            ptxt = f" [{plan[idx]:g}%]" if idx < len(plan) else ""
-            tps.append(f"{t[key]}{rtxt}{ptxt}" + (f" {emo('tracked', chr(0x2705))}" if t.get(hit) else ""))
+    # Take profits - one list: taken (ticked) then pending presets
     _tpt = unified_tp_text(t)
     if _tpt:
         embed.add_field(name="Take Profits", value=_tpt[:1020], inline=False)
@@ -1075,12 +1106,6 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
             proj = spot_zone_projection(p)
             if proj:
                 embed.add_field(name="If Zone Fills", value=f"avg entry \u2248 {proj:g}", inline=True)
-        tgs = []
-        splan = p.get("tp_split") or []
-        for idx, (key, hit) in enumerate((("t1", "t1_hit"), ("t2", "t2_hit"), ("t3", "t3_hit"))):
-            if p.get(key):
-                ptxt = f" [{splan[idx]:g}%]" if idx < len(splan) else ""
-                tgs.append(f"{p[key]}{spot_pct_text(p, p[key])}{ptxt}" + (f" {emo('tracked', chr(0x2705))}" if p.get(hit) else ""))
         _spt = unified_tp_text(p, spot=True)
         if _spt:
             embed.add_field(name="Take Profits", value=_spt[:1020], inline=False)
@@ -1097,64 +1122,8 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
     return embed
 
 
-def build_board_embed() -> discord.Embed:
-    data = load_trades()
-    open_trades = [t for t in data.values() if not t.get("closed")]
-    embed = discord.Embed(title="Open Positions - Live Board", color=NAVY, timestamp=datetime.now(timezone.utc))
-    embed.set_footer(text=f"Sigma Trading - {len(open_trades)} open - auto-updates")
-    if not open_trades:
-        embed.description = "*No open positions right now.*"
-        return embed
-    order = list(ANALYSTS.keys())
-    def sort_key(t):
-        k = t.get("analyst_key", "")
-        return (order.index(k) if k in order else len(order), t.get("created_at", ""))
-    open_trades.sort(key=sort_key)
-    groups = {}
-    for t in open_trades:
-        groups.setdefault(t.get("analyst_key", "other"), []).append(t)
-    ordered_keys = [k for k in order if k in groups] + [k for k in groups if k not in order]
-    for k in ordered_keys:
-        trades = groups[k]
-        name = trades[0].get("analyst_name", k.capitalize())
-        lines = []
-        for t in trades:
-            d = emo("longR", "\u25b2") + " L" if t["direction"] == "LONG" else emo("shortR", "\u25bc") + " S"
-            e = entry_display(t, marks=False)
-            lines.append(f"{d} **{t['pair'].upper()}**" + (f" - {tf(t)}" if tf(t) else "") + f" - entry `{e}` - {short_status(t)} - [view]({jump_url(t)})")
-        embed.add_field(name=f"{name} ({len(trades)})", value=_fit_lines(lines), inline=False)
-    return embed
 
 
-def build_spot_board_embed() -> discord.Embed:
-    data = load_spot()
-    open_plays = [p for p in data.values() if not p.get("closed")]
-    embed = discord.Embed(title="Spot Portfolio - Live Board", color=GOLD, timestamp=datetime.now(timezone.utc))
-    embed.set_footer(text=f"Sigma Trading - {len(open_plays)} active plays - auto-updates")
-    if not open_plays:
-        embed.description = "*No active spot plays right now.*"
-        return embed
-    order = list(ANALYSTS.keys())
-    def sort_key(p):
-        k = p.get("analyst_key", "")
-        return (order.index(k) if k in order else len(order), p.get("created_at", ""))
-    open_plays.sort(key=sort_key)
-    groups = {}
-    for p in open_plays:
-        groups.setdefault(p.get("analyst_key", "other"), []).append(p)
-    ordered_keys = [k for k in order if k in groups] + [k for k in groups if k not in order]
-    for k in ordered_keys:
-        plays = groups[k]
-        name = plays[0].get("analyst_name", k.capitalize())
-        lines = []
-        for p in plays:
-            avg = f" - avg `{p['avg_entry']}`" if p.get("avg_entry") else ""
-            lines.append(f"\U0001FA99 **{p['pair'].upper()}** - zone `{p['dca_zone']}`{avg} - {spot_status_line(p)} - [view]({jump_url(p)})")
-        embed.add_field(name=f"{name} ({len(plays)})", value=_fit_lines(lines), inline=False)
-    return embed
-
-
-# ─── AUTO PRICE TRACKER (live feed -> entry fills / TP hits / SL alerts) ────
 PRICE_WATCH_ENABLED = True
 PRICE_WATCH_SEC = 60
 AUTO_CLOSE_ON_HARD_SL = True    # plain numeric SL: auto-close on touch. Soft SL ("4h close below X"): notify only.
@@ -1192,7 +1161,7 @@ async def _pw_klines(symbol: str, since_ms: int):
     url = (f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol}"
            f"&interval=1m&startTime={since_ms}&limit=1000")
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             async with s.get(url, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status in (400, 404):
                     return "BAD_SYMBOL"          # permanent: not listed on Binance futures
@@ -1233,6 +1202,24 @@ async def _pw_process_trade(tid: str, t: dict, candles):
     for open_ms, hi, lo, close in candles:
         if t.get("closed"):
             break
+        # ── ambiguity gate: if this ONE candle touches a hard stop AND (a pending TP or an unfilled
+        # entry), OHLC cannot prove the intra-candle order. Never guess a P&L - pause and ask. ──
+        stop_now = (entry_num(t) if t.get("be") else slv)
+        if stop_now and not soft_sl and crossed_sl(stop_now, lo, hi):
+            tp_touched = any_entry_filled(t) and any(
+                first_num(t.get(k)) is not None and not t.get(f"{k}_hit") and crossed_tp(first_num(t.get(k)), lo, hi)
+                for k in ("tp1", "tp2", "tp3", "tp4"))
+            entry_touched = (not any_entry_filled(t)) and t.get("entry_type") != "MARKET" and (
+                (e1 and crossed_entry(e1, lo, hi)) or (e2 and crossed_entry(e2, lo, hi)))
+            if tp_touched or entry_touched:
+                t["watch_disabled"] = True
+                t["watch_ambiguous_ms"] = open_ms
+                what = "a take-profit" if tp_touched else "the entry"
+                events.append(("Ambiguous candle - tracking paused", GREY,
+                               f"One 1-minute candle touched both {what} and the stop ({fnum(stop_now)}). "
+                               f"The order inside the candle can't be proven from OHLC, so nothing was recorded. "
+                               f"Check your exchange fills and resolve with /update, then /track On if you want the tracker back."))
+                break
         # entry fills (limit only - market fills at post)
         if e1 and not t.get("entry1_filled") and t.get("entry_type") != "MARKET" and crossed_entry(e1, lo, hi):
             t["entry1_filled"] = True
@@ -1264,16 +1251,17 @@ async def _pw_process_trade(tid: str, t: dict, candles):
                     else:
                         events.append((f"{key.upper()} tagged @ {fnum(tp_px)}", GREEN,
                                        "Auto-tracked - no split % on the card, record size with /update"))
-        # SL
-        if slv and not t.get("closed") and any_entry_filled(t) and crossed_sl(slv, lo, hi):
+        # SL - once the analyst moved the stop to entry, ENTRY is the stop
+        stop_lvl = (entry_num(t) if t.get("be") else slv)
+        if stop_lvl and not t.get("closed") and any_entry_filled(t) and crossed_sl(stop_lvl, lo, hi):
             if soft_sl:
                 warned = t.get("watch_sl_warned_ms") or 0
                 if open_ms - warned > 4 * 3600 * 1000:
                     t["watch_sl_warned_ms"] = open_ms
                     events.append(("Price at soft invalidation", GREY,
-                                   f"Traded through {fnum(slv)} ({t.get('sl_condition')}) - your call, confirm with /update if it closes there."))
+                                   f"Traded through {fnum(stop_lvl)} ({t.get('sl_condition')}) - your call, confirm with /update if it closes there."))
             elif AUTO_CLOSE_ON_HARD_SL:
-                exit_px = entry_num(t) if t.get("be") else slv
+                exit_px = stop_lvl
                 t["sl_hit"] = not t.get("be")
                 avg_exit, r = finalize_close(t, exit_px)
                 t["closed"] = True
@@ -1616,7 +1604,7 @@ async def tg_send(text: str, disable_preview: bool = True) -> bool:
         "reply_markup": json.dumps({"inline_keyboard": [[{"text": "Join Sigma Trading \u2192", "url": DISCORD_INVITE}]]}),
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with http() as session:
             async with session.post(url, data=payload, timeout=20) as resp:
                 if resp.status != 200:
                     body = await resp.text()
@@ -1639,7 +1627,7 @@ async def tg_send_photo(photo: io.BytesIO, caption: str) -> bool:
     form.add_field("reply_markup", json.dumps({"inline_keyboard": [[{"text": "Join Sigma Trading \u2192", "url": DISCORD_INVITE}]]}))
     form.add_field("photo", photo, filename="chart.png", content_type="image/png")
     try:
-        async with aiohttp.ClientSession() as session:
+        async with http() as session:
             async with session.post(url, data=form, timeout=30) as resp:
                 if resp.status != 200:
                     body = await resp.text()
@@ -1967,7 +1955,7 @@ async def build_daily_brief() -> str:
     prices = {}
     fear_txt = dom_txt = fund_txt = movers_txt = ""
     try:
-        async with aiohttp.ClientSession() as session:
+        async with http() as session:
             for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
                 try:
                     async with session.get("https://api.binance.com/api/v3/ticker/24hr", params={"symbol": sym}, timeout=15) as r:
@@ -2092,7 +2080,7 @@ async def tg_sources_loop():
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"}
     for ch in TG_NEWS_CHANNELS:
         try:
-            async with aiohttp.ClientSession() as session:
+            async with http() as session:
                 async with session.get(f"https://t.me/s/{ch}", headers=headers, timeout=20) as resp:
                     if resp.status != 200:
                         print(f"[digest] {ch}: HTTP {resp.status}")
@@ -2389,11 +2377,12 @@ async def liq_binance_loop():
     url = "wss://fstream.binance.com/ws/!forceOrder@arr"
     while not bot.is_closed():
         try:
-            async with aiohttp.ClientSession() as session:
+            async with http() as session:
                 async with session.ws_connect(url, heartbeat=30, timeout=30) as ws:
                     print("[liq] Binance stream connected", flush=True)
                     backoff = 5
                     async for msg in ws:
+                        HEARTBEAT["ws_binance"] = _time.time()
                         if msg.type != aiohttp.WSMsgType.TEXT:
                             if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
@@ -2425,13 +2414,14 @@ async def liq_bybit_loop():
     url = "wss://stream.bybit.com/v5/public/linear"
     while not bot.is_closed():
         try:
-            async with aiohttp.ClientSession() as session:
+            async with http() as session:
                 async with session.ws_connect(url, heartbeat=20, timeout=30) as ws:
                     await ws.send_json({"op": "subscribe",
                                         "args": [f"allLiquidation.{s}" for s in LIQ_BYBIT_SYMBOLS]})
                     print("[liq] Bybit stream connected", flush=True)
                     backoff = 5
                     async for msg in ws:
+                        HEARTBEAT["ws_bybit"] = _time.time()
                         if msg.type != aiohttp.WSMsgType.TEXT:
                             if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
@@ -2468,7 +2458,7 @@ _okx_ctval = {}
 async def _load_okx_ctval():
     """OKX reports liquidation size in contracts - we need each instrument's contract value."""
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             d = await _get_json(s, "https://www.okx.com/api/v5/public/instruments",
                                 {"instType": "SWAP"}, 20)
         for inst in (d or {}).get("data", []) or []:
@@ -2490,13 +2480,14 @@ async def liq_okx_loop():
     url = "wss://ws.okx.com:8443/ws/v5/public"
     while not bot.is_closed():
         try:
-            async with aiohttp.ClientSession() as session:
+            async with http() as session:
                 async with session.ws_connect(url, heartbeat=25, timeout=30) as ws:
                     await ws.send_json({"op": "subscribe",
                                         "args": [{"channel": "liquidation-orders", "instType": "SWAP"}]})
                     print("[liq] OKX stream connected", flush=True)
                     backoff = 5
                     async for msg in ws:
+                        HEARTBEAT["ws_okx"] = _time.time()
                         if msg.type != aiohttp.WSMsgType.TEXT:
                             if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                                 break
@@ -2542,7 +2533,7 @@ async def news_ws_loop():
             await asyncio.sleep(60)
             continue
         try:
-            async with aiohttp.ClientSession() as session:
+            async with http() as session:
                 async with session.ws_connect(NEWS_WS_URL, heartbeat=30, timeout=30) as ws:
                     print("[news] connected to TreeNews")
                     backoff = 5
@@ -2576,7 +2567,7 @@ async def x_poll_loop():
     params = {"query": query, "product": "Latest"}
     headers = {"Authorization": f"Bearer {TWITTERAPIS_KEY}"}
     try:
-        async with aiohttp.ClientSession() as session:
+        async with http() as session:
             async with session.get(url, params=params, headers=headers, timeout=30) as resp:
                 if resp.status != 200:
                     print(f"[x_poll] non-200: {resp.status}")
@@ -2715,11 +2706,6 @@ def build_join_dm() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="\U0001F9E0 Learn & Test Yourself",
-        value="`/quiz` - trading quizzes from basics to advanced. Build a streak.",
-        inline=False,
-    )
-    embed.add_field(
         name="\U0001F513 Want the full picture?",
         value=(
             "Members with **full access** get live analyst trade setups, entry/SL/targets, "
@@ -2776,10 +2762,10 @@ def build_pro_dm() -> discord.Embed:
         inline=False,
     )
     embed.add_field(
-        name="\U0001F4CA Full Quant Terminal",
+        name="\U0001F4CA Full Sigma Terminal",
         value=(
             "**#quant-terminal**: `/chart` `/levels` `/funding` `/oi` `/vol` `/heatmap` `/dominance` "
-            "`/compare` and more. Type `/help` for the full list."
+            "`/rs` `/exitwatch` and more. Type `/help` for the full list."
         ),
         inline=False,
     )
@@ -2910,6 +2896,14 @@ async def health_cmd(interaction: discord.Interaction):
     e.add_field(name="Data", value="\n".join(files), inline=False)
     e.add_field(name="Feed", value=(f"unsupported: {', '.join(sorted(_pw_unsupported)) or 'none'}\n"
                                     f"failing: {', '.join(f'{k}({v})' for k, v in _pw_fail.items()) or 'none'}"), inline=False)
+    ws_rows = []
+    for nm in ("ws_binance", "ws_bybit", "ws_okx"):
+        hb = HEARTBEAT.get(nm)
+        age = int(now - hb) if hb else None
+        ws_rows.append(f"{'\u2705' if age is not None and age < 300 else '\u274c'} {nm[3:]} \u00b7 " + (f"last msg {age}s ago" if age is not None else "no message yet"))
+    e.add_field(name="Liquidation feeds", value="\n".join(ws_rows), inline=False)
+    e.add_field(name="HTTP", value=(f"shared session \u00b7 {HTTP_STATS['requests']} uses"
+                                    + (f" \u00b7 up {int(now - HTTP_STATS['created_at'])}s" if HTTP_STATS['created_at'] else " \u00b7 not opened yet")), inline=False)
     recent = [x for x in _ERR_LOG if now - x[0] < 86400]
     e.add_field(name=f"Errors (24h): {len(recent)}",
                 value=("\n".join(f"`{w}` {m[:80]}" for _, w, m in recent[-6:]) if recent else "none"), inline=False)
@@ -3052,28 +3046,28 @@ async def setup_follow_panel(interaction: discord.Interaction):
     await interaction.response.send_message("Follow panel posted.", ephemeral=True)
 
 
-@bot.tree.command(name="trade", description="Post a trade setup")
+@bot.tree.command(name="trade", description="Post a futures setup")
 @app_commands.describe(
-    pair="e.g. BTC/USDT",
+    pair="Pair, e.g. BTC or BTC/USDT",
     direction="Long or Short",
-    entry_type="Market (filled now), Limit single, or Limit DCA (two entries)",
-    entry="Entry price (Entry 1 if DCA)",
-    stop_loss="SL price (the level)",
-    sl_condition="Optional soft SL, e.g. 4H close below - shows as a condition, not a hard stop",
-    risk="Account risk (just a number = %, e.g. 1 shows as 1%)",
-    entry2="Second DCA entry price (only for Limit DCA)",
-    entry_split="DCA size split, e.g. 20/80 (Entry 1 gets 20%, Entry 2 gets 80%). Optional",
-    tp_split="Planned TP sizes, e.g. 25/50/25 (TP1/TP2/TP3). TP updates then default to these. Optional",
-    framework="Setup framework (optional)",
-    framework2="Second framework (optional)",
-    chart="Chart image (optional)",
-    tp1="Take profit 1 (R auto-calculated)",
-    timeframe="e.g. 4H (optional)",
-    setup_detail="Extra specifics (optional)",
-    tp2="TP2 (optional)",
-    tp3="TP3 (optional)",
-    tp4="TP4 (optional)",
-    notes="Reasoning (optional, posted in the trade thread)",
+    entry_type="How you enter: Market (filled now), Limit (one order), or DCA (two limit orders)",
+    entry="Entry price. For DCA this is Entry 1",
+    stop_loss="Stop-loss level, just the number. The auto-tracker closes the trade here",
+    risk="Account risk %, just the number - 1 shows as 1%",
+    entry2="Entry 2 price - DCA only",
+    entry_split="DCA size split, e.g. 20/80 = 20% at Entry 1, 80% at Entry 2 - DCA only",
+    sl_condition="Soft stop, e.g. 4H close below - shown as a condition, tracker pings instead of closing",
+    tp1="Take-profit 1 price. R:R is calculated for you",
+    tp2="Take-profit 2 price",
+    tp3="Take-profit 3 price",
+    tp4="Take-profit 4 price",
+    tp_split="Planned % to close at each TP, e.g. 25/50/25 - TP updates then use these",
+    timeframe="Setup timeframe, e.g. 4H",
+    framework="Setup framework",
+    framework2="Second framework, if the setup uses two",
+    setup_detail="One line of specifics, e.g. sweep + reclaim of range low",
+    chart="Chart image",
+    notes="Reasoning - posted in the trade thread",
 )
 @app_commands.choices(
     direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")],
@@ -3081,11 +3075,11 @@ async def setup_follow_panel(interaction: discord.Interaction):
     framework2=[app_commands.Choice(name=f, value=f) for f in FRAMEWORKS],
     entry_type=[
         app_commands.Choice(name="Market - filled now", value="MARKET"),
-        app_commands.Choice(name="Limit - single entry", value="LIMIT"),
-        app_commands.Choice(name="Limit - Range/DCA (two entries)", value="DCA"),
+        app_commands.Choice(name="Limit - one order, fills when price gets there", value="LIMIT"),
+        app_commands.Choice(name="DCA - two limit orders (Entry 1 + Entry 2)", value="DCA"),
     ],
 )
-async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry_type: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, sl_condition: str = None, entry2: str = None, entry_split: str = None, tp_split: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, timeframe: str = None, setup_detail: str = None, tp2: str = None, tp3: str = None, tp4: str = None, notes: str = None):
+async def trade(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry_type: app_commands.Choice[str], entry: str, stop_loss: str, risk: str, entry2: str = None, entry_split: str = None, sl_condition: str = None, tp1: str = None, tp2: str = None, tp3: str = None, tp4: str = None, tp_split: str = None, timeframe: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, setup_detail: str = None, chart: discord.Attachment = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message(f"Only members with the **{ANALYST_ROLE_NAME}** role can post setups.", ephemeral=True)
         return
@@ -3121,9 +3115,9 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     if tp_split:
         nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", tp_split)]
         n_tps = sum(1 for x in (tp1, tp2, tp3, tp4) if x)
-        if not nums or len(nums) != n_tps:
+        if not nums or len(nums) > n_tps:
             await interaction.followup.send(
-                f"tp_split has {len(nums)} number(s) but you set {n_tps} TP level(s) - they must match (e.g. `25/50/25` for 3 TPs).",
+                f"tp_split has {len(nums)} number(s) but only {n_tps} TP level(s) are set - it can cover fewer TPs, not more.",
                 ephemeral=True,
             )
             return
@@ -3191,21 +3185,22 @@ async def trade(interaction: discord.Interaction, pair: str, direction: app_comm
     await interaction.followup.send(f"Setup posted in {channel.mention} ({msg.jump_url})", ephemeral=True)
 
 
-@bot.tree.command(name="spot", description="Post a long-term spot play (DCA zone, targets, thesis)")
+@bot.tree.command(name="spot", description="Post a spot play - DCA zone, take-profits, invalidation")
+@app_commands.rename(target1="tp1", target2="tp2", target3="tp3")
 @app_commands.describe(
-    pair="e.g. SOL, AAVE - just the coin, /USDT not needed",
-    play_type="Fresh (zone waiting), Scaling (part filled, still bidding), or Filled (position built)",
-    dca_zone="Buy zone, top - bottom, e.g. 65 - 52",
-    target1="Take-profit 1",
-    allocation="Suggested portfolio allocation - just a number = % (e.g. 5 shows as 5%)",
-    avg_entry="Your average entry so far - REQUIRED for Scaling/Filled, ignored for Fresh",
-    target2="Take-profit 2 (optional)",
-    target3="Take-profit 3 (optional)",
-    tp_split="Planned % to sell at each target, e.g. 30/30/40 (optional, under 100 = moonbag)",
-    invalidation="Thesis kill switch, e.g. Weekly close below 48 (optional but recommended)",
-    horizon="Expected hold, e.g. 3-6 months (optional)",
-    chart="Chart image (optional)",
-    thesis="Long-term reasoning (optional, posted in the play thread)",
+    pair="Coin, e.g. SOL or AAVE - no /USDT needed",
+    play_type="Where the play is: Fresh (zone waiting), Scaling (part filled), Filled (position built)",
+    dca_zone="Buy zone, top to bottom, e.g. 65 - 52",
+    target1="Take-profit 1 price",
+    allocation="Suggested portfolio allocation %, just the number - 5 shows as 5%",
+    avg_entry="Your average entry so far - required for Scaling and Filled, ignored for Fresh",
+    target2="Take-profit 2 price",
+    target3="Take-profit 3 price",
+    tp_split="Planned % to sell at each TP, e.g. 30/30/40 - under 100 leaves a moonbag",
+    invalidation="Level that kills the thesis, e.g. Weekly close below 48 - spot R is measured from it",
+    horizon="Expected hold, e.g. 3-6 months",
+    chart="Chart image",
+    thesis="Reasoning - posted in the play thread",
 )
 @app_commands.choices(play_type=[
     app_commands.Choice(name="Fresh - zone posted, buying starts now", value="FRESH"),
@@ -3405,39 +3400,35 @@ async def post_update_feed(t: dict, title: str, color: discord.Color, line: str,
     await ch.send(embed=e)
 
 
-@bot.tree.command(name="spot_update", description="Update or close a spot play - fills, sells, targets, status, close/invalidate")
+@bot.tree.command(name="spot_update", description="Update or close a live spot play")
 @app_commands.describe(
-    play="Pick an active spot play",
-    buy_price="Log a DCA buy - price you bought at. Avg entry auto-recalculates",
-    buy_pct="With buy_price: how much of the planned bag this buy was, e.g. 25 = 25% (optional)",
-    avg_entry="Set average entry MANUALLY (overrides the auto-calc) (optional)",
-    status="New phase (optional)",
-    tp_hit="Preset TP reached - bot logs the planned % at that price. Undo / rebuild here too",
-    manual_tp="Manual take profit - the price you sold at. Auto-numbered TP1, TP2... no limit",
-    tp_pct="% of the bag sold at this TP (with manual_tp, or to override the plan on tp_hit)",
-    zone_filled="Mark DCA zone fully filled (optional)",
-    tp_split="Set / change the planned sell % per target, e.g. 30/30/40",
-    close="CLOSE the play right here - Win / Loss / BE / Invalidated (zone never filled)",
-    avg_exit="With close: average exit price (auto from partial sells if blank)",
-    note="Update note (optional)",
+    play="Pick the active play",
+    tp_hit="Preset TP reached - bot records the planned % at that price. Undo / repair here too",
+    manual_tp="Take profit at a price - the price you sold at, auto-numbered TP1, TP2...",
+    tp_pct="% of the bag sold at this TP - needed with manual_tp, optional override with tp_hit",
+    buy_price="DCA buy - the price you bought at. Average entry recalculates",
+    buy_pct="With buy_price - how much of the planned bag this buy was, e.g. 25",
+    avg_entry="Set the average entry by hand - overrides the auto-calc",
+    zone_filled="Mark the DCA zone fully filled",
+    tp_split="Set or change the planned % per TP, e.g. 30/30/40",
+    status="Phase - only if the auto status is wrong",
+    close="Close the play here - Win / Loss / Breakeven / Invalidated",
+    avg_exit="With close - average exit price. Blank = worked out from your take profits",
+    note="Note - shown in the update and the thread",
 )
 @app_commands.choices(
     status=[app_commands.Choice(name=s.capitalize(), value=s) for s in SPOT_STATUSES],
     tp_hit=[
-        app_commands.Choice(name="Target 1 reached", value="t1"),
-        app_commands.Choice(name="Target 2 reached", value="t2"),
-        app_commands.Choice(name="Target 3 reached", value="t3"),
-        app_commands.Choice(name="Undo Target 1 tick", value="u1"),
-        app_commands.Choice(name="Undo Target 2 tick", value="u2"),
-        app_commands.Choice(name="Undo Target 3 tick", value="u3"),
-        app_commands.Choice(name="Rebuild TP list from recorded sells", value="rs"),
+        app_commands.Choice(name="Preset TP reached - next planned one", value="tn"),
+        app_commands.Choice(name="Undo last take profit", value="ul"),
+        app_commands.Choice(name="Rebuild TP list from recorded sells (repair)", value="rs"),
     ],
     zone_filled=[app_commands.Choice(name="Yes", value="yes")],
     close=[
-        app_commands.Choice(name="Close - Win", value="WIN"),
-        app_commands.Choice(name="Close - Loss", value="LOSS"),
-        app_commands.Choice(name="Close - Breakeven", value="BE"),
-        app_commands.Choice(name="Invalidated - zone never filled / thesis gone", value="INVALID"),
+        app_commands.Choice(name="Win", value="WIN"),
+        app_commands.Choice(name="Loss", value="LOSS"),
+        app_commands.Choice(name="Breakeven", value="BE"),
+        app_commands.Choice(name="Invalidated - zone never filled or thesis gone", value="INVALID"),
     ],
 )
 @app_commands.autocomplete(play=open_spot_ac)
@@ -3491,14 +3482,21 @@ async def spot_update(interaction: discord.Interaction, play: str, tp_hit: app_c
         changes.append(f"sell plan -> {'/'.join(f'{x:g}' for x in sl)}")
     if target_hit is not None:
         tv = target_hit.value
-        if tv.startswith("u"):
-            k = "t" + tv[1]
-            p[f"{k}_hit"] = False
-            lab = f"T{tv[1]}"
-            before = len(p.get("sells") or [])
-            p["sells"] = [s for s in (p.get("sells") or []) if s.get("label") != lab]
-            removed = before - len(p["sells"])
-            changes.append(f"Target {tv[1]} tick removed" + (" (its recorded sell removed too)" if removed else ""))
+        if tv == "tn":
+            pend = [k for k in ("t1", "t2", "t3") if spot_num(p.get(k)) is not None and not p.get(f"{k}_hit")]
+            if not pend:
+                await interaction.followup.send("No planned targets left on this play - log it with `manual_tp` + `tp_pct`.", ephemeral=True)
+                return
+            tv = pend[0]
+        if tv == "ul":
+            sells_ = p.get("sells") or []
+            if not sells_:
+                await interaction.followup.send("Nothing to undo - no take profits recorded.", ephemeral=True)
+                return
+            gone = sells_.pop()
+            p["sells"] = sells_
+            _sync_tp_flags(p, spot=True)
+            changes.append(f"undid last take profit ({gone.get('pct', 0):g}% @ {gone.get('price', 0):g})")
         elif tv == "rs":
             before = {k: bool(p.get(f"{k}_hit")) for k in ("t1", "t2", "t3")}
             _sync_tp_flags(p, spot=True)
@@ -3650,13 +3648,13 @@ async def _spot_do_close(interaction, data, play, p, result_value, result_pct=No
     return True
 
 
-@bot.tree.command(name="spot_close", description="Close OR invalidate a spot play (win / loss / BE / zone never filled)")
-@app_commands.describe(play="Pick an active spot play", result="Outcome", result_pct="Manual override - auto-calculated from entry/exit if blank", avg_exit="Average exit price (auto from partial sells if blank)", note="Closing note (optional)")
+@bot.tree.command(name="spot_close", description="Close or invalidate a spot play - shortcut for /spot_update close")
+@app_commands.describe(play="Pick the active play", result="Outcome", result_pct="Result % by hand - blank = worked out from entry and exit", avg_exit="Average exit price - blank = worked out from your take profits", note="Closing note")
 @app_commands.choices(result=[
     app_commands.Choice(name="Win", value="WIN"),
     app_commands.Choice(name="Loss", value="LOSS"),
     app_commands.Choice(name="Breakeven", value="BE"),
-    app_commands.Choice(name="Invalidated - zone never filled / thesis gone", value="INVALID"),
+    app_commands.Choice(name="Invalidated - zone never filled or thesis gone", value="INVALID"),
 ])
 @app_commands.autocomplete(play=open_spot_ac)
 @_with_state_lock
@@ -3676,26 +3674,28 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     await _spot_do_close(interaction, data, play, p, result.value, result_pct, avg_exit, note)
 
 
-@bot.tree.command(name="edit", description="Fix a mistake in a recently posted trade or spot play (within the edit window)")
+@bot.tree.command(name="edit", description="Fix a typo on a recently posted setup or spot play - fill only what changes")
 @app_commands.describe(
-    trade="Pick your recent trade or spot play",
-    pair="Corrected pair (optional)",
-    direction="Corrected direction - futures only (optional)",
-    entry="Corrected entry / DCA zone (optional)",
-    tp_split="Planned TP sizes e.g. 25/50/25 (space to clear)", entry_split="DCA size split e.g. 20/80 (space to clear)", entry2="Corrected second DCA entry - futures only (optional)",
-    stop_loss="Corrected SL / invalidation (optional)",
-    risk="Corrected risk / allocation (optional)",
-    entry_type="Corrected entry type - futures only (optional)",
-    framework="Corrected framework - futures only (optional)",
-    framework2="Corrected second framework - futures only (optional)",
-    chart="Replacement chart image (optional)",
-    tp1="Corrected TP1 / Target 1 (optional)",
-    tp2="Corrected TP2 / Target 2 (optional)",
-    tp3="Corrected TP3 / Target 3 (optional)",
-    tp4="Corrected TP4 - futures only (optional)",
-    timeframe="Corrected timeframe - futures only (optional)",
-    setup_detail="Corrected setup detail - futures only (optional)",
-    notes="Corrected reasoning / thesis (optional, posted in the thread)",
+    trade="Pick the setup or spot play",
+    pair="Pair",
+    direction="Long / Short - futures only",
+    entry_type="Market / Limit - futures only",
+    entry="Entry price (futures) or DCA zone (spot)",
+    entry2="Entry 2 price - futures DCA only",
+    entry_split="DCA size split e.g. 20/80 - space to clear",
+    stop_loss="Stop-loss (futures) or invalidation (spot)",
+    risk="Risk % (futures) or allocation % (spot)",
+    tp1="Take-profit 1",
+    tp2="Take-profit 2",
+    tp3="Take-profit 3",
+    tp4="Take-profit 4 - futures only",
+    tp_split="Planned % per TP e.g. 25/50/25 - space to clear",
+    timeframe="Timeframe - futures only",
+    framework="Framework - futures only",
+    framework2="Second framework - futures only",
+    setup_detail="Setup detail - futures only",
+    chart="Replacement chart image",
+    notes="Reasoning / thesis - posted in the thread",
 )
 @app_commands.choices(
     direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")],
@@ -3708,7 +3708,7 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
 )
 @app_commands.autocomplete(trade=editable_any_ac)
 @_with_state_lock
-async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, entry_split: str = None, tp_split: str = None, stop_loss: str = None, risk: str = None, entry_type: app_commands.Choice[str] = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, chart: discord.Attachment = None, tp1: str = None, tp2: str = None, tp3: str = None, tp4: str = None, timeframe: str = None, setup_detail: str = None, notes: str = None):
+async def edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None, entry_type: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, entry_split: str = None, stop_loss: str = None, risk: str = None, tp1: str = None, tp2: str = None, tp3: str = None, tp4: str = None, tp_split: str = None, timeframe: str = None, framework: app_commands.Choice[str] = None, framework2: app_commands.Choice[str] = None, setup_detail: str = None, chart: discord.Attachment = None, notes: str = None):
     if not is_analyst(interaction):
         await interaction.response.send_message("Analysts only.", ephemeral=True)
         return
@@ -3772,7 +3772,7 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
             else:
                 nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", raw)]
                 n_tps = sum(1 for k2 in ("tp1", "tp2", "tp3", "tp4") if t.get(k2))
-                if nums and len(nums) == n_tps and 0 < sum(nums) <= 100.5:
+                if nums and len(nums) <= n_tps and 0 < sum(nums) <= 100.5:
                     t["tp_split"] = [round(x, 1) for x in nums]; changes.append("TP split")
         if stop_loss is not None:
             e_num, e_cond = parse_sl(stop_loss)
@@ -3849,29 +3849,27 @@ async def edit(interaction: discord.Interaction, trade: str, pair: str = None, d
     await interaction.followup.send(f"Updated ({changed_txt}). {jump_url(t)}", ephemeral=True)
 
 
-@bot.tree.command(name="update", description="Update or close a running trade")
+@bot.tree.command(name="update", description="Update or close a live futures setup")
+@app_commands.rename(size_pct="tp_pct")
 @app_commands.describe(
-    trade="Pick an open trade",
+    trade="Pick the open setup",
     event="What happened",
-    size_pct="Take profits - % of position closed (e.g. 25). Skip for other events",
-    price="Take Profit (any price) / Closed - exit price. Required on SL Hit if the trade has a soft SL",
-    new_sl="SL Updated only - number for hard (64000) or full condition (4h close below 64000)",
-    note="Optional note",
+    size_pct="Take profits only - % of the position closed, e.g. 25. Blank = planned % from the card",
+    price="Take profit at a price / Closed - the exit price. Also needed on SL Hit if the stop was a soft stop",
+    new_sl="SL Updated only - a number (64000) or a condition (4h close below 64000)",
+    note="Note - shown in the update and the thread",
 )
 @app_commands.choices(event=[
-    app_commands.Choice(name="Entry 1 Filled", value="EF1"),
-    app_commands.Choice(name="DCA Entry Filled (Entry 2)", value="EF2"),
-    app_commands.Choice(name="TP1 Hit", value="TP1"),
-    app_commands.Choice(name="TP2 Hit", value="TP2"),
-    app_commands.Choice(name="TP3 Hit", value="TP3"),
-    app_commands.Choice(name="TP4 Hit", value="TP4"),
-    app_commands.Choice(name="Take Profit - any price (auto-numbered TP5, TP6...)", value="PTP"),
-    app_commands.Choice(name="Rebuild TP list from recorded fills", value="RTP"),
-    app_commands.Choice(name="SL Moved to Entry (Risk-Free)", value="BE"),
-    app_commands.Choice(name="SL Updated (new level/condition)", value="SLU"),
-    app_commands.Choice(name="SL Hit (closes trade)", value="SL"),
-    app_commands.Choice(name="Closed (bot calculates result)", value="CLOSE"),
-    app_commands.Choice(name="Invalidated (never triggered)", value="CI"),
+    app_commands.Choice(name="Entry 1 filled", value="EF1"),
+    app_commands.Choice(name="Entry 2 filled (DCA)", value="EF2"),
+    app_commands.Choice(name="Preset TP reached - next planned one, or all up to price", value="TPN"),
+    app_commands.Choice(name="Take profit at a price - any level, auto-numbered", value="PTP"),
+    app_commands.Choice(name="SL moved to entry - risk-free", value="BE"),
+    app_commands.Choice(name="SL updated - new level or condition", value="SLU"),
+    app_commands.Choice(name="SL hit - closes the trade", value="SL"),
+    app_commands.Choice(name="Closed at a price - bot works out the result", value="CLOSE"),
+    app_commands.Choice(name="Invalidated - never triggered", value="CI"),
+    app_commands.Choice(name="Rebuild TP list from recorded fills (repair)", value="RTP"),
 ])
 @app_commands.autocomplete(trade=open_trades_ac)
 @_with_state_lock
@@ -3893,6 +3891,21 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
     pct = parse_num(size_pct)
     px = parse_num(price)
 
+    if ev == "TPN":
+        is_long_ = t.get("direction") == "LONG"
+        pend = [(k, first_num(t.get(k))) for k in ("tp1", "tp2", "tp3", "tp4")
+                if t.get(k) and first_num(t.get(k)) is not None and not t.get(f"{k}_hit")]
+        if not pend:
+            await interaction.followup.send("No planned targets left on this card - use **Take Profit at a price**.", ephemeral=True)
+            return
+        if px is not None:
+            reached = [k for k, tpx in pend if (px >= tpx if is_long_ else px <= tpx)]
+            if not reached:
+                await interaction.followup.send(f"Price {fnum(px)} hasn't reached the next planned target ({fnum(pend[0][1])}) - use **Take Profit at a price** for a discretionary exit.", ephemeral=True)
+                return
+            ev = reached[-1].upper()
+        else:
+            ev = pend[0][0].upper()
     if ev in ("TP1", "TP2", "TP3", "TP4", "PTP"):
         if pct is None and ev != "PTP":
             plan = t.get("tp_split") or []
@@ -3900,10 +3913,10 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
             if idx < len(plan):
                 pct = float(plan[idx])  # planned size from the trade card
         if pct is None:
-            await interaction.followup.send("**size_pct is required** - how much of the position was closed at this level? (e.g. 25)", ephemeral=True)
+            await interaction.followup.send("**tp_pct is required** - how much of the position was closed at this level? (e.g. 25)", ephemeral=True)
             return
         if pct <= 0 or pct > 100:
-            await interaction.followup.send("size_pct must be between 0 and 100.", ephemeral=True)
+            await interaction.followup.send("tp_pct must be between 0 and 100.", ephemeral=True)
             return
         if fills_pct(t) + pct > 100.01:
             await interaction.followup.send(f"That would close {fills_pct(t) + pct:g}% total - only {100 - fills_pct(t):g}% of the position is left.", ephemeral=True)
@@ -4053,14 +4066,14 @@ async def update(interaction: discord.Interaction, trade: str, event: app_comman
     await interaction.followup.send(f"Updated: {desc}{rtxt}{aetxt}", ephemeral=True)
 
 
-@bot.tree.command(name="open", description="See all live positions (futures + spot)")
+@bot.tree.command(name="open", description="Every live setup and spot play right now")
 async def open_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await interaction.followup.send(embed=build_combined_board_embed(), ephemeral=True)
 
 
-@bot.tree.command(name="recent", description="Latest closed trades with results")
-@app_commands.describe(analyst="Filter by analyst (optional)")
+@bot.tree.command(name="recent", description="Latest closed setups and spot plays with results")
+@app_commands.describe(analyst="Only this analyst - blank = everyone")
 async def recent(interaction: discord.Interaction, analyst: discord.Member = None):
     await interaction.response.defer(ephemeral=True)
     data = load_trades()
@@ -4330,7 +4343,7 @@ async def funding(interaction: discord.Interaction, coin: str):
 async def fear(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        async with aiohttp.ClientSession() as session:
+        async with http() as session:
             async with session.get("https://api.alternative.me/fng/?limit=2", timeout=15) as resp:
                 data = await resp.json()
     except Exception:
@@ -4398,7 +4411,7 @@ async def oi(interaction: discord.Interaction, coin: str):
 async def _movers(interaction: discord.Interaction, top: bool):
     await interaction.response.defer()
     try:
-        async with aiohttp.ClientSession() as session:
+        async with http() as session:
             async with session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=20) as resp:
                 data = await resp.json()
     except Exception:
@@ -4449,7 +4462,7 @@ async def losers(interaction: discord.Interaction):
 async def dominance(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        async with aiohttp.ClientSession() as session:
+        async with http() as session:
             async with session.get("https://api.coingecko.com/api/v3/global", timeout=15) as resp:
                 data = await resp.json()
     except Exception:
@@ -4558,7 +4571,7 @@ def make_cvd_image(symbol: str, tf_label: str, dates: list, closes: list, cvd_sp
 
 
 async def _fetch_cvd_klines(url: str, pair: str, interval: str, limit: int):
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         return await _get_json(s, url, {"symbol": pair, "interval": interval, "limit": limit}, 20)
 
 
@@ -4745,7 +4758,7 @@ async def altseason_cmd(interaction: discord.Interaction):
     else:
         # top coins by mcap from CoinGecko (free), then history from Binance
         try:
-            async with aiohttp.ClientSession() as s:
+            async with http() as s:
                 cg = await _get_json(s, "https://api.coingecko.com/api/v3/coins/markets",
                                      {"vs_currency": "usd", "order": "market_cap_desc", "per_page": 80, "page": 1}, 20)
         except Exception:
@@ -4762,11 +4775,11 @@ async def altseason_cmd(interaction: discord.Interaction):
             if len(syms) >= 50:
                 break
         async def _kl(sym):
-            async with aiohttp.ClientSession() as s2:
+            async with http() as s2:
                 return sym, await _get_json(s2, "https://api.binance.com/api/v3/klines",
                                             {"symbol": f"{sym}USDT", "interval": "1d", "limit": 400}, 20)
         results = await asyncio.gather(*[_kl(x) for x in syms], return_exceptions=True)
-        async with aiohttp.ClientSession() as s3:
+        async with http() as s3:
             btc = await _get_json(s3, "https://api.binance.com/api/v3/klines",
                                   {"symbol": "BTCUSDT", "interval": "1d", "limit": 400}, 20)
         if not btc or not isinstance(btc, list):
@@ -4847,7 +4860,7 @@ async def altseason_cmd(interaction: discord.Interaction):
 async def unlocks_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             d = await _get_json(s, "https://api.llama.fi/emissions", None, 25)
     except Exception:
         d = None
@@ -4910,7 +4923,7 @@ async def fees_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     btc_fee = eth_gwei = None
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             mf = await _get_json(s, "https://mempool.space/api/v1/fees/recommended", None, 15)
             if mf:
                 btc_fee = float(mf.get("fastestFee") or 0)
@@ -5025,7 +5038,7 @@ async def _btc_daily_full():
     """BTC daily closes since 2017 listing - paginated (Binance 1000/call)."""
     out = []
     start = 1502928000000  # 2017-08-17
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         for _ in range(6):
             d = await _get_json(s, "https://api.binance.com/api/v3/klines",
                                 {"symbol": "BTCUSDT", "interval": "1d", "startTime": start, "limit": 1000}, 20)
@@ -5162,7 +5175,7 @@ async def options_cmd(interaction: discord.Interaction):
     dvol = pc_ratio = max_pain = nearest_exp = None
     dvol_pct = 50
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             end = int(datetime.now(timezone.utc).timestamp() * 1000)
             vd = await _get_json(s, "https://www.deribit.com/api/v2/public/get_volatility_index_data",
                                  {"currency": "BTC", "start_timestamp": end - 400 * 86400_000,
@@ -5239,7 +5252,7 @@ async def options_cmd(interaction: discord.Interaction):
 async def hash_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             hr = await _get_json(s, "https://api.blockchain.info/charts/hash-rate",
                                  {"timespan": "18months", "format": "json"}, 25)
     except Exception:
@@ -5256,7 +5269,7 @@ async def hash_cmd(interaction: discord.Interaction):
     # BTC closes aligned to the hashrate timestamps (blockchain.info x = unix seconds)
     prices = None
     try:
-        async with aiohttp.ClientSession() as s2:
+        async with http() as s2:
             kl = await _get_json(s2, "https://api.binance.com/api/v3/klines",
                                  {"symbol": "BTCUSDT", "interval": "1d", "limit": 1000}, 20)
         if kl and isinstance(kl, list):
@@ -5443,7 +5456,7 @@ async def basis_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     rows = []
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             info = await _get_json(s, "https://fapi.binance.com/fapi/v1/exchangeInfo", None, 25)
             now_ms = datetime.now(timezone.utc).timestamp() * 1000
             targets = []
@@ -5498,7 +5511,7 @@ async def basis_cmd(interaction: discord.Interaction):
 async def sessions_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             kl = await _get_json(s, "https://api.binance.com/api/v3/klines",
                                  {"symbol": "BTCUSDT", "interval": "1h", "limit": 744}, 25)
     except Exception:
@@ -5808,7 +5821,7 @@ def make_monthly_image(years: list, grid: dict, avg_row: list) -> io.BytesIO:
 async def monthly_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             kl = await _get_json(s, "https://api.binance.com/api/v3/klines",
                                  {"symbol": "BTCUSDT", "interval": "1M", "limit": 120}, 20)
     except Exception:
@@ -5878,7 +5891,7 @@ def make_bmsb_image(prices: list, sma20: list, ema21: list, status: str, scolor:
 async def bmsb_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             kl = await _get_json(s, "https://api.binance.com/api/v3/klines",
                                  {"symbol": "BTCUSDT", "interval": "1w", "limit": 200}, 20)
     except Exception:
@@ -6045,7 +6058,7 @@ async def cycle_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     import math
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             daily = await _get_json(s, "https://api.binance.com/api/v3/klines",
                                     {"symbol": "BTCUSDT", "interval": "1d", "limit": 1000}, 20)
             weekly = await _get_json(s, "https://api.binance.com/api/v3/klines",
@@ -6088,7 +6101,7 @@ async def cycle_cmd(interaction: discord.Interaction):
     # Puell Multiple (miner revenue / 365d avg) - blockchain.info free
     puell = None
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             bj = await _get_json(s, "https://api.blockchain.info/charts/miners-revenue",
                                  {"timespan": "2years", "format": "json"}, 20)
         vals = [p["y"] for p in bj.get("values", []) if p.get("y")]
@@ -6194,7 +6207,7 @@ async def ratio_cmd(interaction: discord.Interaction, coin: str):
     await interaction.response.defer()
     base = re.sub(r"[^A-Za-z0-9]", "", coin).upper().replace("USDT", "")
     ratios = None
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         d = await _get_json(s, "https://api.binance.com/api/v3/klines",
                             {"symbol": f"{base}BTC", "interval": "1d", "limit": 365}, 20)
         if d and isinstance(d, list) and len(d) > 60:
@@ -6247,7 +6260,7 @@ async def rvol_cmd(interaction: discord.Interaction, coin: str):
     import math
     klines = None
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             klines = await _get_json(s, "https://api.binance.com/api/v3/klines",
                                      {"symbol": pair, "interval": "1d", "limit": 1000}, 20)
     except Exception:
@@ -6316,7 +6329,7 @@ async def snapshot_cmd(interaction: discord.Interaction, coin: str):
     # quick 24h CVD from 1h klines (Binance only)
     cvd_line = None
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             kl_s = await _get_json(s, "https://api.binance.com/api/v3/klines", {"symbol": pair, "interval": "1h", "limit": 24}, 15)
             kl_p = await _get_json(s, "https://fapi.binance.com/fapi/v1/klines", {"symbol": pair, "interval": "1h", "limit": 24}, 15)
         def _delta(kl):
@@ -6335,7 +6348,7 @@ async def snapshot_cmd(interaction: discord.Interaction, coin: str):
     # fear & greed
     fg_line = None
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             fg = await _get_json(s, "https://api.alternative.me/fng/", None, 10)
         v = fg["data"][0]
         fg_line = f"**Fear & Greed:** {v['value']} ({v['value_classification']})"
@@ -6395,7 +6408,7 @@ async def before_backup():
 async def stables_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             d = await _get_json(s, "https://stablecoins.llama.fi/stablecoincharts/all", None, 20)
     except Exception:
         d = None
@@ -6437,7 +6450,7 @@ async def fetch_agg_rows(base: str):
     """(exchange, oi_usd, funding_pct) rows across Binance/Bybit/OKX - shared by /agg and the euphoria guard."""
     pair = f"{base}USDT"
     rows = []
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         try:
             oi_d = await _get_json(s, "https://fapi.binance.com/fapi/v1/openInterest", {"symbol": pair}, 15)
             px_d = await _get_json(s, "https://fapi.binance.com/fapi/v1/premiumIndex", {"symbol": pair}, 15)
@@ -6506,7 +6519,7 @@ async def whale_cmd(interaction: discord.Interaction, coin: str, min_usd: int = 
     start = end - 3600_000
     trades = []
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             cur = start
             for _ in range(6):  # aggTrades pages, max ~6k trades scanned
                 d = await _get_json(s, "https://api.binance.com/api/v3/aggTrades",
@@ -6558,7 +6571,7 @@ async def lsr_cmd(interaction: discord.Interaction, coin: str):
     symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
     pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             acct = await _get_json(s, "https://fapi.binance.com/futures/data/topLongShortAccountRatio",
                                    {"symbol": pair, "period": "1h", "limit": 25}, 15)
             pos = await _get_json(s, "https://fapi.binance.com/futures/data/topLongShortPositionRatio",
@@ -6682,7 +6695,7 @@ async def liqzones_cmd(interaction: discord.Interaction, coin: str):
     # long/short skew from LSR (fallback 1.0 balanced)
     ls_ratio = 1.0
     try:
-        async with aiohttp.ClientSession() as s:
+        async with http() as s:
             acct = await _get_json(s, "https://fapi.binance.com/futures/data/globalLongShortAccountRatio",
                                    {"symbol": pair, "period": "1h", "limit": 1}, 15)
         if acct and isinstance(acct, list):
@@ -6832,7 +6845,7 @@ def make_heatmap_image(rows: list) -> io.BytesIO:
 async def heatmap(interaction: discord.Interaction):
     await interaction.response.defer()
     try:
-        async with aiohttp.ClientSession() as session:
+        async with http() as session:
             async with session.get("https://api.binance.com/api/v3/ticker/24hr", timeout=20) as resp:
                 data = await resp.json()
     except Exception:
@@ -6862,31 +6875,6 @@ async def heatmap(interaction: discord.Interaction):
     await interaction.followup.send(content=f"**Market Heatmap** - {green}/20 green (24h)", file=f)
 
 
-def make_compare_image(sym1: str, sym2: str, closes1: list, closes2: list, dates: list) -> io.BytesIO:
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    n1 = [c / closes1[0] * 100 - 100 for c in closes1]
-    n2 = [c / closes2[0] * 100 - 100 for c in closes2]
-    fig, ax = plt.subplots(figsize=(11, 5.5), facecolor=SG_OBS)
-    ax.set_facecolor(SG_OBS)
-    ax.plot(dates, n1, color="#E8590C", linewidth=2, label=sym1)
-    ax.plot(dates, n2, color=SG_CYAN, linewidth=2, label=sym2)
-    ax.axhline(0, color=SG_ASH, linewidth=0.6, linestyle="--", alpha=0.5)
-    ax.grid(color=SG_SLATE, linewidth=0.5)
-    for spine in ax.spines.values():
-        spine.set_color(SG_SLATE)
-    ax.tick_params(colors=SG_ASH, labelsize=8)
-    ax.yaxis.tick_right()
-    leg = ax.legend(facecolor=SG_OBS, edgecolor=SG_SLATE, labelcolor=SG_PAPER, fontsize=10)
-    ax.set_title(f"{sym1} vs {sym2} - 30d performance (%)", color=SG_PAPER, fontsize=12, loc="left", pad=10)
-    plt.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
-    plt.close(fig)
-    buf.seek(0)
-    return buf
-
 
 # ═══════════════ SIGMA TERMINAL - BULL MARKET SCANNERS ═══════════════
 _SCAN_CACHE: dict = {"ts": 0, "rows": None}
@@ -6898,7 +6886,7 @@ async def _scan_universe(n: int = 40):
     now = _time.time()
     if _SCAN_CACHE["rows"] is not None and now - _SCAN_CACHE["ts"] < 300:
         return _SCAN_CACHE["rows"]
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         tick = await _get_json(s, "https://fapi.binance.com/fapi/v1/ticker/24hr", None, 15)
         if not tick:
             return None
@@ -7012,7 +7000,7 @@ async def crowded_cmd(interaction: discord.Interaction):
     if _CROWD_CACHE["embed"] is not None and now - _CROWD_CACHE["ts"] < 300:
         await interaction.followup.send(embed=_CROWD_CACHE["embed"])
         return
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         prem = await _get_json(s, "https://fapi.binance.com/fapi/v1/premiumIndex", None, 15)
         if not prem:
             await interaction.followup.send("Binance feed didn't answer - try again in a minute.")
@@ -7086,7 +7074,7 @@ async def exitwatch_cmd(interaction: discord.Interaction):
     await interaction.response.defer()
     def sma(v, n):
         return sum(v[-n:]) / n if len(v) >= n else None
-    async with aiohttp.ClientSession() as s:
+    async with http() as s:
         daily = await _get_json(s, "https://api.binance.com/api/v3/klines", {"symbol": "BTCUSDT", "interval": "1d", "limit": 720}, 20)
         weekly = await _get_json(s, "https://api.binance.com/api/v3/klines", {"symbol": "BTCUSDT", "interval": "1w", "limit": 210}, 20)
         fund = await _get_json(s, "https://fapi.binance.com/fapi/v1/fundingRate", {"symbol": "BTCUSDT", "limit": 21}, 15)
@@ -7303,12 +7291,11 @@ def build_help_embed() -> discord.Embed:
         name="\U0001F514 Pings & Learning",
         value=(
             "`/follow` `/unfollow` - analyst trade pings\n"
-            "Or use the buttons in #select-analyst-alerts\n"
-            "`/quiz` - trading quizzes, basics to advanced"
+            "Or use the buttons in #select-analyst-alerts"
         ),
         inline=False,
     )
-    embed.set_footer(text="Sigma Trading - Quant Terminal")
+    embed.set_footer(text="Sigma Trading - Sigma Terminal")
     return embed
 
 
@@ -7649,18 +7636,6 @@ async def board_cmd(interaction: discord.Interaction):
     await interaction.followup.send("Board rebuilt.", ephemeral=True)
 
 
-@bot.tree.command(name="spot_board", description="(Admin) Rebuild the spot plays board")
-async def spot_board_cmd(interaction: discord.Interaction):
-    if not interaction.user.guild_permissions.administrator:
-        await interaction.response.send_message("Admins only.", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    if not OPEN_BOARD_CHANNEL_ID:
-        await interaction.followup.send("Set OPEN_BOARD_CHANNEL_ID first.", ephemeral=True)
-        return
-    save_spot_board({})
-    await refresh_spot_board()
-    await interaction.followup.send("Spot board rebuilt.", ephemeral=True)
 
 
 def build_trades_csv(trades: list, analyst_name: str) -> io.BytesIO:
@@ -7741,21 +7716,9 @@ def _in_window(item: dict, start, end) -> bool:
         return False
 
 
-def _in_period(item: dict, days: int) -> bool:
-    """True if the item's close falls inside the last `days` days (0 = all time)."""
-    if not days:
-        return True
-    try:
-        d = datetime.fromisoformat(item["closed_at"])
-        if d.tzinfo is None:
-            d = d.replace(tzinfo=timezone.utc)
-        return d >= datetime.now(timezone.utc) - timedelta(days=days)
-    except Exception:
-        return False
 
-
-@bot.tree.command(name="stats", description="Trade journal scorecard (futures) - default: last complete month")
-@app_commands.describe(analyst="Whose stats? (blank = your own)", period="Time window (blank = last complete month)")
+@bot.tree.command(name="stats", description="Analyst scorecard - futures R, spot R, total. Default: last complete month")
+@app_commands.describe(analyst="Which analyst - blank = you", period="Time window - blank = last complete month")
 @app_commands.choices(period=_PERIOD_CHOICES)
 async def stats(interaction: discord.Interaction, analyst: discord.Member = None,
                 period: app_commands.Choice[int] = None):
@@ -7791,6 +7754,10 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     s_wr = (s_w / (s_w + s_l) * 100) if (s_w + s_l) else 0
     fut_r = total_r if total_r is not None else 0.0
     spot_r = sum(s_rs) if s_rs else 0.0
+    graded = [(t.get("result_r"), f"{t.get('pair','?').upper()} fut") for t in closed
+              if isinstance(t.get("result_r"), (int, float))]
+    graded += [(spot_result_r(p), f"{p.get('pair','?').upper()} spot") for p in s_closed
+               if spot_result_r(p) is not None]
     embed = discord.Embed(title=f"Scorecard - {target.display_name} \u00b7 {plabel}", color=ecolor)
     embed.add_field(name="Futures R", value=(f"**{fut_r:+.2f}R**" if rs else "-"), inline=True)
     embed.add_field(name="Spot R", value=(f"**{spot_r:+.2f}R**" if s_rs else "-"), inline=True)
@@ -7798,23 +7765,18 @@ async def stats(interaction: discord.Interaction, analyst: discord.Member = None
     embed.add_field(name="Futures", value=(f"{len(closed)} closed \u00b7 {len(wins)}W/{len(losses)}L \u00b7 {wr:.0f}%" if closed else "no closes"), inline=True)
     embed.add_field(name="Spot", value=(f"{len(s_closed)} closed \u00b7 {s_w}W/{s_l}L \u00b7 {s_wr:.0f}%" if s_closed else "no closes"), inline=True)
     embed.add_field(name="Open now", value=f"{sum(1 for t in mine if not t.get('closed'))} futures \u00b7 {sum(1 for p in s_all if not p.get('closed'))} spot", inline=True)
-    # best / worst across BOTH markets, tagged with the pair
-    graded = [(t.get("result_r"), f"{t.get('pair','?').upper()} fut") for t in closed
-              if isinstance(t.get("result_r"), (int, float))]
-    graded += [(spot_result_r(p), f"{p.get('pair','?').upper()} spot") for p in s_closed
-               if spot_result_r(p) is not None]
     tail = []
     if graded:
         b = max(graded, key=lambda x: x[0]); w_ = min(graded, key=lambda x: x[0])
-        tail.append(f"best {b[0]:+.2f}R ({b[1]}) \u00b7 worst {w_[0]:+.2f}R ({w_[1]})")
-    tail.append(f"BE/invalidated {len(be)}/{len(invalid)}")
-    embed.add_field(name="\u200b", value=" \u00b7 ".join(tail), inline=False)
+        tail.append(f"**Best** {b[0]:+.2f}R ({b[1]})  \u00b7  **Worst** {w_[0]:+.2f}R ({w_[1]})")
+    tail.append(f"**BE / Invalidated** {len(be)} / {len(invalid)}")
+    embed.add_field(name="\u200b", value="  \u00b7  ".join(tail), inline=False)
     embed.set_footer(text="Sigma Trading - Journal \u00b7 R only counts graded closes")
     await interaction.followup.send(embed=embed, view=StatsCSVView(mine, target.display_name), ephemeral=True)
 
 
-@bot.tree.command(name="spot_stats", description="Spot plays scorecard - default: last complete month")
-@app_commands.describe(analyst="Whose stats? (blank = your own)", period="Time window (blank = last complete month)")
+@bot.tree.command(name="spot_stats", description="Spot-only scorecard with each play's result %. Default: last complete month")
+@app_commands.describe(analyst="Which analyst - blank = you", period="Time window - blank = last complete month")
 @app_commands.choices(period=_PERIOD_CHOICES)
 async def spot_stats(interaction: discord.Interaction, analyst: discord.Member = None,
                      period: app_commands.Choice[int] = None):
@@ -8608,10 +8570,10 @@ async def post_analyst_journals(start=None, end=None, label=None) -> int:
     return posted
 
 
-@bot.tree.command(name="track", description="(Admin/Analyst) Auto price tracking on/off for a setup")
-@app_commands.describe(trade="Which setup", mode="on / off")
-@app_commands.choices(mode=[app_commands.Choice(name="Off - manual tracking only", value="off"),
-                            app_commands.Choice(name="On - re-arm auto tracking", value="on")])
+@bot.tree.command(name="track", description="Auto price tracking on or off for one setup")
+@app_commands.describe(trade="Pick the open setup", mode="Off = you update it by hand. On = tracker fills entries, TPs and the stop from live price")
+@app_commands.choices(mode=[app_commands.Choice(name="Off - manual updates only", value="off"),
+                            app_commands.Choice(name="On - tracker re-armed, feed re-verified", value="on")])
 @app_commands.autocomplete(trade=open_trades_ac)
 @_with_state_lock
 async def track_cmd(interaction: discord.Interaction, trade: str, mode: app_commands.Choice[str]):
@@ -8636,37 +8598,40 @@ async def track_cmd(interaction: discord.Interaction, trade: str, mode: app_comm
         f"Auto-tracking **{mode.value.upper()}** for {t.get('pair','?').upper()}.", ephemeral=True)
 
 
-@bot.tree.command(name="reopen", description="(Admin) Reopen a wrongly-closed setup and clean the results board")
-@app_commands.describe(trade="Closed setup to reopen (recent closes shown)")
+@bot.tree.command(name="reopen", description="(Admin) Undo a wrong close - reopens the setup and removes its results card")
+@app_commands.describe(trade="Pick the closed setup or spot play")
 @_with_state_lock
 async def reopen_cmd(interaction: discord.Interaction, trade: str):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    data = load_trades()
-    t = data.get(trade)
+    spot = trade.startswith("s:")
+    mid = trade[2:] if (trade.startswith("f:") or trade.startswith("s:")) else trade
+    data = load_spot() if spot else load_trades()
+    t = data.get(mid)
     if t is None or not t.get("closed"):
         await interaction.followup.send("Closed setup not found with that id.", ephemeral=True)
         return
-    # reset close state
-    for f in ("result", "result_r", "avg_exit", "closed_at", "close_note"):
+    for f in ("result", "result_r", "result_pct", "avg_exit", "closed_at", "close_note"):
         t.pop(f, None)
     t["closed"] = False
-    t["sl_hit"] = False
-    t["watch_disabled"] = True   # safety: manual tracking after a reopen
-    # drop auto-recorded stop fill if it was the last fill
-    fills = t.get("fills") or []
-    if fills and fills[-1].get("label") in ("SL", "STOP"):
-        fills.pop()
-        t["fills"] = fills
-    data[trade] = t
-    save_trades(data)
-    # results board cleanup: delete the wrong card + forget it
+    if spot:
+        if t.get("status") == "INVALIDATED":
+            t["status"] = "HOLDING" if t.get("zone_filled") else "ACCUMULATING"
+    else:
+        t["sl_hit"] = False
+        t["watch_disabled"] = True   # safety: manual tracking after a reopen
+        fills = t.get("fills") or []
+        if fills and fills[-1].get("label") in ("SL", "STOP", "close"):
+            fills.pop()
+            t["fills"] = fills
+    data[mid] = t
+    (save_spot if spot else save_trades)(data)
     state = load_results()
     removed = False
     for kind in ("fut", "spot"):
-        key = f"{kind}:{trade}"
+        key = f"{kind}:{mid}"
         if key in set(state.get("posted", [])):
             state["posted"] = [x for x in state.get("posted", []) if x != key]
             msg_id = (state.get("posted_msgs") or {}).pop(key, None)
@@ -8681,14 +8646,15 @@ async def reopen_cmd(interaction: discord.Interaction, trade: str):
             removed = True
     save_results(state)
     try:
-        await refresh_and_edit(t)
+        await refresh_and_edit(t, spot_mode=spot)
     except Exception:
         pass
     await refresh_board()
     await refresh_results_summary(repost=True)
     await post_update_feed(t, "Setup reopened", BLUE,
                            "Previous close was recorded in error and has been reversed. "
-                           "The setup is live again - auto-tracking is off for it (manual updates).")
+                           + ("The play is live again." if spot else "The setup is live again - auto-tracking is off for it (manual updates)."),
+                           footer=("Sigma Trading - Spot Plays" if spot else "Sigma Trading - Trade Updates"))
     await interaction.followup.send(
         f"Reopened {t.get('pair','?').upper()}." + (" Wrong results card deleted, summary rebuilt." if removed else ""),
         ephemeral=True)
@@ -8696,16 +8662,18 @@ async def reopen_cmd(interaction: discord.Interaction, trade: str):
 
 @reopen_cmd.autocomplete("trade")
 async def _reopen_ac(interaction: discord.Interaction, current: str):
-    data = load_trades()
     rows = []
-    for mid, t in data.items():
-        if not t.get("closed"):
-            continue
-        label = f"[{t.get('result','?')}] {t.get('pair','?').upper()} - closed {str(t.get('closed_at',''))[:10]}"
-        if current.lower() in label.lower():
-            rows.append((t.get("closed_at") or "", label, mid))
+    for mid, t in load_trades().items():
+        if t.get("closed"):
+            lbl = f"[{t.get('result','?')}] {t.get('pair','?').upper()} {t.get('direction','')} - closed {str(t.get('closed_at',''))[:10]}"
+            rows.append((t.get("closed_at") or "", lbl, f"f:{mid}"))
+    for mid, p in load_spot().items():
+        if p.get("closed"):
+            lbl = f"[{p.get('result','?')}] {p.get('pair','?').upper()} SPOT - closed {str(p.get('closed_at',''))[:10]}"
+            rows.append((p.get("closed_at") or "", lbl, f"s:{mid}"))
     rows.sort(reverse=True)
-    return [app_commands.Choice(name=lbl[:100], value=mid) for _, lbl, mid in rows[:25]]
+    cur = current.lower()
+    return [app_commands.Choice(name=lbl[:100], value=v) for _, lbl, v in rows if cur in lbl.lower()][:25]
 
 
 @bot.tree.command(name="journal_month",
