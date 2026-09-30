@@ -3674,6 +3674,115 @@ async def spot_close(interaction: discord.Interaction, play: str, result: app_co
     await _spot_do_close(interaction, data, play, p, result.value, result_pct, avg_exit, note)
 
 
+def _spot_entries_text(p: dict) -> str:
+    lines = []
+    sells = p.get("sells") or []
+    buys = p.get("buys") or []
+    if sells:
+        lines.append("**Sells:**")
+        for i, s in enumerate(sells, 1):
+            lab = f" ({str(s['label']).upper()})" if s.get("label") else ""
+            lines.append(f"`{i}.` {s.get('pct', 0):g}% @ {s.get('price', 0):g}{lab}")
+    if buys:
+        lines.append("**Buys:**")
+        for i, b in enumerate(buys, 1):
+            ptxt = f"{b['pct']:g}% " if b.get("pct") else ""
+            lines.append(f"`{i}.` {ptxt}@ {b.get('price', 0):g}")
+    return "\n".join(lines) if lines else "No sells or buys recorded on this play yet."
+
+
+@bot.tree.command(name="spot_edit", description="Fix a wrongly recorded sell or buy on a spot play - any time, no window")
+@app_commands.describe(
+    play="Pick the play",
+    action="What to fix - run 'List entries' first to see the numbers",
+    item="Which entry - the number from 'List entries' (1 = oldest)",
+    price="Corrected price (with Fix)",
+    pct="Corrected % of the bag (with Fix)",
+    note="Correction note - posted in the play thread (optional)",
+)
+@app_commands.choices(action=[
+    app_commands.Choice(name="List entries (see the numbers)", value="list"),
+    app_commands.Choice(name="Remove a sell", value="rm_sell"),
+    app_commands.Choice(name="Fix a sell (price/pct)", value="fix_sell"),
+    app_commands.Choice(name="Remove a buy", value="rm_buy"),
+    app_commands.Choice(name="Fix a buy (price/pct)", value="fix_buy"),
+])
+@app_commands.autocomplete(play=open_spot_ac)
+@_with_state_lock
+async def spot_edit(interaction: discord.Interaction, play: str, action: app_commands.Choice[str], item: int = None, price: str = None, pct: str = None, note: str = None):
+    if not is_analyst(interaction):
+        await interaction.response.send_message("Analysts only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    data = load_spot()
+    p = data.get(play)
+    if not p:
+        await interaction.followup.send("Play not found.", ephemeral=True)
+        return
+    if not (interaction.user.guild_permissions.administrator or p.get("analyst_id") == interaction.user.id):
+        await interaction.followup.send("Only the analyst who posted this play (or an admin) can edit it.", ephemeral=True)
+        return
+    av = action.value
+    if av == "list":
+        await interaction.followup.send(
+            f"**{p['pair'].upper()}** - recorded entries:\n{_spot_entries_text(p)}\n"
+            f"*Re-run `/spot_edit` with the action + `item` number to remove or fix one.*",
+            ephemeral=True)
+        return
+    kind = "sells" if av.endswith("sell") else "buys"
+    rows = p.get(kind) or []
+    if not rows:
+        await interaction.followup.send(f"No {kind} recorded on this play.", ephemeral=True)
+        return
+    if item is None or not (1 <= item <= len(rows)):
+        await interaction.followup.send(
+            f"Pick which one with `item` (1-{len(rows)}):\n{_spot_entries_text(p)}", ephemeral=True)
+        return
+    row = rows[item - 1]
+    old_txt = f"{row.get('pct', 0):g}% @ {row.get('price', 0):g}"
+    if av.startswith("rm_"):
+        rows.pop(item - 1)
+        p[kind] = rows
+        change = f"removed {kind[:-1]} #{item} ({old_txt})"
+    else:
+        npx = spot_num(price) if price is not None else None
+        npc = spot_num(pct) if pct is not None else None
+        if npx is None and npc is None:
+            await interaction.followup.send("Give `price` and/or `pct` to fix this entry.", ephemeral=True)
+            return
+        if npc is not None and not (0 < npc <= 100):
+            await interaction.followup.send("pct must be between 0 and 100.", ephemeral=True)
+            return
+        if npx is not None:
+            row["price"] = npx
+        if npc is not None:
+            row["pct"] = npc
+        if kind == "sells":
+            others = sum(s.get("pct", 0) for i2, s in enumerate(rows) if i2 != item - 1)
+            if others + row.get("pct", 0) > 100.01:
+                await interaction.followup.send(
+                    f"That would make {others + row.get('pct', 0):g}% sold in total - over 100%. Adjust the pct.",
+                    ephemeral=True)
+                return
+        change = f"fixed {kind[:-1]} #{item}: {old_txt} -> {row.get('pct', 0):g}% @ {row.get('price', 0):g}"
+    if kind == "sells":
+        _sync_tp_flags(p, spot=True)
+    else:
+        auto = spot_weighted_entry(p)
+        if auto:
+            p["avg_entry"] = f"{auto:g}"
+        elif not rows:
+            pass  # no buys left - keep whatever avg_entry was set manually
+    p["edited"] = True
+    p["edited_at"] = datetime.now(timezone.utc).isoformat()
+    data[play] = p
+    save_spot(data)
+    await refresh_and_edit(p, spot_mode=True)
+    await refresh_spot_board()
+    await thread_note(p, f"**Correction** - {change}" + (f" - {note}" if note else ""))
+    await interaction.followup.send(f"\u2705 {change}. Card and journal updated.", ephemeral=True)
+
+
 @bot.tree.command(name="edit", description="Fix a typo on a recently posted setup or spot play - fill only what changes")
 @app_commands.describe(
     trade="Pick the setup or spot play",
