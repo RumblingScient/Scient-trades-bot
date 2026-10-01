@@ -27,15 +27,13 @@ _fmt = logging.Formatter("%(asctime)s %(levelname)s %(message)s", "%Y-%m-%d %H:%
 
 _fh = logging.handlers.RotatingFileHandler(_LOG_DIR / "sigma_bot.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8")
 
-_fh.setFormatter(_fmt); log.addHandler(_fh)
+_fh.setFormatter(_fmt)
 
-_fh.setFormatter(_fmt); log.addHandler(_fh)
+_sh = logging.StreamHandler(); _sh.setFormatter(_fmt)
 
-_sh = logging.StreamHandler(); _sh.setFormatter(_fmt); log.addHandler(_sh)
-
-_sh = logging.StreamHandler(); _sh.setFormatter(_fmt); log.addHandler(_sh)
-
-_sh = logging.StreamHandler(); _sh.setFormatter(_fmt); log.addHandler(_sh)
+if not log.handlers:   # one file + one stream handler, however many times this module is imported
+    log.addHandler(_fh)
+    log.addHandler(_sh)
 
 def print(*args, **kwargs):  # every existing print() lands in the log file too
     log.info(" ".join(str(a) for a in args))
