@@ -24,8 +24,17 @@ except Exception as e:
 cmds = m.bot.tree.get_commands()
 out.write(f"module loaded - {len(cmds)} commands\n")
 names = {c.name for c in cmds}
-for must in ("health","update","spot_update","edit","reopen","track","trade","spot","stats","journal_month","recap_month","results_debug","results_sync"):
+for must in ("open", "recent", "stats", "results", "help", "setup", "admin"):
     check(f"command /{must}", must in names)
+def _group(nm):
+    g = next((c for c in cmds if c.name == nm), None)
+    return {s.name for s in getattr(g, "commands", []) or []}
+check("/setup subcommands", _group("setup") == {"futures","spot","update","close","edit","fix","track","reopen","xpost"}, str(sorted(_group("setup"))))
+check("/admin subcommands", _group("admin") >= {"health","terminal_check","board","results","override","recap","tg","panel","grant","revoke","subs"}, str(sorted(_group("admin"))))
+_adm = next((c for c in cmds if c.name == "admin"), None)
+check("/admin hidden from members", _adm is not None and _adm.default_permissions is not None and _adm.default_permissions.administrator)
+_aliases = [c.name for c in cmds if (getattr(c, "extras", None) or {}).get("moved")]
+check("old names kept as aliases (one release)", len(_aliases) == 14, f"({len(_aliases)})")
 check("all 13 loops present", len(m._loops()) == 13)
 # Discord hard limits - a single violation makes the WHOLE command sync fail on boot
 def _walk_cmds(cmds):
@@ -53,6 +62,14 @@ ae, r = m.finalize_close({"direction":"SHORT","entry":"100","sl":"105","fills":[
 p = {"t1":"2.05","t2":"5.4","t3":"8.4","tp_split":[],"avg_entry":"1.65",
      "sells":[{"pct":10,"price":2.26},{"pct":10,"price":3.14}],"t1_hit":True,"t2_hit":True,"t3_hit":True}
 m._sync_tp_flags(p, spot=True); check("unified TP ledger", not p["t3_hit"] and p["t2_hit"])
+# service layer: close grades itself
+from sigma.services import trades as _svc
+_t = {"direction":"LONG","entry":"100","sl":"95","fills":[],"closed":False}
+_o = _svc.close("fut", _t, "110"); check("service close grades WIN", _t["result"] == "WIN" and abs(_t["result_r"] - 2.0) < 1e-9 and _o.closed)
+_t = {"direction":"LONG","entry":"100","sl":"95","fills":[],"closed":False}
+_svc.close("fut", _t, "100.1"); check("service close grades BE band", _t["result"] == "BE")
+_p = {"kind":"spot","avg_entry":"10","invalidation":"8","sells":[],"buys":[{"price":10,"pct":None}],"t1":"14","t1_hit":False,"closed":False}
+_svc.close("spot", _p, "12"); check("service spot close R", _p["result"] == "WIN" and abs(_p["result_r"] - 1.0) < 1e-9)
 
 tf = Path(tempfile.mkdtemp()) / "t.json"
 m._save(tf, {"a":1}); m._save(tf, {"a":2}); tf.write_text("{corrupt")

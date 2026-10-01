@@ -1,0 +1,6 @@
+discord.py>=2.3
+aiohttp>=3.9
+matplotlib>=3.8
+mplfinance>=0.12.10b0
+numpy>=1.26
+pandas>=2.1
