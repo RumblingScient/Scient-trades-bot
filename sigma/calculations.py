@@ -104,7 +104,7 @@ def _tp_presets(t: dict, spot: bool = False):
 def _tp_taken(t: dict, spot: bool = False):
     """Profit-taking fills in the order they happened: [{'price','pct'}]."""
     if spot:
-        return [s for s in (t.get("sells") or []) if s.get("price") is not None]
+        return [s for s in (t.get("sells") or []) if s.get("price") is not None and str(s.get("label") or "") != "close"]
     return [f for f in (t.get("fills") or []) if _is_tp_fill(f)]
 
 def _sync_tp_flags(t: dict, spot: bool = False):

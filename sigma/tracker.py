@@ -15,7 +15,9 @@ from sigma.core import bot
 from sigma.ops import HEARTBEAT, ops_alert
 from sigma.http import http
 from sigma.storage import load_trades, save_trades
-from sigma.calculations import _sync_tp_flags, any_entry_filled, entry_num, fills_pct, finalize_close, first_num, fnum, sl_num
+from sigma.calculations import any_entry_filled, entry_num, first_num, fnum, sl_num
+from sigma.errors import UserError
+from sigma.services import trades as _svc
 from sigma.cards import post_update_feed, refresh_and_edit
 from sigma.boards import refresh_board
 
@@ -85,7 +87,6 @@ async def _pw_process_trade(tid: str, t: dict, candles):
     e1 = first_num(t.get("entry"))
     e2 = first_num(t.get("entry2")) if t.get("entry2") else None
     slv = sl_num(t)
-    plan = t.get("tp_split") or []
     soft_sl = bool(t.get("sl_condition"))
 
     def crossed_entry(px, lo, hi):
@@ -135,18 +136,14 @@ async def _pw_process_trade(tid: str, t: dict, candles):
                 if not tp_px or t.get(f"{key}_hit"):
                     continue
                 if crossed_tp(tp_px, lo, hi):
-                    t[f"{key}_hit"] = True
-                    for prev in ("tp1", "tp2", "tp3", "tp4")[:idx]:
-                        t[f"{prev}_hit"] = True
-                    pct = float(plan[idx]) if idx < len(plan) else 0.0
-                    room = max(0.0, 100.0 - fills_pct(t))
-                    pct = min(pct, room)
-                    if pct > 0:
-                        t.setdefault("fills", []).append({"price": tp_px, "pct": pct, "label": key.upper()})
-                        _sync_tp_flags(t)
-                        events.append((f"{key.upper()} hit @ {fnum(tp_px)} ({pct:g}%)", GREEN,
-                                       f"Auto-tracked · {fills_pct(t):g}% closed, {100 - fills_pct(t):g}% running"))
-                    else:
+                    try:
+                        out = _svc.apply_event("fut", t, key.upper())      # planned % from the card, same path as /setup update
+                        events.append((out.title + " - auto-tracked", GREEN, out.line or out.desc))
+                    except UserError:
+                        # no planned % (or nothing left to close): tick the level, let the analyst record size
+                        t[f"{key}_hit"] = True
+                        for prev in ("tp1", "tp2", "tp3", "tp4")[:idx]:
+                            t[f"{prev}_hit"] = True
                         events.append((f"{key.upper()} tagged @ {fnum(tp_px)}", GREEN,
                                        "Auto-tracked - no split % on the card, record size with /setup update"))
         # SL - once the analyst moved the stop to entry, ENTRY is the stop
@@ -159,20 +156,14 @@ async def _pw_process_trade(tid: str, t: dict, candles):
                     events.append(("Price at soft invalidation", GREY,
                                    f"Traded through {fnum(stop_lvl)} ({t.get('sl_condition')}) - your call, confirm with /setup update if it closes there."))
             elif AUTO_CLOSE_ON_HARD_SL:
-                exit_px = stop_lvl
-                t["sl_hit"] = not t.get("be")
-                avg_exit, r = finalize_close(t, exit_px)
-                t["closed"] = True
-                t["avg_exit"] = avg_exit
-                t["result_r"] = round(r, 2) if r is not None else None
-                t["result"] = ("WIN" if r > 0.05 else "LOSS" if r < -0.05 else "BE") if r is not None else "LOSS"
-                t["closed_at"] = datetime.now(timezone.utc).isoformat()
-                t["close_note"] = "Auto-tracked stop"
-                rtxt = f" ({t['result_r']:+.2f}R)" if isinstance(t.get("result_r"), (int, float)) else ""
-                if t.get("be"):
-                    events.append((f"Closed - Breakeven{rtxt}", GREY, f"Stop at entry hit @ {fnum(exit_px)} - auto-tracked"))
-                else:
-                    events.append((f"Closed - Loss{rtxt}", RED, f"Stop hit @ {fnum(exit_px)} - auto-tracked"))
+                try:
+                    out = _svc.apply_event("fut", t, "SL", note="Auto-tracked stop")   # same close + grading as /setup update
+                except UserError as ex:
+                    t["watch_disabled"] = True
+                    events.append(("Tracker could not close this setup", GREY, f"{ex.message} Resolve with /setup update."))
+                    break
+                where = "Stop at entry" if t.get("be") else "Stop"
+                events.append((out.title, out.color, f"{where} hit @ {fnum(stop_lvl)} - auto-tracked"))
                 break
     return events
 

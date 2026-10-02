@@ -32,7 +32,7 @@ from sigma.cards import (_ac_label, _ac_sortkey, build_embed, build_spot_embed, 
 from sigma.sizer import TradeSizerView
 from sigma.boards import refresh_board
 from sigma.tracker import _with_state_lock
-from sigma.results import refresh_results_summary
+from sigma.results import refresh_results_summary, _results_watch_tick
 from sigma.services import store
 from sigma.services import trades as svc
 
@@ -134,9 +134,9 @@ async def _finish(interaction, kind, key, rec, data, out: svc.Outcome, note=None
     await thread_note(rec, f"**{out.desc}{out.result_txt}**" + (f" - {note}" if note else ""))
     if out.closed:
         try:
-            await refresh_results_summary()
+            await _results_watch_tick()      # results card + summary now, not on the next poll
         except Exception as ex:
-            print(f"[setup] results refresh failed: {ex}", flush=True)
+            print(f"[setup] results post failed: {ex}", flush=True)
     await _reply(interaction, f"{'Closed' if out.closed else 'Updated'}: {out.desc}{out.result_txt}" + (f"\n{out.extra}" if out.extra else ""))
 
 
@@ -303,22 +303,34 @@ async def setup_spot(interaction: discord.Interaction, pair: str, zone: str, tp1
     event="What happened",
     price="The price it happened at - TPs, stop moves, spot buys. Blank = the preset level",
     tp_pct="% of the position closed at this TP - blank = planned % from the card. Spot buy: % of the bag",
+    status="Spot only - change the phase by hand (Watching / Accumulating / Holding / Trimmed / Distributing)",
     note="Note - shown in the update and the thread",
 )
-@app_commands.choices(event=[app_commands.Choice(name=n, value=v) for v, n in svc.EVENTS])
+@app_commands.choices(
+    event=[app_commands.Choice(name=n, value=v) for v, n in svc.EVENTS],
+    status=[app_commands.Choice(name=s.capitalize(), value=s) for s in SPOT_STATUSES],
+)
 @app_commands.autocomplete(trade=open_any_ac)
 @_with_state_lock
-async def setup_update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str],
-                       price: str = None, tp_pct: str = None, note: str = None):
+async def setup_update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str] = None,
+                       price: str = None, tp_pct: str = None, status: app_commands.Choice[str] = None, note: str = None):
     if not await _gate(interaction):
         return
 
     async def body():
+        if event is None and status is None:
+            raise UserError("Pick an **event**, or a **status** for a spot play.")
         kind, key, rec, data = store.find(trade)
         _own(interaction, rec)
         if rec.get("closed"):
             raise UserError("That trade is closed. **/setup reopen** it first if the close was wrong.")
-        out = svc.apply_event(kind, rec, event.value, price=price, pct=tp_pct, note=note)
+        if event is not None:
+            out = svc.apply_event(kind, rec, event.value, price=price, pct=tp_pct, note=note)
+            if status is not None and not out.closed:
+                st = svc.set_status(kind, rec, status.value)
+                out.desc += f" - {st.desc}"
+        else:
+            out = svc.set_status(kind, rec, status.value)
         await _finish(interaction, kind, key, rec, data, out, note)
     await _run(interaction, body())
 
@@ -457,6 +469,8 @@ async def setup_fix(interaction: discord.Interaction, trade: str, action: app_co
     async def body():
         kind, key, rec, data = store.find(trade)
         _own(interaction, rec)
+        if rec.get("closed") and action.value != "list":
+            raise UserError("That trade is closed - its result is already on the board. **/setup reopen** it, fix, then close again.")
         if action.value == "list":
             await _reply(interaction, f"**{rec['pair'].upper()}** - recorded fills:\n{svc.ledger_text(kind, rec)}\n"
                                       f"*Re-run `/setup fix` with the action + `item` number to remove or fix one.*")
