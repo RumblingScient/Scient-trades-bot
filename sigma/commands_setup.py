@@ -301,8 +301,8 @@ async def setup_spot(interaction: discord.Interaction, pair: str, zone: str, tp1
 @app_commands.describe(
     trade="Pick the trade",
     event="What happened",
-    price="The price it happened at - TPs, stop moves, spot buys. Blank = the preset level",
-    tp_pct="% of the position closed at this TP - blank = planned % from the card. Spot buy: % of the bag",
+    price="The price it happened at - TP, stop move, spot buy, real avg entry on zone filled. Blank = preset level",
+    pct="Take profit: % of the position closed (blank = planned %). Spot buy: % of the bag (blank = equal buys)",
     status="Spot only - change the phase by hand (Watching / Accumulating / Holding / Trimmed / Distributing)",
     note="Note - shown in the update and the thread",
 )
@@ -313,7 +313,7 @@ async def setup_spot(interaction: discord.Interaction, pair: str, zone: str, tp1
 @app_commands.autocomplete(trade=open_any_ac)
 @_with_state_lock
 async def setup_update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str] = None,
-                       price: str = None, tp_pct: str = None, status: app_commands.Choice[str] = None, note: str = None):
+                       price: str = None, pct: str = None, status: app_commands.Choice[str] = None, note: str = None):
     if not await _gate(interaction):
         return
 
@@ -325,7 +325,7 @@ async def setup_update(interaction: discord.Interaction, trade: str, event: app_
         if rec.get("closed"):
             raise UserError("That trade is closed. **/setup reopen** it first if the close was wrong.")
         if event is not None:
-            out = svc.apply_event(kind, rec, event.value, price=price, pct=tp_pct, note=note)
+            out = svc.apply_event(kind, rec, event.value, price=price, pct=pct, note=note)
             if status is not None and not out.closed:
                 st = svc.set_status(kind, rec, status.value)
                 out.desc += f" - {st.desc}"
