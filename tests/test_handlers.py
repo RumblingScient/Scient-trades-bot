@@ -84,7 +84,7 @@ def _choice(value):
 def test_update_preset_tp_flow(bot_mod, env):
     cmd = _sub(bot_mod, "update")
     it = FakeInteraction(FakeUser(uid=1), command=cmd)
-    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("TPN"), price=None, tp_pct=None, note="clean"))
+    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("TPN"), price=None, pct=None, note="clean"))
     t = env["trades"]["11"]
     assert it.response.deferred and t["tp1_hit"] and t["fills"][0]["pct"] == 50.0
     assert env["calls"]["card"] == 1 and env["calls"]["board"] == 1
@@ -95,17 +95,17 @@ def test_update_preset_tp_flow(bot_mod, env):
 def test_update_status_only_on_spot(bot_mod, env):
     cmd = _sub(bot_mod, "update")
     it = FakeInteraction(FakeUser(uid=2), command=cmd)
-    asyncio.run(cmd.callback(it, trade="s:22", event=None, price=None, tp_pct=None, status=_choice("HOLDING"), note=None))
+    asyncio.run(cmd.callback(it, trade="s:22", event=None, price=None, pct=None, status=_choice("HOLDING"), note=None))
     assert env["spots"]["22"]["status"] == "HOLDING" and env["calls"]["feed"][0][0] == "Status updated"
     it = FakeInteraction(FakeUser(uid=2), command=cmd)
-    asyncio.run(cmd.callback(it, trade="s:22", event=None, price=None, tp_pct=None, status=None, note=None))
+    asyncio.run(cmd.callback(it, trade="s:22", event=None, price=None, pct=None, status=None, note=None))
     assert it.followup.sent[-1].startswith("Pick an **event**")
 
 
 def test_update_refuses_other_analysts_trade(bot_mod, env):
     cmd = _sub(bot_mod, "update")
     it = FakeInteraction(FakeUser(uid=1), command=cmd)
-    asyncio.run(cmd.callback(it, trade="s:22", event=_choice("TPN"), price=None, tp_pct=None, note=None))
+    asyncio.run(cmd.callback(it, trade="s:22", event=_choice("TPN"), price=None, pct=None, note=None))
     assert "Only the analyst who posted" in it.followup.sent[-1]
     assert env["spots"]["22"]["sells"] == [] and env["calls"]["card"] == 0
 
@@ -142,7 +142,7 @@ def test_admin_can_close_spot_and_alias_adds_moved_note(bot_mod, env):
 def test_user_error_is_one_plain_line(bot_mod, env):
     cmd = _sub(bot_mod, "update")
     it = FakeInteraction(FakeUser(uid=1), command=cmd)
-    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("PTP"), price="105", tp_pct=None, note=None))
+    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("PTP"), price="105", pct=None, note=None))
     assert it.followup.sent[-1].startswith("**tp_pct is required**")
     assert env["trades"]["11"]["fills"] == []
 
@@ -150,7 +150,7 @@ def test_user_error_is_one_plain_line(bot_mod, env):
 def test_fix_list_and_remove(bot_mod, env):
     upd = _sub(bot_mod, "update"); fix = _sub(bot_mod, "fix")
     it = FakeInteraction(FakeUser(uid=1), command=upd)
-    asyncio.run(upd.callback(it, trade="f:11", event=_choice("TPN"), price=None, tp_pct=None, note=None))
+    asyncio.run(upd.callback(it, trade="f:11", event=_choice("TPN"), price=None, pct=None, note=None))
     it2 = FakeInteraction(FakeUser(uid=1), command=fix)
     asyncio.run(fix.callback(it2, trade="f:11", action=_choice("list"), item=None, price=None, pct=None, note=None))
     assert "`1.` 50% @" in it2.followup.sent[-1]

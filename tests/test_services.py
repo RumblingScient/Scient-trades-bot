@@ -142,7 +142,13 @@ def test_spot_buy_recalculates_average():
     with pytest.raises(UserError, match="price is required"):
         svc.apply_event("spot", p, "BUY")
     out = svc.apply_event("spot", p, "ZONE")
-    assert p["zone_filled"] and p["status"] == "HOLDING"
+    assert p["zone_filled"] and p["status"] == "HOLDING" and p["avg_entry"] == "1.1"   # buys exist -> untouched
+    q = spot(avg_entry=None, buys=[])
+    svc.apply_event("spot", q, "ZONE")                 # no buys -> zone midpoint becomes avg entry
+    assert q["avg_entry"] == "1.1" and q["zone_filled"]
+    q = spot(avg_entry=None, buys=[])
+    svc.apply_event("spot", q, "ZONE", price="1.05")   # price = real average
+    assert q["avg_entry"] == "1.05"
     with pytest.raises(UserError, match="Buy filled"):
         svc.apply_event("spot", p, "EF1")
     with pytest.raises(UserError):
