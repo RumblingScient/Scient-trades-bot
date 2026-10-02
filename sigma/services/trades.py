@@ -25,16 +25,18 @@ SPOT_TP_KEYS = ("t1", "t2", "t3")
 
 # (value, label) - the single event list for /setup update, both markets
 EVENTS = [
-    ("EF1", "Entry filled - futures: entry 1 · spot: buy at price (tp_pct = % of bag), no price = zone filled"),
-    ("EF2", "Entry 2 filled (DCA) - futures only"),
-    ("TPN", "Preset TP reached - next planned one, or all up to price"),
-    ("PTP", "Take profit at a price - any level, auto-numbered (needs price + tp_pct)"),
-    ("BE",  "Stop to entry - risk-free (futures only)"),
-    ("SLU", "Stop updated - new level or condition (spot: invalidation)"),
-    ("SL",  "Stop hit - closes the trade (futures only)"),
-    ("CI",  "Invalidated - never triggered / thesis gone"),
-    ("UL",  "Undo last take profit"),
-    ("RTP", "Rebuild TP list from recorded fills (repair)"),
+    ("EF1",  "Entry filled - futures entry 1"),
+    ("EF2",  "Entry 2 filled - futures DCA"),
+    ("BUY",  "Buy filled - spot: price + tp_pct (% of the bag)"),
+    ("ZONE", "Zone filled - spot: position built, now holding"),
+    ("TPN",  "Preset TP reached - next planned one, or all up to price"),
+    ("PTP",  "Take profit at a price - any level, needs price + tp_pct"),
+    ("BE",   "Stop to entry - risk-free (futures)"),
+    ("SLU",  "Stop updated - new level or condition (spot: invalidation)"),
+    ("SL",   "Stop hit - closes the trade (futures)"),
+    ("CI",   "Invalidated - never triggered / thesis gone"),
+    ("UL",   "Undo last take profit"),
+    ("RTP",  "Rebuild TP list from recorded fills (repair)"),
 ]
 
 
@@ -281,29 +283,41 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
                       title=f"{label} taken", color=GREEN)
         return _after_tp(kind, t, out, note)
 
+    if ev == "ZONE":
+        if not spot:
+            raise UserError("Zone filled is a spot event - for futures use **Entry filled**.")
+        t["zone_filled"] = True
+        if t.get("status") in (None, "WATCHING", "ACCUMULATING"):
+            t["status"] = "HOLDING"
+        return Outcome(desc="zone filled - position built", title="Zone filled", color=BLUE, line="DCA zone fully filled - now holding.")
+
+    if ev == "BUY":
+        if not spot:
+            raise UserError("Buy filled is a spot event - for futures use **Entry filled**.")
+        if px is None:
+            raise UserError("**price is required** - what price did you buy at? (tp_pct = % of the planned bag, optional)")
+        if pct is not None and not (0 < pct <= 100):
+            raise UserError("tp_pct here = % of the planned bag this buy was - between 0 and 100.")
+        t.setdefault("buys", []).append({"price": px, "pct": pct})
+        auto = spot_weighted_entry(t)
+        if auto:
+            t["avg_entry"] = f"{auto:g}"
+        if t.get("status") in (None, "WATCHING"):
+            t["status"] = "ACCUMULATING"
+        ptxt = f" ({pct:g}% of the bag)" if pct else ""
+        return Outcome(desc=f"buy @ {px:g}{ptxt} -> avg {t.get('avg_entry')}", title="Buy filled", color=BLUE,
+                       line=f"Bought @ {px:g}{ptxt}. Average entry now {t.get('avg_entry')}.")
+
     if ev == "EF1":
         if spot:
-            if px is None:
-                t["zone_filled"] = True
-                if t.get("status") == "ACCUMULATING":
-                    t["status"] = "HOLDING"
-                return Outcome(desc="zone filled - position built", title="Zone filled", color=BLUE, line="DCA zone fully filled.")
-            if pct is not None and not (0 < pct <= 100):
-                raise UserError("tp_pct here = % of the planned bag this buy was - between 0 and 100.")
-            t.setdefault("buys", []).append({"price": px, "pct": pct})
-            auto = spot_weighted_entry(t)
-            if auto:
-                t["avg_entry"] = f"{auto:g}"
-            ptxt = f" ({pct:g}% of the bag)" if pct else ""
-            return Outcome(desc=f"buy @ {px:g}{ptxt} -> avg {t.get('avg_entry')}", title="Buy filled", color=BLUE,
-                           line=f"Bought @ {px:g}{ptxt}. Average entry now {t.get('avg_entry')}.")
+            raise UserError("Spot has no entry flags - use **Buy filled** (with price) or **Zone filled**.")
         t["entry1_filled"] = True
         d = "Entry 1 filled" if t.get("entry2") else "Entry filled"
         return Outcome(desc=d, title=d, color=BLUE, line=d + ".")
 
     if ev == "EF2":
         if spot:
-            raise UserError("Spot has no Entry 2 - log each buy with **Entry filled** + price.")
+            raise UserError("Spot has no Entry 2 - log each buy with **Buy filled** + price.")
         if not t.get("entry2"):
             raise UserError("This trade has no DCA entry (entry2) - use Entry filled.")
         t["entry2_filled"] = True
@@ -680,3 +694,14 @@ def reopen(kind: str, t: dict):
         if fills and fills[-1].get("label") in ("SL", "STOP", "close"):
             fills.pop()
             t["fills"] = fills
+
+
+def set_status(kind: str, t: dict, status: str) -> Outcome:
+    """Spot phase change by hand (WATCHING / ACCUMULATING / HOLDING / TRIMMED / DISTRIBUTING)."""
+    if kind != "spot":
+        raise UserError("Status is a spot field - futures cards show their state from fills and stops.")
+    if status not in SPOT_STATUSES:
+        raise UserError("Unknown status.")
+    old = t.get("status")
+    t["status"] = status
+    return Outcome(desc=f"status {old} -> {status}", title="Status updated", color=GREY, line=f"Phase: **{status.capitalize()}**")
