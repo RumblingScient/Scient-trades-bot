@@ -14,7 +14,7 @@ from sigma.errors import UserError
 from sigma.calculations import (
     _is_tp_fill, _sync_tp_flags, entry_num, fills_pct, finalize_close, first_num, fnum,
     parse_num, parse_sl, parse_spot_split, sl_num, spot_num, spot_ref_entry, spot_signed_r,
-    spot_weighted_entry,
+    spot_weighted_entry, spot_zone_projection,
 )
 
 BE_R_BAND = 0.05      # |R| at or under this = breakeven
@@ -27,8 +27,8 @@ SPOT_TP_KEYS = ("t1", "t2", "t3")
 EVENTS = [
     ("EF1",  "Entry filled - futures entry 1"),
     ("EF2",  "Entry 2 filled - futures DCA"),
-    ("BUY",  "Buy filled - spot: price + tp_pct (% of the bag)"),
-    ("ZONE", "Zone filled - spot: position built, now holding"),
+    ("BUY",  "Buy filled - spot: price, pct of the bag (optional)"),
+    ("ZONE", "Zone filled - spot: now holding, price = your real avg entry"),
     ("TPN",  "Preset TP reached - next planned one, or all up to price"),
     ("PTP",  "Take profit at a price - any level, needs price + tp_pct"),
     ("BE",   "Stop to entry - risk-free (futures)"),
@@ -289,15 +289,25 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
         t["zone_filled"] = True
         if t.get("status") in (None, "WATCHING", "ACCUMULATING"):
             t["status"] = "HOLDING"
-        return Outcome(desc="zone filled - position built", title="Zone filled", color=BLUE, line="DCA zone fully filled - now holding.")
+        how = ""
+        if px is not None:
+            t["avg_entry"] = f"{px:g}"
+            how = f" - avg entry {px:g}"
+        elif not spot_num(t.get("avg_entry")):
+            proj = spot_zone_projection(t)
+            if proj:
+                t["avg_entry"] = f"{proj:g}"
+                how = f" - avg entry ≈ {proj:g} (zone midpoint, set the real one with price)"
+        return Outcome(desc=f"zone filled - position built{how}", title="Zone filled", color=BLUE,
+                       line=f"DCA zone fully filled - now holding{how}.")
 
     if ev == "BUY":
         if not spot:
             raise UserError("Buy filled is a spot event - for futures use **Entry filled**.")
         if px is None:
-            raise UserError("**price is required** - what price did you buy at? (tp_pct = % of the planned bag, optional)")
+            raise UserError("**price is required** - what price did you buy at? (pct = % of the planned bag, optional)")
         if pct is not None and not (0 < pct <= 100):
-            raise UserError("tp_pct here = % of the planned bag this buy was - between 0 and 100.")
+            raise UserError("pct here = % of the planned bag this buy was - between 0 and 100.")
         t.setdefault("buys", []).append({"price": px, "pct": pct})
         auto = spot_weighted_entry(t)
         if auto:
