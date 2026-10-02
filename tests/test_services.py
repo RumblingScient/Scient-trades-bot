@@ -137,10 +137,20 @@ def test_spot_only_events_refused_on_futures_and_vice_versa():
 
 def test_spot_buy_recalculates_average():
     p = spot(buys=[{"price": 1.2, "pct": 50}])
-    out = svc.apply_event("spot", p, "EF1", price="1.0", pct="50")
+    out = svc.apply_event("spot", p, "BUY", price="1.0", pct="50")
     assert p["avg_entry"] == "1.1" and "avg 1.1" in out.desc
-    out = svc.apply_event("spot", p, "EF1")      # no price = zone filled
+    with pytest.raises(UserError, match="price is required"):
+        svc.apply_event("spot", p, "BUY")
+    out = svc.apply_event("spot", p, "ZONE")
     assert p["zone_filled"] and p["status"] == "HOLDING"
+    with pytest.raises(UserError, match="Buy filled"):
+        svc.apply_event("spot", p, "EF1")
+    with pytest.raises(UserError):
+        svc.apply_event("fut", fut(), "BUY")
+    out = svc.set_status("spot", p, "TRIMMED")
+    assert p["status"] == "TRIMMED" and "HOLDING -> TRIMMED" in out.desc
+    with pytest.raises(UserError):
+        svc.set_status("fut", fut(), "HOLDING")
 
 
 def test_spot_preset_tp_and_auto_close_at_100():
@@ -235,3 +245,13 @@ def test_reopen_reverses_close():
 def test_store_ids():
     assert store.split_id("f:12") == ("fut", "12") and store.split_id("s:12") == ("spot", "12") and store.split_id("12") == (None, "12")
     assert store.make_id("spot", "5") == "s:5" and store.make_id("fut", 5) == "f:5"
+
+
+def test_spot_close_chunk_is_not_a_tp_on_the_card():
+    from sigma.calculations import _tp_taken, spot_weighted_exit
+    p = spot()
+    svc.apply_event("spot", p, "TPN")            # 50% @ 1.5
+    svc.close("spot", p, "1.3")                  # rest @ 1.3 -> sells has a 'close' row
+    assert [s["label"] for s in p["sells"]] == ["TP1", "close"]
+    assert len(_tp_taken(p, spot=True)) == 1     # card lists one TP, not two
+    assert abs(spot_weighted_exit(p) - 1.4) < 1e-9   # exit math still uses both

@@ -16,9 +16,10 @@ def test_setup_group(tree):
     g, subs = _group(tree, "setup")
     assert set(subs) == {"futures", "spot", "update", "close", "edit", "fix", "track", "reopen", "xpost"}
     assert [p.name for p in subs["close"].parameters] == ["trade", "price", "note"]
-    assert [p.name for p in subs["update"].parameters] == ["trade", "event", "price", "tp_pct", "note"]
+    assert [p.name for p in subs["update"].parameters] == ["trade", "event", "price", "tp_pct", "status", "note"]
     names = [c.name for c in subs["update"].parameters[1].choices]
-    assert names[0].startswith("Entry filled") and any(n.startswith("Preset TP reached") for n in names)
+    assert names[0].startswith("Entry filled") and any(n.startswith("Buy filled") for n in names) and any(n.startswith("Zone filled") for n in names)
+    assert all(len(n) <= 62 for n in names), "event names must not truncate in the picker"
     assert all(len(p.parameters) <= 25 for p in subs.values())
     assert subs["update"].parameters[0].autocomplete is not None
     assert subs["reopen"].parameters[0].autocomplete is not None

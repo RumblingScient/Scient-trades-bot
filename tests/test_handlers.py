@@ -63,12 +63,12 @@ def env(bot_mod, monkeypatch):
     async def _board(): calls["board"] += 1
     async def _feed(rec, title, color, line, footer=None): calls["feed"].append((title, line, footer))
     async def _thread(rec, text): calls["thread"].append(text)
-    async def _results(repost=False): calls["results"] += 1
+    async def _results(): calls["results"] += 1
     monkeypatch.setattr(cs, "refresh_and_edit", _card)
     monkeypatch.setattr(cs, "refresh_board", _board)
     monkeypatch.setattr(cs, "post_update_feed", _feed)
     monkeypatch.setattr(cs, "thread_note", _thread)
-    monkeypatch.setattr(cs, "refresh_results_summary", _results)
+    monkeypatch.setattr(cs, "_results_watch_tick", _results)
     return {"trades": trades, "spots": spots, "calls": calls, "cs": cs}
 
 
@@ -90,6 +90,16 @@ def test_update_preset_tp_flow(bot_mod, env):
     assert env["calls"]["card"] == 1 and env["calls"]["board"] == 1
     assert env["calls"]["feed"][0][0] == "TP1 reached" and "> clean" in env["calls"]["feed"][0][1]
     assert it.followup.sent[-1].startswith("Updated: TP1 reached")
+
+
+def test_update_status_only_on_spot(bot_mod, env):
+    cmd = _sub(bot_mod, "update")
+    it = FakeInteraction(FakeUser(uid=2), command=cmd)
+    asyncio.run(cmd.callback(it, trade="s:22", event=None, price=None, tp_pct=None, status=_choice("HOLDING"), note=None))
+    assert env["spots"]["22"]["status"] == "HOLDING" and env["calls"]["feed"][0][0] == "Status updated"
+    it = FakeInteraction(FakeUser(uid=2), command=cmd)
+    asyncio.run(cmd.callback(it, trade="s:22", event=None, price=None, tp_pct=None, status=None, note=None))
+    assert it.followup.sent[-1].startswith("Pick an **event**")
 
 
 def test_update_refuses_other_analysts_trade(bot_mod, env):

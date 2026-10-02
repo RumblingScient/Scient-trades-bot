@@ -52,3 +52,31 @@ def test_symbol_normalisation(bot_mod):
     f = bot_mod._pw_symbol
     assert f("BTCUSDT.P") == "BTCUSDT" and f("BINANCE:ETHUSDT.P") == "ETHUSDT"
     assert f("1000PEPE/USDT") == "1000PEPEUSDT" and f("btcusd") == "BTCUSDT" and f("sui") == "SUIUSDT"
+
+
+def test_tracker_tp_and_stop_go_through_services(bot_mod):
+    """Tracker fills and closes must produce exactly what /setup update would."""
+    import asyncio
+    from sigma.services import trades as svc
+    base = 1_700_000_000_000
+    mk = lambda i, hi, lo: (base + i * 60_000, hi, lo, (hi + lo) / 2)
+    # TP1 (plan 50%) then hard stop -> services label + grading
+    t = {"direction": "LONG", "entry": "100", "sl": "95", "tp1": "110", "tp2": "120", "tp_split": [50, 50],
+         "fills": [], "closed": False, "entry_type": "MARKET", "entry1_filled": True, "entry2_filled": False,
+         "tp1_hit": False, "tp2_hit": False, "be": False, "pair": "BTC"}
+    ev = asyncio.run(bot_mod._pw_process_trade("1", t, [mk(0, 111, 105), mk(1, 100, 94)]))
+    assert t["fills"][0] == {"price": 110.0, "pct": 50.0, "label": "TP1"} and t["tp1_hit"]
+    assert t["closed"] and t["result_r"] == pytest.approx(0.5) and t["result"] == "WIN"   # avg exit 102.5 -> +0.5R
+    assert t["close_note"] == "Auto-tracked stop" and t["sl_hit"]
+    assert ev[0][0].startswith("TP1 reached") and ev[-1][0].startswith("Closed - Win")
+    # same inputs through the command path give the same record
+    u = {k: v for k, v in t.items() if k not in ("closed", "result", "result_r", "avg_exit", "closed_at", "close_note", "sl_hit")}
+    u.update({"fills": [], "tp1_hit": False, "closed": False})
+    svc.apply_event("fut", u, "TPN"); svc.apply_event("fut", u, "SL", note="Auto-tracked stop")
+    for k in ("fills", "result", "result_r", "avg_exit", "tp1_hit", "sl_hit"):
+        assert u[k] == t[k], k
+    # no plan % -> level is tagged, nothing recorded, trade stays open
+    t2 = {"direction": "SHORT", "entry": "100", "sl": "105", "tp1": "90", "fills": [], "closed": False,
+          "entry_type": "MARKET", "entry1_filled": True, "tp1_hit": False, "be": False, "pair": "ETH"}
+    ev = asyncio.run(bot_mod._pw_process_trade("2", t2, [mk(0, 95, 89)]))
+    assert t2["tp1_hit"] and t2["fills"] == [] and not t2["closed"] and "tagged" in ev[0][0]
