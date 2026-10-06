@@ -23,7 +23,8 @@ from sigma.liquidations import liq_binance_loop, liq_bybit_loop, liq_okx_loop
 from sigma.xfeed import x_poll_loop
 from sigma.jobs import backup_loop, funding_guard_loop
 from sigma.health import _loops, _self_heal, _validate_startup, on_app_command_error
-from sigma.payments import PaymentPanel, QuoteView, payment_watch_loop
+from sigma.payments import PaymentPanel, QuoteView, TokenPick, payment_watch_loop
+from sigma.services import plans as _plansvc
 from sigma.storage import load_payments
 from sigma.config import SOL_WALLET
 
@@ -43,6 +44,8 @@ async def on_ready():
     log.info(f"[boot] ready - ops_channel={'set' if OPS_CHANNEL_ID else 'unset'}, corrupt={sorted(_CORRUPT) or 'none'}")
     bot.add_view(FollowPanel())
     bot.add_view(PaymentPanel())
+    for _pk in _plansvc.all():
+        bot.add_view(TokenPick(_pk))
     for _sid, _s in (load_payments().get("sessions") or {}).items():
         if not _s.get("paid"):
             bot.add_view(QuoteView(_sid))

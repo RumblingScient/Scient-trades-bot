@@ -17,7 +17,7 @@ from discord.ext import tasks
 
 from sigma.logging_setup import log, print
 from sigma.config import (GOLD, GREEN, GREY, GUILD_ID, MOD_LOG_CHANNEL_ID, NAVY, OPS_CHANNEL_ID, PAYMENT_CHANNEL_ID,
-                          PAY_FEE_SLACK, PAY_LATE_GRACE_H, PAY_MATCH_TOL, PAY_MIN_SOL, PAY_POLL_SEC, PAY_SESSION_MIN, PAY_VALUE_FLOOR, SOL_RPC, SOL_WALLET,
+                          PAY_FEE_SLACK, PAY_LATE_GRACE_H, PAY_MATCH_TOL, PAY_MIN_SOL, PAY_POLL_SEC, PAY_SESSION_MIN, PAY_TOKENS, PAY_VALUE_FLOOR, SOL_RPC, SOL_WALLET,
                           SUB_REMINDER_DAYS)
 from sigma.core import bot
 from sigma.ops import HEARTBEAT, ops_alert
@@ -38,16 +38,36 @@ def _now():
     return datetime.now(timezone.utc)
 
 
-def quote_amount(usd: float, sol_price: float, taken: set) -> float:
-    """SOL amount for `usd`, with a unique 5th-decimal tail so two open quotes never collide."""
+def quote_amount(usd: float, sol_price: float, taken: set, token: str = "SOL") -> float:
+    """Amount for `usd` in `token`, with a unique tail so two open quotes never collide.
+    SOL: 5th-decimal tail. Stables: USD + unique cents (100.37), falling back to 3 decimals when cents run out."""
+    tk = PAY_TOKENS[token]
+    tol = tk["tol"]
+    if tk["stable"]:
+        base = round(usd, 2)
+        if all(abs(base - t) > tol * 2 for t in taken):
+            return base                                   # the round number, whenever it's free
+        for k in range(1, 100):                           # someone else holds it right now: smallest free cents tail
+            amt = round(base + k * 0.01, 2)
+            if all(abs(amt - t) > tol * 2 for t in taken):
+                return amt
+        for k in range(1, 1000):
+            amt = round(base + k * 0.001, 3)
+            if all(abs(amt - t) > tol * 2 for t in taken):
+                return amt
+        raise UserError("Too many open quotes right now - try again in a minute.")
     if not sol_price or sol_price <= 0:
         raise UserError("Couldn't fetch the SOL price - try again in a minute.")
     base = round(usd / sol_price, 3)
     for _ in range(200):
         amt = round(base + random.randint(1, 999) * 0.00001, 5)
-        if all(abs(amt - t) > PAY_MATCH_TOL * 2 for t in taken):
+        if all(abs(amt - t) > tol * 2 for t in taken):
             return amt
     raise UserError("Too many open quotes right now - try again in a minute.")
+
+
+def fmt_amt(amount: float, token: str = "SOL") -> str:
+    return f"{amount:.5f} SOL" if token == "SOL" else f"{amount:.2f} {token}" if abs(amount * 100 - round(amount * 100)) < 1e-6 else f"{amount:.3f} {token}"
 
 
 def received_sol(tx: dict, wallet: str) -> float | None:
@@ -63,6 +83,37 @@ def received_sol(tx: dict, wallet: str) -> float | None:
         return None
 
 
+def received_token(tx: dict, wallet: str, mint: str) -> float | None:
+    """Net amount of SPL `mint` that `wallet` (as token-account owner) gained in a jsonParsed transaction."""
+    try:
+        meta = tx["meta"]
+        if meta.get("err"):
+            return None
+        def tot(key):
+            return sum(float(b["uiTokenAmount"]["uiAmountString"] or 0) for b in (meta.get(key) or [])
+                       if b.get("mint") == mint and b.get("owner") == wallet)
+        post, pre = tot("postTokenBalances"), tot("preTokenBalances")
+        if post == 0 and pre == 0 and not any(b.get("mint") == mint and b.get("owner") == wallet for b in (meta.get("postTokenBalances") or [])):
+            return None
+        return round(post - pre, 6)
+    except Exception:
+        return None
+
+
+def received_all(tx: dict, wallet: str) -> list:
+    """[(token, amount)] for every accepted token this tx moved into the wallet."""
+    out = []
+    a = received_sol(tx, wallet)
+    if a is not None and a > 0:
+        out.append(("SOL", a))
+    for tk, cfg in PAY_TOKENS.items():
+        if cfg["mint"]:
+            b = received_token(tx, wallet, cfg["mint"])
+            if b is not None and b > 0:
+                out.append((tk, b))
+    return out
+
+
 def _live(sessions: dict, now):
     for sid, s in sessions.items():
         if s.get("paid") or s.get("underpaid"):
@@ -75,21 +126,26 @@ def _live(sessions: dict, now):
             yield sid, s, created
 
 
-def match_session(sessions: dict, amount: float, now=None) -> tuple[str | None, str]:
-    """(session id, how). how = 'exact' | 'fee' | ''.
-    exact: quoted amount within PAY_MATCH_TOL. fee: no exact hit, but exactly ONE live quote is short by
-    0 < quoted - received <= PAY_FEE_SLACK (exchange withdrawal fee). Two candidates = ambiguous = no match."""
+def match_session(sessions: dict, amount: float, now=None, token: str = "SOL") -> tuple[str | None, str]:
+    """(session id, how). how = 'exact' | 'fee' | ''. Only quotes in the same token are considered.
+    exact: quoted amount within the token's tolerance. fee: no exact hit, but exactly ONE live quote is short by
+    0 < quoted - received <= the token's slack (exchange withdrawal fee, SOL only). Two candidates = ambiguous = no match."""
     now = now or _now()
+    tk = PAY_TOKENS.get(token, PAY_TOKENS["SOL"])
     best = None
     for sid, s, created in _live(sessions, now):
-        if abs(float(s["amount"]) - amount) <= PAY_MATCH_TOL:
+        if s.get("token", "SOL") != token:
+            continue
+        if abs(float(s["amount"]) - amount) <= tk["tol"]:
             if best is None or created > datetime.fromisoformat(sessions[best]["created"]):
                 best = sid
     if best:
         return best, "exact"
-    cands = [sid for sid, s, _ in _live(sessions, now) if 0 < float(s["amount"]) - amount <= PAY_FEE_SLACK]
-    if len(cands) == 1:
-        return cands[0], "fee"
+    if tk["slack"] > 0:
+        cands = [sid for sid, s, _ in _live(sessions, now)
+                 if s.get("token", "SOL") == token and 0 < float(s["amount"]) - amount <= tk["slack"]]
+        if len(cands) == 1:
+            return cands[0], "fee"
     return None, ""
 
 
@@ -162,7 +218,7 @@ async def mod_log(text: str, color=GREY):
         log.warning(f"[modlog] send failed: {e}")
 
 
-async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = None, note: str = "") -> dict:
+async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = None, note: str = "", expires_at=None) -> dict:
     """Grant (or extend) + role + DM + mod-log. Used by the chain watcher and by /admin grant."""
     guild = bot.get_guild(GUILD_ID)
     member = None
@@ -173,7 +229,7 @@ async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = No
             member = None
     name = member.display_name if member else str(uid)
     subs = load_subs()
-    rec = subsvc.grant(subs, uid, name, plan, by, note=note, tx=tx, usd=usd)
+    rec = subsvc.grant(subs, uid, name, plan, by, note=note, tx=tx, usd=(0.0 if expires_at else usd), expires_at=expires_at)
     save_subs(subs)
     ok = await _sub_grant_role(guild, uid) if guild else False
     p = plansvc.get(plan)
@@ -190,7 +246,8 @@ async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = No
             await member.send(embed=e)
         except Exception:
             pass
-    await mod_log(f"**Granted** {p['label']} -> {name} (`{uid}`) by {by}"
+    await mod_log(f"**{'Imported' if expires_at else 'Granted'}** {p['label']} -> {name} (`{uid}`) by {by}"
+                  + (f" · expires {exp.strftime('%d %b %Y')}" if expires_at else "")
                   + (f" · tx `{tx[:12]}...`" if tx else "") + (f" · {note}" if note else "")
                   + (" · role FAILED" if not ok else ""), color=GREEN)
     return rec
@@ -198,14 +255,54 @@ async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = No
 
 # ----------------------------------------------------------------------------- member UI
 
+# server emotes (upload sigma/assets/emotes/plan_*.png with these exact names); unicode fallback if missing
+PLAN_EMOTES = {"1month": ("plan_1m", "\U0001F539"), "3months": ("plan_3m", "\U0001F538"), "6months": ("plan_6m", "\U0001F536"),
+               "1year": ("plan_1y", "\U0001F7E2"), "lifetime": ("plan_life", "\U0001F48E")}
+
+
+
+def _banner_path():
+    from sigma.config import _ROOT
+    return _ROOT / "sigma" / "assets" / "pay_banner.png"
+
+
+def plan_emote(key: str) -> str:
+    from sigma.cards import emo
+    name, fb = PLAN_EMOTES.get(key, ("plan_1m", "\u2b50"))
+    return emo(name, fb)
+
+
+def _guild_emoji(name: str):
+    try:
+        g = bot.get_guild(GUILD_ID)
+        return discord.utils.get(g.emojis, name=name) if g else None
+    except Exception:
+        return None
+
+
 def panel_embed() -> discord.Embed:
+    from sigma.config import SUB_ROLE_ID
     subs = load_subs()
     e = discord.Embed(title="Sigma Pro - choose your plan", color=NAVY)
-    lines = [plansvc.describe(p, subsvc.seats_left(subs, k)) for k, p in plansvc.all(enabled_only=True).items()]
-    e.description = ("Pick a plan below. You'll get a private message with the wallet and the exact SOL amount - "
-                     "send it, and your access switches on automatically once it lands on chain.\n\n" + "\n".join(lines)
-                     + ("\n\nHave a promo code? Pick a plan first, then tap **Promo code** on your quote." if plansvc.promos() else ""))
-    e.set_footer(text="Payments in SOL (Solana). One payment, no card, no DMs from us asking for anything.")
+    role = f"<@&{SUB_ROLE_ID}>" if SUB_ROLE_ID else "**Sigma Pro**"
+    lines = [f"{plan_emote(k)} {plansvc.describe(p, subsvc.seats_left(subs, k))}" for k, p in plansvc.all(enabled_only=True).items()]
+    e.description = (f"Every plan unlocks {role}: live futures and spot setups, the full terminal, results board and monthly journals.\n\n"
+                     + "\n".join(lines)
+                     + "\n\nPick a plan below - you get a private message with the wallet and the exact SOL amount. "
+                       "Send it and access switches on by itself once it lands on chain."
+                     + ("\nHave a promo code? Pick a plan first, then tap **Promo code** on your quote." if plansvc.promos() else ""))
+    try:
+        if bot.user and bot.user.display_avatar:
+            e.set_thumbnail(url=bot.user.display_avatar.url)
+    except Exception:
+        pass
+    if _banner_path().exists():
+        e.set_image(url="attachment://pay_banner.png")
+    try:
+        e.set_footer(text="Sigma Trading · SOL / USDC / USDT on Solana · we never DM you first, never ask for keys",
+                     icon_url=(bot.user.display_avatar.url if bot.user else None))
+    except Exception:
+        e.set_footer(text="Sigma Trading · payments in SOL")
     return e
 
 
@@ -219,7 +316,8 @@ class PlanSelect(discord.ui.Select):
             desc = (f"${eff:,.0f}" + (f" (was ${p['price']:,.0f})" if why else "")) + ("" if p["days"] >= LIFETIME_DAYS else f" · {p['days']} days")
             if left is not None:
                 desc += f" · {left} seats left" if left else " · sold out"
-            opts.append(discord.SelectOption(label=p["short"][:100], value=k, description=desc[:100]))
+            em = _guild_emoji(PLAN_EMOTES.get(k, ("plan_1m", ""))[0]) or PLAN_EMOTES.get(k, ("", "\u2b50"))[1]
+            opts.append(discord.SelectOption(label=p["short"][:100], value=k, description=desc[:100], emoji=em))
         if not opts:
             opts.append(discord.SelectOption(label="No plans available", value="none"))
         super().__init__(placeholder="Select a plan...", options=opts, custom_id="sigma:pay:plan", min_values=1, max_values=1)
@@ -229,11 +327,37 @@ class PlanSelect(discord.ui.Select):
         if self.values[0] == "none":
             await interaction.followup.send("No plans are open right now.", ephemeral=True)
             return
+        plan = self.values[0]
+        p = plansvc.all(enabled_only=True).get(plan)
+        if not p:
+            await interaction.followup.send("That plan isn't open right now.", ephemeral=True)
+            return
+        eff, _ = plansvc.effective_price(p)
+        await interaction.followup.send(f"**{p['label']}** - ${eff:,.0f}. How do you want to pay? All three are on the **Solana** network.",
+                                        view=TokenPick(plan), ephemeral=True)
+
+
+class TokenSelect(discord.ui.Select):
+    def __init__(self, plan: str):
+        self.plan = plan
+        opts = [discord.SelectOption(label=tk, value=tk, emoji=cfg["emoji"],
+                                     description=("Native SOL - price locked for 30 min" if tk == "SOL" else f"{tk} on Solana (SPL) - exact dollar amount"))
+                for tk, cfg in PAY_TOKENS.items()]
+        super().__init__(placeholder="Pay with...", options=opts, custom_id=f"sigma:pay:token:{plan}", min_values=1, max_values=1)
+
+    async def callback(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
         try:
-            emb, view = await new_quote(interaction.user, self.values[0])
+            emb, view = await new_quote(interaction.user, self.plan, self.values[0])
             await interaction.followup.send(embed=emb, view=view, ephemeral=True)
         except UserError as e:
             await interaction.followup.send(e.message, ephemeral=True)
+
+
+class TokenPick(discord.ui.View):
+    def __init__(self, plan: str):
+        super().__init__(timeout=None)
+        self.add_item(TokenSelect(plan))
 
 
 class PaymentPanel(discord.ui.View):
@@ -305,36 +429,39 @@ async def apply_promo(user, sid: str, code: str):
     usd, why = plansvc.effective_price(p, promo)
     if usd <= 0:
         raise UserError("That code would make the plan free - ping an admin to grant it directly.")
-    price = s.get("sol_price") or await sol_price()
-    taken = {float(x["amount"]) for k, x in st["sessions"].items() if not x.get("paid") and k != sid}
-    s.update({"usd": usd, "amount": quote_amount(usd, price, taken), "promo": promo["code"], "why": why,
+    token = s.get("token", "SOL")
+    price = s.get("sol_price") or (await sol_price() if token == "SOL" else 1.0)
+    taken = {float(x["amount"]) for k, x in st["sessions"].items() if not x.get("paid") and k != sid and x.get("token", "SOL") == token}
+    s.update({"usd": usd, "amount": quote_amount(usd, price, taken, token), "promo": promo["code"], "why": why,
               "created": _now().isoformat()})     # fresh 30 min on the new amount
     save_payments(st)
     await log_quote(s, sid, f"Promo applied - {promo['code']}")
     return quote_embed(s, sid), QuoteView(sid)
 
 
-async def new_quote(user: discord.abc.User, plan: str):
+async def new_quote(user: discord.abc.User, plan: str, token: str = "SOL"):
     if not SOL_WALLET:
         raise UserError("Payments aren't configured yet - ping an admin.")
+    if token not in PAY_TOKENS:
+        raise UserError("Unknown token.")
     p = plansvc.all(enabled_only=True).get(plan)
     if not p:
         raise UserError("That plan isn't open right now.")
     subs = load_subs()
     if p.get("seats") is not None and subsvc.seats_left(subs, plan) <= 0:
         raise UserError(f"{p['label']} is sold out.")
-    price = await sol_price()
+    price = await sol_price() if token == "SOL" else 1.0
     st = prune(load_payments())
     sessions = st.setdefault("sessions", {})
-    # one open quote per user per plan - reuse it instead of minting another amount
+    # one open quote per user per plan per token - reuse it instead of minting another amount
     for sid, s in sessions.items():
-        if s.get("user_id") == user.id and s.get("plan") == plan and not s.get("paid") and session_open(s):
+        if s.get("user_id") == user.id and s.get("plan") == plan and s.get("token", "SOL") == token and not s.get("paid") and session_open(s):
             return quote_embed(s, sid), QuoteView(sid)
-    taken = {float(s["amount"]) for s in sessions.values() if not s.get("paid")}
+    taken = {float(s["amount"]) for s in sessions.values() if not s.get("paid") and s.get("token", "SOL") == token}
     usd, why = plansvc.effective_price(p)
-    amt = quote_amount(usd, price, taken)
+    amt = quote_amount(usd, price, taken, token)
     sid = uuid.uuid4().hex[:12]
-    sessions[sid] = {"user_id": user.id, "user": str(user), "plan": plan, "usd": usd, "list_usd": p["price"], "why": why,
+    sessions[sid] = {"user_id": user.id, "user": str(user), "plan": plan, "token": token, "usd": usd, "list_usd": p["price"], "why": why,
                      "sol_price": price, "amount": amt, "created": _now().isoformat(), "paid": False}
     save_payments(st)
     await log_quote(sessions[sid], sid, "Plan selected")
@@ -347,12 +474,12 @@ async def log_quote(s: dict, sid: str, title: str):
     e = discord.Embed(title=title, color=GOLD, timestamp=_now())
     e.add_field(name="User", value=f"<@{s['user_id']}>", inline=True)
     e.add_field(name="Plan", value=p.get("label", s["plan"]), inline=True)
-    e.add_field(name="Price", value=f"${s['usd']:,.2f} ({s['amount']:.5f} SOL)" + (f"\n{', '.join(s['why'])}" if s.get("why") else ""), inline=True)
+    e.add_field(name="Price", value=f"${s['usd']:,.2f} ({fmt_amt(s['amount'], s.get('token', 'SOL'))})" + (f"\n{', '.join(s['why'])}" if s.get("why") else ""), inline=True)
     e.add_field(name="Session", value=f"`{sid}`", inline=False)
     cid = MOD_LOG_CHANNEL_ID or OPS_CHANNEL_ID
     ch = bot.get_channel(cid) if cid else None
     if ch is None:
-        log.info(f"[modlog] {title} {s.get('user')} {s['plan']} {s['amount']:.5f} SOL {sid}")
+        log.info(f"[modlog] {title} {s.get('user')} {s['plan']} {fmt_amt(s['amount'], s.get('token', 'SOL'))} {sid}")
         return
     try:
         await ch.send(embed=e)
@@ -365,12 +492,24 @@ def quote_embed(s: dict, sid: str) -> discord.Embed:
     exp = datetime.fromisoformat(s["created"]) + timedelta(minutes=PAY_SESSION_MIN)
     e = discord.Embed(title=f"{p['label']} - payment", color=GOLD)
     price_line = f"plan `${s['usd']:,.0f}`" + (f" (list ${s.get('list_usd', p['price']):,.0f} - {', '.join(s['why'])})" if s.get("why") else "")
-    e.description = (f"Send the **exact amount** of SOL to the wallet below.\n\n"
+    token = s.get("token", "SOL")
+    if token == "SOL":
+        head = f"Send the **exact amount** of SOL to the wallet below."
+        rate = f"SOL price `${s['sol_price']:,.2f}` · "
+        tail = (f"The amount's last digits identify your payment - don't round it. "
+                f"Sending from an exchange? Its withdrawal fee comes out of the amount - add it on top so the full amount lands. ")
+    else:
+        head = (f"Send the **exact amount** of **{token} on the Solana network (SPL)** to the wallet below. "
+                f"\u26a0 Not Ethereum, not BSC, not Tron - {token} sent on another network is lost.")
+        rate = ""
+        cents = " - the cents identify your payment, don't round them. " if abs(s["amount"] - round(s["amount"])) > 1e-9 else ". "
+        tail = (f"Send exactly `{fmt_amt(s['amount'], token)}`{cents}"
+                f"From an exchange: pick network **Solana (SOL)** for the withdrawal; the fee is charged separately, so the full amount lands. ")
+    e.description = (f"{head}\n\n"
                      f"**Wallet (Solana):**\n```{SOL_WALLET}```\n"
-                     f"**Amount to send:**\n```{s['amount']:.5f} SOL```\n"
-                     f"SOL price `${s['sol_price']:,.2f}` · {price_line} · quote expires <t:{int(exp.timestamp())}:R>\n\n"
-                     f"The amount's last digits identify your payment - don't round it. "
-                     f"Sending from an exchange? Its withdrawal fee comes out of the amount - add it on top so the full amount lands. "
+                     f"**Amount to send:**\n```{fmt_amt(s['amount'], token)}```\n"
+                     f"{rate}{price_line} · quote expires <t:{int(exp.timestamp())}:R>\n\n"
+                     f"{tail}"
                      f"Access switches on automatically within a minute of the transfer landing; you'll get a DM.")
     e.set_footer(text=f"Quote {sid}")
     return e
@@ -412,50 +551,61 @@ async def _watch_once_inner() -> int:
         st["seen"] = list(seen)
         if not tx:
             continue
-        amt = received_sol(tx, SOL_WALLET)
-        if amt is None or amt <= 0:
-            continue
-        if amt < PAY_MIN_SOL:
-            print(f"[pay] dust ignored {amt:.6f} SOL {sig[:12]}", flush=True)
-            save_payments(st)
-            continue
-        found += 1
-        sid, how = match_session(st.get("sessions", {}), amt)
-        if sid is None:
-            st.setdefault("unmatched", []).append({"sig": sig, "amount": amt, "at": _now().isoformat()})
-            st["unmatched"] = st["unmatched"][-50:]
-            save_payments(st)
-            await ops_alert(f"unmatched SOL payment: {amt:.5f} SOL - https://solscan.io/tx/{sig} - resolve with /admin grant (tx in note)",
-                            key=f"pay:unmatched:{sig[:12]}")
-            continue
-        s = st["sessions"][sid]
-        # value gate: a late or fee-short payment must still be worth >= PAY_VALUE_FLOOR of the quoted USD *now*
-        px_now = await sol_price()
-        worth = amt * px_now if px_now else amt * float(s.get("sol_price") or 0)
-        if worth < float(s["usd"]) * PAY_VALUE_FLOOR:
-            s.update({"underpaid": True, "tx": sig, "received": amt, "worth_usd": round(worth, 2)})
-            st.setdefault("unmatched", []).append({"sig": sig, "amount": amt, "at": _now().isoformat(), "session": sid, "worth_usd": round(worth, 2)})
-            save_payments(st)
-            await ops_alert(f"UNDERPAID: <@{s['user_id']}> sent {amt:.5f} SOL (~${worth:,.0f}) for {s['plan']} quoted ${s['usd']:,.0f} - "
-                            f"https://solscan.io/tx/{sig} - not activated; /admin grant if you accept it", key=f"pay:under:{sig[:12]}")
-            continue
-        s.update({"paid": True, "tx": sig, "paid_at": _now().isoformat(), "received": amt, "match": how})
+        for token, amt in received_all(tx, SOL_WALLET):
+            if amt < PAY_TOKENS[token]["min"]:
+                print(f"[pay] dust ignored {amt:.6f} {token} {sig[:12]}", flush=True)
+                continue
+            found += 1
+            await _settle_transfer(st, sig, token, amt)
         save_payments(st)
-        if s.get("promo"):
-            plansvc.promo_consume(s["promo"])
-            pr = plansvc.promos().get(s["promo"])
-            row = plansvc.record_referral(st, pr, s, sig)
-            if row:
-                save_payments(st)
-                await mod_log(f"**Referral** `{row['code']}` -> {row.get('owner_name') or row['owner_id']} earns ${row['share_usd']:,.2f} "
-                              f"({row['share_pct']:g}% of ${row['usd']:,.0f}) from {s.get('user')}", color=GOLD)
-        try:
-            await activate(int(s["user_id"]), s["plan"], by="chain", tx=sig, usd=s["usd"])
-        except Exception as e:
-            print(f"[pay] activate failed {sid}: {e}", flush=True)
-            await ops_alert(f"payment matched but activation failed for <@{s['user_id']}> ({s['plan']}): {e} - tx {sig}", key=f"pay:act:{sid}")
     save_payments(st)
     return found
+
+
+async def _settle_transfer(st: dict, sig: str, token: str, amt: float):
+    """One incoming transfer -> match a quote, value-gate it, activate. Mutates st (caller saves)."""
+    shown = fmt_amt(amt, token)
+    sid, how = match_session(st.get("sessions", {}), amt, token=token)
+    if sid is None:
+        st.setdefault("unmatched", []).append({"sig": sig, "amount": amt, "token": token, "at": _now().isoformat()})
+        st["unmatched"] = st["unmatched"][-50:]
+        save_payments(st)
+        await ops_alert(f"unmatched payment: {shown} - https://solscan.io/tx/{sig} - resolve with /admin grant (tx in note)",
+                        key=f"pay:unmatched:{sig[:12]}")
+        return
+    s = st["sessions"][sid]
+    # value gate: a late or fee-short payment must still be worth >= PAY_VALUE_FLOOR of the quoted USD *now*
+    if token == "SOL":
+        px_now = await sol_price()
+        worth = amt * px_now if px_now else amt * float(s.get("sol_price") or 0)
+    else:
+        worth = amt
+    if worth < float(s["usd"]) * PAY_VALUE_FLOOR:
+        s.update({"underpaid": True, "tx": sig, "received": amt, "worth_usd": round(worth, 2)})
+        st.setdefault("unmatched", []).append({"sig": sig, "amount": amt, "token": token, "at": _now().isoformat(), "session": sid, "worth_usd": round(worth, 2)})
+        save_payments(st)
+        await ops_alert(f"UNDERPAID: <@{s['user_id']}> sent {shown} (~${worth:,.0f}) for {s['plan']} quoted ${s['usd']:,.0f} - "
+                        f"https://solscan.io/tx/{sig} - not activated; /admin grant if you accept it", key=f"pay:under:{sig[:12]}")
+        return
+    s.update({"paid": True, "tx": sig, "paid_at": _now().isoformat(), "received": amt, "match": how})
+    save_payments(st)
+    await _after_paid(st, s, sid, sig)
+
+
+async def _after_paid(st: dict, s: dict, sid: str, sig: str):
+    if s.get("promo"):
+        plansvc.promo_consume(s["promo"])
+        pr = plansvc.promos().get(s["promo"])
+        row = plansvc.record_referral(st, pr, s, sig)
+        if row:
+            save_payments(st)
+            await mod_log(f"**Referral** `{row['code']}` -> {row.get('owner_name') or row['owner_id']} earns ${row['share_usd']:,.2f} "
+                          f"({row['share_pct']:g}% of ${row['usd']:,.0f}) from {s.get('user')}", color=GOLD)
+    try:
+        await activate(int(s["user_id"]), s["plan"], by="chain", tx=sig, usd=s["usd"])
+    except Exception as e:
+        print(f"[pay] activate failed {sid}: {e}", flush=True)
+        await ops_alert(f"payment matched but activation failed for <@{s['user_id']}> ({s['plan']}): {e} - tx {sig}", key=f"pay:act:{sid}")
 
 
 @tasks.loop(seconds=PAY_POLL_SEC)
@@ -472,7 +622,8 @@ async def _before_pay():
 # ----------------------------------------------------------------------------- admin bits
 
 async def post_panel(channel: discord.abc.Messageable) -> discord.Message:
-    msg = await channel.send(embed=panel_embed(), view=PaymentPanel())
+    files = [discord.File(_banner_path(), filename="pay_banner.png")] if _banner_path().exists() else []
+    msg = await channel.send(embed=panel_embed(), view=PaymentPanel(), files=files)
     try:
         await msg.pin()
     except Exception:
@@ -557,12 +708,24 @@ def members_embed(guild: discord.Guild, view: str = "overview") -> discord.Embed
         paid = sorted([s for s in sess.values() if s.get("paid")], key=lambda s: s.get("paid_at", ""), reverse=True)[:10]
         unm = (st.get("unmatched") or [])[-10:]
         e.title = "Payments"
-        e.add_field(name=f"Open quotes ({len(opn)})", value=("\n".join(f"{s.get('user')} · {_plan_short(s['plan'])} · {s['amount']:.5f} SOL" for s in opn) or "none"), inline=False)
-        e.add_field(name="Last paid", value=("\n".join(f"{s.get('user')} · {_plan_short(s['plan'])} · {s.get('received', s['amount']):.5f} SOL · <t:{int(datetime.fromisoformat(s['paid_at']).timestamp())}:R>" for s in paid) or "none"), inline=False)
+        e.add_field(name=f"Open quotes ({len(opn)})", value=("\n".join(f"{s.get('user')} · {_plan_short(s['plan'])} · {fmt_amt(s['amount'], s.get('token', 'SOL'))}" for s in opn) or "none"), inline=False)
+        e.add_field(name="Last paid", value=("\n".join(f"{s.get('user')} · {_plan_short(s['plan'])} · {fmt_amt(s.get('received', s['amount']), s.get('token', 'SOL'))} · <t:{int(datetime.fromisoformat(s['paid_at']).timestamp())}:R>" for s in paid) or "none"), inline=False)
         e.add_field(name=f"Unmatched ({len(st.get('unmatched') or [])})",
-                    value=("\n".join(f"{u['amount']:.5f} SOL · [tx](https://solscan.io/tx/{u['sig']}) · <t:{int(datetime.fromisoformat(u['at']).timestamp())}:R>" for u in reversed(unm)) or "none"), inline=False)
+                    value=("\n".join(f"{fmt_amt(u['amount'], u.get('token', 'SOL'))} · [tx](https://solscan.io/tx/{u['sig']}) · <t:{int(datetime.fromisoformat(u['at']).timestamp())}:R>" for u in reversed(unm)) or "none"), inline=False)
         e.add_field(name="Wallet", value=(f"`{SOL_WALLET}`" if SOL_WALLET else "NOT SET"), inline=False)
         e.set_footer(text="Sigma Trading - payments · unmatched = resolve with /admin grant, tx in note")
+        return e
+    if view == "unrecorded":
+        from sigma.config import SUB_ROLE_ID
+        role = guild.get_role(SUB_ROLE_ID) if SUB_ROLE_ID else None
+        holders = [m for m in (role.members if role else []) if not m.bot]
+        missing = [m for m in holders if str(m.id) not in subs]
+        e.title = f"Pro role without a record ({len(missing)} of {len(holders)})"
+        e.description = ("These members have the Pro role but no subscription record - the old bot tracked them. "
+                         "Import each with `/admin grant member plan expires:<date from the old bot>` so expiry and reminders work here.\n\n"
+                         + ("\n".join(f"{m.mention} · {m.display_name}" for m in missing[:40]) if missing else "none - everyone is on record"))
+        if len(missing) > 40:
+            e.set_footer(text=f"+{len(missing) - 40} more")
         return e
     # overview
     e.title = "Members - overview"
@@ -612,3 +775,150 @@ class MembersCSVView(discord.ui.View):
             await interaction.response.send_message("Admins only.", ephemeral=True)
             return
         await interaction.response.send_message(file=discord.File(members_csv(load_subs()), filename="sigma_members.csv"), ephemeral=True)
+
+
+# ----------------------------------------------------------------------------- import from the old Payment Bot
+
+import re as _re
+
+_PLAN_DAYS = (("lifetime", 36500), ("year", 365), ("6month", 180), ("3month", 90), ("month", 30))
+
+
+def parse_old_plan(label: str):
+    """'Sigma Pro $500/6months' -> (days, usd). None if it doesn't look like a plan."""
+    if not label:
+        return None
+    low = label.lower().replace(" ", "")
+    m = _re.search(r"\$([\d,]+)", label)
+    usd = float(m.group(1).replace(",", "")) if m else None
+    for key, days in _PLAN_DAYS:
+        if key in low:
+            return days, usd
+    return None
+
+
+def plan_key_for_days(days: int) -> str | None:
+    best = None
+    for k, p in plansvc.all().items():
+        if p["days"] == days:
+            return k
+        if best is None or abs(p["days"] - days) < abs(plansvc.all()[best]["days"] - days):
+            best = k
+    return best
+
+
+def _parse_old_card(msg: discord.Message):
+    """One Payment Bot 'Plan selected' embed -> (user_id, days, usd, when) or None."""
+    for e in msg.embeds:
+        if (e.title or "").strip().lower() != "plan selected":
+            continue
+        uid = plan = None
+        for f in e.fields:
+            if f.name.lower() == "user":
+                m = _re.search(r"<@!?(\d+)>", f.value or "")
+                uid = int(m.group(1)) if m else None
+            elif f.name.lower() == "plan":
+                plan = f.value
+        pd = parse_old_plan(plan or "")
+        if uid and pd:
+            return uid, pd[0], pd[1], msg.created_at
+    return None
+
+
+async def scan_old_bot(guild: discord.Guild, log_channel: discord.TextChannel, old_bot_name: str = "Payment Bot") -> dict:
+    """Build an import preview: {uid: {name, days, usd, start, expires, source}} for Pro-role holders without a record."""
+    from sigma.config import SUB_ROLE_ID
+    subs = load_subs()
+    role = guild.get_role(SUB_ROLE_ID)
+    holders = {m.id: m for m in (role.members if role else []) if not m.bot and str(m.id) not in subs}
+    if not holders:
+        return {"rows": {}, "skipped": [], "cards": 0, "grants": 0}
+    # 1) every 'Plan selected' card, newest first per user
+    selected = {}
+    cards = 0
+    async for msg in log_channel.history(limit=None, oldest_first=False):
+        if not msg.author.bot or old_bot_name.lower() not in (msg.author.display_name or msg.author.name).lower():
+            continue
+        r = _parse_old_card(msg)
+        if not r:
+            continue
+        cards += 1
+        uid, days, usd, when = r
+        selected.setdefault(uid, []).append((when, days, usd))
+    # 2) audit log: when did the old bot give the Pro role (confirmed payment)
+    grants = {}
+    try:
+        async for entry in guild.audit_logs(action=discord.AuditLogAction.member_role_update, limit=None):
+            if not entry.user or not entry.user.bot or old_bot_name.lower() not in (entry.user.display_name or entry.user.name).lower():
+                continue
+            after_roles = getattr(entry.after, "roles", None) or []
+            if role and any(r.id == role.id for r in after_roles):
+                tid = entry.target.id if entry.target else None
+                if tid and (tid not in grants or entry.created_at > grants[tid]):
+                    grants[tid] = entry.created_at
+    except discord.Forbidden:
+        pass
+    rows, skipped = {}, []
+    for uid, m in holders.items():
+        sel = sorted(selected.get(uid, []), reverse=True)
+        g = grants.get(uid)
+        if g and sel:
+            before = [x for x in sel if x[0] <= g + timedelta(minutes=5)]
+            when, days, usd = (before[0] if before else sel[0])
+            start, source = g, "audit log + plan card"
+        elif sel:
+            when, days, usd = sel[0]
+            start, source = when, "plan card only (assumed paid - holds the role)"
+        elif g:
+            start, days, usd, source = g, 30, None, "audit log only - plan unknown, assumed monthly"
+        else:
+            skipped.append((uid, m.display_name))
+            continue
+        exp = start + timedelta(days=days)
+        rows[uid] = {"name": m.display_name, "days": days, "usd": usd, "start": start.isoformat(), "expires": exp.isoformat(),
+                     "plan": plan_key_for_days(days), "source": source, "already_expired": exp < _now()}
+    st = load_payments()
+    st["import_preview"] = {str(k): v for k, v in rows.items()}
+    save_payments(st)
+    return {"rows": rows, "skipped": skipped, "cards": cards, "grants": len(grants)}
+
+
+def import_preview_embed(res: dict) -> discord.Embed:
+    rows = res["rows"]
+    e = discord.Embed(title=f"Import preview - {len(rows)} member(s)", color=NAVY)
+    e.description = (f"Read {res['cards']} plan cards and {res['grants']} role grants from the old bot. "
+                     f"Run `/admin import action:Apply` to create these records (no revenue is counted).")
+    lines = []
+    for uid, r in sorted(rows.items(), key=lambda x: x[1]["expires"]):
+        exp = datetime.fromisoformat(r["expires"])
+        flag = " \u26a0 already past expiry - will NOT import, decide by hand" if r["already_expired"] else ""
+        est = "" if r["source"].startswith("audit log +") else " (est.)"
+        lines.append(f"<@{uid}> · {plansvc.all().get(r['plan'], {}).get('short', r['days'])} · expires {exp.strftime('%d %b %Y')}{est}{flag}")
+    for i in range(0, len(lines), 15):
+        e.add_field(name="\u200b" if i else "Members", value="\n".join(lines[i:i + 15])[:1024], inline=False)
+    if res["skipped"]:
+        e.add_field(name=f"No trace found ({len(res['skipped'])}) - import by hand with /admin grant expires:",
+                    value="\n".join(f"<@{u}> · {n}" for u, n in res["skipped"][:20])[:1024], inline=False)
+    e.set_footer(text="(est.) = plan card only or plan unknown - check the ones that matter")
+    return e
+
+
+async def apply_import(by: str) -> tuple[int, int]:
+    st = load_payments()
+    rows = st.get("import_preview") or {}
+    done = skipped = 0
+    for uid, r in rows.items():
+        if r.get("already_expired") or not r.get("plan"):
+            skipped += 1
+            continue
+        try:
+            await activate(int(uid), r["plan"], by=by, note=f"imported from old bot ({r['source']})",
+                           expires_at=datetime.fromisoformat(r["expires"]))
+            done += 1
+        except Exception as ex:
+            print(f"[import] {uid} failed: {ex}", flush=True)
+            skipped += 1
+    st = load_payments()
+    st["import_preview"] = {}
+    save_payments(st)
+    return done, skipped

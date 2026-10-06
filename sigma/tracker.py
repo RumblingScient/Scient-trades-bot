@@ -213,7 +213,7 @@ async def _price_watch_tick():
             for tid, t in items:
                 if t.get("watch_disabled"):
                     continue
-                # feed identity gate: Binance ka price is trade ke entry ke scale par hona chahiye
+                # feed identity gate: the Binance price must be on the same scale as this trade's entry
                 if not t.get("watch_verified"):
                     ref = entry_num(t) or first_num(t.get("entry"))
                     last_close = candles[-1][3] if candles else None

@@ -71,6 +71,12 @@ PAY_FEE_SLACK = 0.02          # SOL - exchange withdrawals arrive short by their
 PAY_MIN_SOL = 0.005           # ignore dust below this (no alert, just a log line)
 PAY_VALUE_FLOOR = 0.95        # received SOL must still be worth >= 95% of the quoted USD at the time it lands
 PAY_POLL_SEC = 30
+# tokens accepted on Solana. SOL = native; the stables are SPL mints (mainnet). Amounts for stables are USD + unique cents.
+PAY_TOKENS = {
+    "SOL":  {"mint": None, "decimals": 9, "stable": False, "tol": 0.000005, "slack": 0.02,  "min": 0.005, "emoji": "\u25ce"},
+    "USDC": {"mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "decimals": 6, "stable": True, "tol": 0.0005, "slack": 0.0, "min": 0.5, "emoji": "\U0001F4B5"},
+    "USDT": {"mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "decimals": 6, "stable": True, "tol": 0.0005, "slack": 0.0, "min": 0.5, "emoji": "\U0001F4B5"},
+}
 
 FREE_ALERT_LIMIT = 5      # max active alerts for non-pro members
 
