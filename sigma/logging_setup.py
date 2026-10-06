@@ -34,6 +34,10 @@ _sh = logging.StreamHandler(); _sh.setFormatter(_fmt)
 if not log.handlers:   # one file + one stream handler, however many times this module is imported
     log.addHandler(_fh)
     log.addHandler(_sh)
+    _dl = logging.getLogger("discord")          # discord.py logs view/modal errors here - don't let them vanish
+    _dl.setLevel(logging.WARNING)
+    _dl.addHandler(_fh)
+    _dl.addHandler(_sh)
 
 def print(*args, **kwargs):  # every existing print() lands in the log file too
     log.info(" ".join(str(a) for a in args))

@@ -288,8 +288,8 @@ def panel_embed() -> discord.Embed:
     lines = [f"{plan_emote(k)} {plansvc.describe(p, subsvc.seats_left(subs, k))}" for k, p in plansvc.all(enabled_only=True).items()]
     e.description = (f"Every plan unlocks {role}: live futures and spot setups, the full terminal, results board and monthly journals.\n\n"
                      + "\n".join(lines)
-                     + "\n\nPick a plan below - you get a private message with the wallet and the exact SOL amount. "
-                       "Send it and access switches on by itself once it lands on chain."
+                     + "\n\nPick a plan below, then how you want to pay - SOL, USDC or USDT, all on Solana. "
+                       "You get a private message with the wallet and the exact amount; send it and access switches on by itself once it lands on chain."
                      + ("\nHave a promo code? Pick a plan first, then tap **Promo code** on your quote." if plansvc.promos() else ""))
     try:
         if bot.user and bot.user.display_avatar:
@@ -304,6 +304,25 @@ def panel_embed() -> discord.Embed:
     except Exception:
         e.set_footer(text="Sigma Trading · payments in SOL")
     return e
+
+
+class SafeView(discord.ui.View):
+    """Every dropdown / button error: one ephemeral line to the member, full trace to the log + ops channel."""
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        import traceback as _tb
+        log.error(f"[ui] {type(item).__name__} failed: {error}\n" + "".join(_tb.format_exception(error)))
+        try:
+            await ops_alert(f"UI error in {type(item).__name__}: `{type(error).__name__}: {str(error)[:160]}`", key=f"ui:{type(item).__name__}:{type(error).__name__}")
+        except Exception:
+            pass
+        msg = "Something broke on that click - it's logged and the admin has been pinged. Try again in a minute."
+        try:
+            if interaction.response.is_done():
+                await interaction.followup.send(msg, ephemeral=True)
+            else:
+                await interaction.response.send_message(msg, ephemeral=True)
+        except Exception:
+            pass
 
 
 class PlanSelect(discord.ui.Select):
@@ -354,19 +373,19 @@ class TokenSelect(discord.ui.Select):
             await interaction.followup.send(e.message, ephemeral=True)
 
 
-class TokenPick(discord.ui.View):
+class TokenPick(SafeView):
     def __init__(self, plan: str):
         super().__init__(timeout=None)
         self.add_item(TokenSelect(plan))
 
 
-class PaymentPanel(discord.ui.View):
+class PaymentPanel(SafeView):
     def __init__(self):
         super().__init__(timeout=None)
         self.add_item(PlanSelect())
 
 
-class QuoteView(discord.ui.View):
+class QuoteView(SafeView):
     def __init__(self, sid: str):
         super().__init__(timeout=None)
         self.sid = sid
@@ -763,7 +782,7 @@ def members_csv(subs: dict):
     return out
 
 
-class MembersCSVView(discord.ui.View):
+class MembersCSVView(SafeView):
     def __init__(self):
         super().__init__(timeout=600)
         b = discord.ui.Button(label="Download CSV", style=discord.ButtonStyle.secondary)
