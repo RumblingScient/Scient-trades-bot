@@ -14,7 +14,7 @@ def _group(tree, name):
 
 def test_setup_group(tree):
     g, subs = _group(tree, "setup")
-    assert set(subs) == {"futures", "spot", "update", "close", "edit", "fix", "track", "reopen", "xpost"}
+    assert set(subs) == {"futures", "spot", "update", "close", "edit", "fix", "track", "reopen", "xpost", "referrals"}
     assert [p.name for p in subs["close"].parameters] == ["trade", "price", "note"]
     assert [p.name for p in subs["update"].parameters] == ["trade", "event", "price", "pct", "status", "note"]
     names = [c.name for c in subs["update"].parameters[1].choices]
@@ -28,7 +28,7 @@ def test_setup_group(tree):
 def test_admin_group_hidden(tree):
     g, subs = _group(tree, "admin")
     assert g.default_permissions is not None and g.default_permissions.administrator
-    assert {"health", "terminal_check", "board", "results", "override", "recap", "tg", "panel", "grant", "revoke", "subs"} <= set(subs)
+    assert {"health", "terminal_check", "board", "results", "override", "recap", "tg", "panel", "grant", "revoke", "subs", "members", "plans", "promo"} <= set(subs)
     assert [c.value for c in subs["recap"].parameters[0].choices] == ["week", "month", "journal"]
 
 
