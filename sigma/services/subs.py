@@ -23,8 +23,28 @@ def seats_left(subs: dict, plan: str) -> int | None:
     return max(0, cap - taken)
 
 
-def grant(subs: dict, uid, name: str, plan: str, by: str, note: str = "", tx: str = None, usd: float = None) -> dict:
-    """Mutates subs; returns the new record. Raises UserError for an unknown plan or a sold-out one."""
+def parse_date(text):
+    """'2026-11-15' / '15-11-2026' / '15 Nov 2026' / '15 Nov' -> aware datetime at 23:59 UTC. None for blank."""
+    if text in (None, ""):
+        return None
+    s = str(text).strip()
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%d %b %Y", "%d %b"):
+        try:
+            d = datetime.strptime(s, fmt)
+            if fmt == "%d %b":
+                d = d.replace(year=_now().year)
+                if d.replace(tzinfo=timezone.utc) < _now():
+                    d = d.replace(year=d.year + 1)
+            return d.replace(hour=23, minute=59, tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    raise UserError("Date must look like `2026-11-15` or `15 Nov`.")
+
+
+def grant(subs: dict, uid, name: str, plan: str, by: str, note: str = "", tx: str = None, usd: float = None,
+          expires_at=None) -> dict:
+    """Mutates subs; returns the new record. Raises UserError for an unknown plan or a sold-out one.
+    expires_at: explicit expiry (datetime or date text) - used when importing members from the old bot."""
     p = plansvc.all().get(plan)
     if not p:
         raise UserError("Unknown plan.")
@@ -41,6 +61,10 @@ def grant(subs: dict, uid, name: str, plan: str, by: str, note: str = "", tx: st
         except Exception:
             pass
     expires = base + timedelta(days=p["days"])
+    if expires_at not in (None, ""):
+        expires = expires_at if isinstance(expires_at, datetime) else parse_date(expires_at)
+        if expires <= now:
+            raise UserError("That expiry is already in the past.")
     rec = {
         "name": name,
         "plan": plan,
