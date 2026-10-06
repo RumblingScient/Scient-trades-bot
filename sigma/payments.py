@@ -162,7 +162,7 @@ async def mod_log(text: str, color=GREY):
         log.warning(f"[modlog] send failed: {e}")
 
 
-async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = None, note: str = "", expires_at=None) -> dict:
+async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = None, note: str = "") -> dict:
     """Grant (or extend) + role + DM + mod-log. Used by the chain watcher and by /admin grant."""
     guild = bot.get_guild(GUILD_ID)
     member = None
@@ -173,7 +173,7 @@ async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = No
             member = None
     name = member.display_name if member else str(uid)
     subs = load_subs()
-    rec = subsvc.grant(subs, uid, name, plan, by, note=note, tx=tx, usd=(0.0 if expires_at else usd), expires_at=expires_at)
+    rec = subsvc.grant(subs, uid, name, plan, by, note=note, tx=tx, usd=usd)
     save_subs(subs)
     ok = await _sub_grant_role(guild, uid) if guild else False
     p = plansvc.get(plan)
@@ -190,8 +190,7 @@ async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = No
             await member.send(embed=e)
         except Exception:
             pass
-    await mod_log(f"**{'Imported' if expires_at else 'Granted'}** {p['label']} -> {name} (`{uid}`) by {by}"
-                  + (f" · expires {exp.strftime('%d %b %Y')}" if expires_at else "")
+    await mod_log(f"**Granted** {p['label']} -> {name} (`{uid}`) by {by}"
                   + (f" · tx `{tx[:12]}...`" if tx else "") + (f" · {note}" if note else "")
                   + (" · role FAILED" if not ok else ""), color=GREEN)
     return rec
@@ -199,54 +198,14 @@ async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = No
 
 # ----------------------------------------------------------------------------- member UI
 
-# server emotes (upload sigma/assets/emotes/plan_*.png with these exact names); unicode fallback if missing
-PLAN_EMOTES = {"1month": ("plan_1m", "\U0001F539"), "3months": ("plan_3m", "\U0001F538"), "6months": ("plan_6m", "\U0001F536"),
-               "1year": ("plan_1y", "\U0001F7E2"), "lifetime": ("plan_life", "\U0001F48E")}
-
-
-
-def _banner_path():
-    from sigma.config import _ROOT
-    return _ROOT / "sigma" / "assets" / "pay_banner.png"
-
-
-def plan_emote(key: str) -> str:
-    from sigma.cards import emo
-    name, fb = PLAN_EMOTES.get(key, ("plan_1m", "\u2b50"))
-    return emo(name, fb)
-
-
-def _guild_emoji(name: str):
-    try:
-        g = bot.get_guild(GUILD_ID)
-        return discord.utils.get(g.emojis, name=name) if g else None
-    except Exception:
-        return None
-
-
 def panel_embed() -> discord.Embed:
-    from sigma.config import SUB_ROLE_ID
     subs = load_subs()
     e = discord.Embed(title="Sigma Pro - choose your plan", color=NAVY)
-    role = f"<@&{SUB_ROLE_ID}>" if SUB_ROLE_ID else "**Sigma Pro**"
-    lines = [f"{plan_emote(k)} {plansvc.describe(p, subsvc.seats_left(subs, k))}" for k, p in plansvc.all(enabled_only=True).items()]
-    e.description = (f"Every plan unlocks {role}: live futures and spot setups, the full terminal, results board and monthly journals.\n\n"
-                     + "\n".join(lines)
-                     + "\n\nPick a plan below - you get a private message with the wallet and the exact SOL amount. "
-                       "Send it and access switches on by itself once it lands on chain."
-                     + ("\nHave a promo code? Pick a plan first, then tap **Promo code** on your quote." if plansvc.promos() else ""))
-    try:
-        if bot.user and bot.user.display_avatar:
-            e.set_thumbnail(url=bot.user.display_avatar.url)
-    except Exception:
-        pass
-    if _banner_path().exists():
-        e.set_image(url="attachment://pay_banner.png")
-    try:
-        e.set_footer(text="Sigma Trading · payments in SOL · we never DM you first, never ask for keys",
-                     icon_url=(bot.user.display_avatar.url if bot.user else None))
-    except Exception:
-        e.set_footer(text="Sigma Trading · payments in SOL")
+    lines = [plansvc.describe(p, subsvc.seats_left(subs, k)) for k, p in plansvc.all(enabled_only=True).items()]
+    e.description = ("Pick a plan below. You'll get a private message with the wallet and the exact SOL amount - "
+                     "send it, and your access switches on automatically once it lands on chain.\n\n" + "\n".join(lines)
+                     + ("\n\nHave a promo code? Pick a plan first, then tap **Promo code** on your quote." if plansvc.promos() else ""))
+    e.set_footer(text="Payments in SOL (Solana). One payment, no card, no DMs from us asking for anything.")
     return e
 
 
@@ -260,8 +219,7 @@ class PlanSelect(discord.ui.Select):
             desc = (f"${eff:,.0f}" + (f" (was ${p['price']:,.0f})" if why else "")) + ("" if p["days"] >= LIFETIME_DAYS else f" · {p['days']} days")
             if left is not None:
                 desc += f" · {left} seats left" if left else " · sold out"
-            em = _guild_emoji(PLAN_EMOTES.get(k, ("plan_1m", ""))[0]) or PLAN_EMOTES.get(k, ("", "\u2b50"))[1]
-            opts.append(discord.SelectOption(label=p["short"][:100], value=k, description=desc[:100], emoji=em))
+            opts.append(discord.SelectOption(label=p["short"][:100], value=k, description=desc[:100]))
         if not opts:
             opts.append(discord.SelectOption(label="No plans available", value="none"))
         super().__init__(placeholder="Select a plan...", options=opts, custom_id="sigma:pay:plan", min_values=1, max_values=1)
@@ -514,8 +472,7 @@ async def _before_pay():
 # ----------------------------------------------------------------------------- admin bits
 
 async def post_panel(channel: discord.abc.Messageable) -> discord.Message:
-    files = [discord.File(_banner_path(), filename="pay_banner.png")] if _banner_path().exists() else []
-    msg = await channel.send(embed=panel_embed(), view=PaymentPanel(), files=files)
+    msg = await channel.send(embed=panel_embed(), view=PaymentPanel())
     try:
         await msg.pin()
     except Exception:
@@ -607,18 +564,6 @@ def members_embed(guild: discord.Guild, view: str = "overview") -> discord.Embed
         e.add_field(name="Wallet", value=(f"`{SOL_WALLET}`" if SOL_WALLET else "NOT SET"), inline=False)
         e.set_footer(text="Sigma Trading - payments · unmatched = resolve with /admin grant, tx in note")
         return e
-    if view == "unrecorded":
-        from sigma.config import SUB_ROLE_ID
-        role = guild.get_role(SUB_ROLE_ID) if SUB_ROLE_ID else None
-        holders = [m for m in (role.members if role else []) if not m.bot]
-        missing = [m for m in holders if str(m.id) not in subs]
-        e.title = f"Pro role without a record ({len(missing)} of {len(holders)})"
-        e.description = ("These members have the Pro role but no subscription record - the old bot tracked them. "
-                         "Import each with `/admin grant member plan expires:<date from the old bot>` so expiry and reminders work here.\n\n"
-                         + ("\n".join(f"{m.mention} · {m.display_name}" for m in missing[:40]) if missing else "none - everyone is on record"))
-        if len(missing) > 40:
-            e.set_footer(text=f"+{len(missing) - 40} more")
-        return e
     # overview
     e.title = "Members - overview"
     total = guild.member_count or len(guild.members)
@@ -667,150 +612,3 @@ class MembersCSVView(discord.ui.View):
             await interaction.response.send_message("Admins only.", ephemeral=True)
             return
         await interaction.response.send_message(file=discord.File(members_csv(load_subs()), filename="sigma_members.csv"), ephemeral=True)
-
-
-# ----------------------------------------------------------------------------- import from the old Payment Bot
-
-import re as _re
-
-_PLAN_DAYS = (("lifetime", 36500), ("year", 365), ("6month", 180), ("3month", 90), ("month", 30))
-
-
-def parse_old_plan(label: str):
-    """'Sigma Pro $500/6months' -> (days, usd). None if it doesn't look like a plan."""
-    if not label:
-        return None
-    low = label.lower().replace(" ", "")
-    m = _re.search(r"\$([\d,]+)", label)
-    usd = float(m.group(1).replace(",", "")) if m else None
-    for key, days in _PLAN_DAYS:
-        if key in low:
-            return days, usd
-    return None
-
-
-def plan_key_for_days(days: int) -> str | None:
-    best = None
-    for k, p in plansvc.all().items():
-        if p["days"] == days:
-            return k
-        if best is None or abs(p["days"] - days) < abs(plansvc.all()[best]["days"] - days):
-            best = k
-    return best
-
-
-def _parse_old_card(msg: discord.Message):
-    """One Payment Bot 'Plan selected' embed -> (user_id, days, usd, when) or None."""
-    for e in msg.embeds:
-        if (e.title or "").strip().lower() != "plan selected":
-            continue
-        uid = plan = None
-        for f in e.fields:
-            if f.name.lower() == "user":
-                m = _re.search(r"<@!?(\d+)>", f.value or "")
-                uid = int(m.group(1)) if m else None
-            elif f.name.lower() == "plan":
-                plan = f.value
-        pd = parse_old_plan(plan or "")
-        if uid and pd:
-            return uid, pd[0], pd[1], msg.created_at
-    return None
-
-
-async def scan_old_bot(guild: discord.Guild, log_channel: discord.TextChannel, old_bot_name: str = "Payment Bot") -> dict:
-    """Build an import preview: {uid: {name, days, usd, start, expires, source}} for Pro-role holders without a record."""
-    from sigma.config import SUB_ROLE_ID
-    subs = load_subs()
-    role = guild.get_role(SUB_ROLE_ID)
-    holders = {m.id: m for m in (role.members if role else []) if not m.bot and str(m.id) not in subs}
-    if not holders:
-        return {"rows": {}, "skipped": [], "cards": 0, "grants": 0}
-    # 1) every 'Plan selected' card, newest first per user
-    selected = {}
-    cards = 0
-    async for msg in log_channel.history(limit=None, oldest_first=False):
-        if not msg.author.bot or old_bot_name.lower() not in (msg.author.display_name or msg.author.name).lower():
-            continue
-        r = _parse_old_card(msg)
-        if not r:
-            continue
-        cards += 1
-        uid, days, usd, when = r
-        selected.setdefault(uid, []).append((when, days, usd))
-    # 2) audit log: when did the old bot give the Pro role (confirmed payment)
-    grants = {}
-    try:
-        async for entry in guild.audit_logs(action=discord.AuditLogAction.member_role_update, limit=None):
-            if not entry.user or not entry.user.bot or old_bot_name.lower() not in (entry.user.display_name or entry.user.name).lower():
-                continue
-            after_roles = getattr(entry.after, "roles", None) or []
-            if role and any(r.id == role.id for r in after_roles):
-                tid = entry.target.id if entry.target else None
-                if tid and (tid not in grants or entry.created_at > grants[tid]):
-                    grants[tid] = entry.created_at
-    except discord.Forbidden:
-        pass
-    rows, skipped = {}, []
-    for uid, m in holders.items():
-        sel = sorted(selected.get(uid, []), reverse=True)
-        g = grants.get(uid)
-        if g and sel:
-            before = [x for x in sel if x[0] <= g + timedelta(minutes=5)]
-            when, days, usd = (before[0] if before else sel[0])
-            start, source = g, "audit log + plan card"
-        elif sel:
-            when, days, usd = sel[0]
-            start, source = when, "plan card only (assumed paid - holds the role)"
-        elif g:
-            start, days, usd, source = g, 30, None, "audit log only - plan unknown, assumed monthly"
-        else:
-            skipped.append((uid, m.display_name))
-            continue
-        exp = start + timedelta(days=days)
-        rows[uid] = {"name": m.display_name, "days": days, "usd": usd, "start": start.isoformat(), "expires": exp.isoformat(),
-                     "plan": plan_key_for_days(days), "source": source, "already_expired": exp < _now()}
-    st = load_payments()
-    st["import_preview"] = {str(k): v for k, v in rows.items()}
-    save_payments(st)
-    return {"rows": rows, "skipped": skipped, "cards": cards, "grants": len(grants)}
-
-
-def import_preview_embed(res: dict) -> discord.Embed:
-    rows = res["rows"]
-    e = discord.Embed(title=f"Import preview - {len(rows)} member(s)", color=NAVY)
-    e.description = (f"Read {res['cards']} plan cards and {res['grants']} role grants from the old bot. "
-                     f"Run `/admin import action:Apply` to create these records (no revenue is counted).")
-    lines = []
-    for uid, r in sorted(rows.items(), key=lambda x: x[1]["expires"]):
-        exp = datetime.fromisoformat(r["expires"])
-        flag = " \u26a0 already past expiry - will NOT import, decide by hand" if r["already_expired"] else ""
-        est = "" if r["source"].startswith("audit log +") else " (est.)"
-        lines.append(f"<@{uid}> · {plansvc.all().get(r['plan'], {}).get('short', r['days'])} · expires {exp.strftime('%d %b %Y')}{est}{flag}")
-    for i in range(0, len(lines), 15):
-        e.add_field(name="\u200b" if i else "Members", value="\n".join(lines[i:i + 15])[:1024], inline=False)
-    if res["skipped"]:
-        e.add_field(name=f"No trace found ({len(res['skipped'])}) - import by hand with /admin grant expires:",
-                    value="\n".join(f"<@{u}> · {n}" for u, n in res["skipped"][:20])[:1024], inline=False)
-    e.set_footer(text="(est.) = plan card only or plan unknown - check the ones that matter")
-    return e
-
-
-async def apply_import(by: str) -> tuple[int, int]:
-    st = load_payments()
-    rows = st.get("import_preview") or {}
-    done = skipped = 0
-    for uid, r in rows.items():
-        if r.get("already_expired") or not r.get("plan"):
-            skipped += 1
-            continue
-        try:
-            await activate(int(uid), r["plan"], by=by, note=f"imported from old bot ({r['source']})",
-                           expires_at=datetime.fromisoformat(r["expires"]))
-            done += 1
-        except Exception as ex:
-            print(f"[import] {uid} failed: {ex}", flush=True)
-            skipped += 1
-    st = load_payments()
-    st["import_preview"] = {}
-    save_payments(st)
-    return done, skipped
