@@ -30,7 +30,7 @@ def _group(nm):
     g = next((c for c in cmds if c.name == nm), None)
     return {s.name for s in getattr(g, "commands", []) or []}
 check("/setup subcommands", _group("setup") == {"futures","spot","update","close","edit","fix","track","reopen","xpost","referrals"}, str(sorted(_group("setup"))))
-check("/admin subcommands", _group("admin") >= {"health","terminal_check","board","results","override","recap","tg","panel","grant","revoke","subs","members","plans","promo"}, str(sorted(_group("admin"))))
+check("/admin subcommands", _group("admin") >= {"health","terminal_check","board","results","override","recap","tg","panel","grant","revoke","subs","members","plans","promo","import"}, str(sorted(_group("admin"))))
 _adm = next((c for c in cmds if c.name == "admin"), None)
 check("/admin hidden from members", _adm is not None and _adm.default_permissions is not None and _adm.default_permissions.administrator)
 _aliases = [c.name for c in cmds if (getattr(c, "extras", None) or {}).get("moved")]
