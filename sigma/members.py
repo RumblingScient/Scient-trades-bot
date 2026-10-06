@@ -304,9 +304,10 @@ async def _sub_remove_role(guild: discord.Guild, uid: int) -> bool:
         return False
 
 # (moved to /admin - registered in sigma.commands_admin)
-@app_commands.describe(member="Who gets Pro", plan="Which plan", note="Optional note, e.g. tx hash or payment ref")
+@app_commands.describe(member="Who gets Pro", plan="Which plan", note="Optional note, e.g. tx hash or payment ref",
+                       expires="Import from the old bot: set the exact expiry, e.g. 2026-11-15 (no revenue is recorded)")
 @app_commands.autocomplete(plan=plan_ac)
-async def grant_cmd(interaction: discord.Interaction, member: discord.Member, plan: str, note: str = None):
+async def grant_cmd(interaction: discord.Interaction, member: discord.Member, plan: str, note: str = None, expires: str = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
@@ -314,7 +315,7 @@ async def grant_cmd(interaction: discord.Interaction, member: discord.Member, pl
     from sigma.payments import activate
     from sigma.errors import UserError
     try:
-        rec = await activate(member.id, plan, by=interaction.user.display_name, note=note or "")
+        rec = await activate(member.id, plan, by=interaction.user.display_name, note=note or "", expires_at=expires)
     except UserError as e:
         await interaction.followup.send(e.message, ephemeral=True)
         return

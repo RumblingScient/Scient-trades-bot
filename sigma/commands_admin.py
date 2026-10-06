@@ -136,6 +136,7 @@ async def admin_panel(interaction: discord.Interaction, kind: app_commands.Choic
     app_commands.Choice(name="Members - every active Pro with plan and expiry (+ CSV)", value="members"),
     app_commands.Choice(name="Revenue - this month, last month, all time, by plan, run-rate", value="revenue"),
     app_commands.Choice(name="Payments - open quotes, last paid, unmatched", value="payments"),
+    app_commands.Choice(name="Unrecorded - Pro role holders the old bot tracked, to import", value="unrecorded"),
 ])
 async def admin_members(interaction: discord.Interaction, view: app_commands.Choice[str] = None):
     if not interaction.user.guild_permissions.administrator:
@@ -327,6 +328,37 @@ async def admin_promo(interaction: discord.Interaction, action: app_commands.Cho
     await refresh_panel()
     await mod_log(f"**Promo** - {interaction.user.display_name}: {msg}")
     await interaction.followup.send(msg, embed=_promos_embed(), ephemeral=True)
+
+
+@admin.command(name="import", description="Bring the old Payment Bot's members into this bot - scan the logs channel, then apply")
+@app_commands.describe(action="Scan = build a preview from #logs + audit log. Apply = create the records from the last scan",
+                       channel="Scan: the channel the old bot logged to (blank = the mod-log channel)")
+@app_commands.choices(action=[
+    app_commands.Choice(name="Scan - preview what would be imported", value="scan"),
+    app_commands.Choice(name="Apply - import everything from the last scan", value="apply"),
+])
+async def admin_import(interaction: discord.Interaction, action: app_commands.Choice[str], channel: discord.TextChannel = None):
+    if not _admin_only(interaction):
+        await interaction.response.send_message("Admins only.", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    from sigma.payments import scan_old_bot, import_preview_embed, apply_import
+    from sigma.config import MOD_LOG_CHANNEL_ID
+    if action.value == "scan":
+        ch = channel or (interaction.guild.get_channel(MOD_LOG_CHANNEL_ID) if MOD_LOG_CHANNEL_ID else None)
+        if ch is None:
+            await interaction.followup.send("Give `channel` - the one the old bot logged to.", ephemeral=True)
+            return
+        res = await scan_old_bot(interaction.guild, ch)
+        if not res["rows"] and not res["skipped"]:
+            await interaction.followup.send("Everyone with the Pro role already has a record - nothing to import.", ephemeral=True)
+            return
+        await interaction.followup.send(embed=import_preview_embed(res), ephemeral=True)
+        return
+    done, skipped = await apply_import(by=interaction.user.display_name)
+    await mod_log(f"**Import** by {interaction.user.display_name}: {done} member(s) imported, {skipped} skipped")
+    await interaction.followup.send(f"Imported **{done}** member(s), skipped {skipped} (expired / no plan / failed - see mod-log). "
+                                    f"Run `/admin members view:Unrecorded` to see what's left.", ephemeral=True)
 
 
 bot.tree.add_command(admin)
