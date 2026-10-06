@@ -27,6 +27,8 @@ import sigma.commands_help  # noqa: F401
 import sigma.errors  # noqa: F401
 import sigma.services.store  # noqa: F401
 import sigma.services.trades  # noqa: F401
+import sigma.services.subs  # noqa: F401
+import sigma.payments  # noqa: F401
 import sigma.commands_setup  # noqa: F401
 import sigma.commands_admin  # noqa: F401
 import sigma.aliases  # noqa: F401
