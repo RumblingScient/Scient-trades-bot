@@ -10,7 +10,7 @@ from datetime import datetime, timezone, timedelta, time as dt_time
 import logging, logging.handlers, builtins, time as _time, traceback as _tb
 import functools as _functools
 from sigma.logging_setup import print
-from sigma.config import ANALYSTS, ANALYST_CHOICES, ANALYST_ROLE_NAME, GOLD, GUILD_ID, NAVY, NEWS_PING_ROLE_ID, PING_ROLE_ID, PRO_ROLE_IDS, SUB_PLANS, SUB_REMINDER_DAYS, SUB_ROLE_ID, X_PING_ROLE_ID
+from sigma.config import ALUMNI_ROLE_ID, ANALYSTS, ANALYST_CHOICES, ANALYST_ROLE_NAME, GOLD, GREY, GUILD_ID, NAVY, RED, NEWS_PING_ROLE_ID, PING_ROLE_ID, PRO_ROLE_IDS, SUB_REMINDER_DAYS, SUB_ROLE_ID, X_PING_ROLE_ID
 from sigma.core import bot
 from sigma.storage import load_subs, save_subs
 
@@ -199,6 +199,14 @@ async def on_member_join(member: discord.Member):
     if member.bot:
         return
     try:
+        from sigma.services import subs as subsvc
+        s = load_subs().get(str(member.id))
+        if s and (subsvc.days_left(s) or -1) >= 0:
+            await _sub_grant_role(member.guild, member.id)
+            print(f"[subs] rejoin - Pro restored for {member} ({member.id})")
+    except Exception as e:
+        print(f"[subs] rejoin check error {member.id}: {e}")
+    try:
         await member.send(embed=build_join_dm())
         print(f"[welcome] join DM sent to {member} ({member.id})")
     except discord.Forbidden:
@@ -263,7 +271,15 @@ async def setup_follow_panel(interaction: discord.Interaction):
     await interaction.channel.send(embed=embed, view=FollowPanel())
     await interaction.response.send_message("Follow panel posted.", ephemeral=True)
 
-PLAN_CHOICES = [app_commands.Choice(name=v["label"], value=k) for k, v in SUB_PLANS.items()]
+def _plan_label(k):
+    from sigma.services import plans as plansvc
+    return plansvc.all().get(k, {}).get("label", k)
+
+async def plan_ac(interaction: discord.Interaction, current: str):
+    from sigma.services import plans as plansvc
+    cur = (current or "").lower()
+    return [app_commands.Choice(name=p["label"][:100], value=k) for k, p in plansvc.all().items()
+            if cur in p["label"].lower() or cur in k][:25]
 
 async def _sub_grant_role(guild: discord.Guild, uid: int) -> bool:
     try:
@@ -289,56 +305,23 @@ async def _sub_remove_role(guild: discord.Guild, uid: int) -> bool:
 
 # (moved to /admin - registered in sigma.commands_admin)
 @app_commands.describe(member="Who gets Pro", plan="Which plan", note="Optional note, e.g. tx hash or payment ref")
-@app_commands.choices(plan=PLAN_CHOICES)
-async def grant_cmd(interaction: discord.Interaction, member: discord.Member, plan: app_commands.Choice[str], note: str = None):
+@app_commands.autocomplete(plan=plan_ac)
+async def grant_cmd(interaction: discord.Interaction, member: discord.Member, plan: str, note: str = None):
     if not interaction.user.guild_permissions.administrator:
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    p = SUB_PLANS[plan.value]
-    subs = load_subs()
-    uid = str(member.id)
-    now = datetime.now(timezone.utc)
-    existing = subs.get(uid)
-    if existing and existing.get("expires"):
-        try:
-            cur_exp = datetime.fromisoformat(existing["expires"])
-            base = max(cur_exp, now)  # extend from current expiry if still active
-        except Exception:
-            base = now
-    else:
-        base = now
-    expires = base + timedelta(days=p["days"])
-    subs[uid] = {
-        "name": member.display_name,
-        "plan": plan.value,
-        "price": p["price"],
-        "started": existing.get("started") if existing else now.isoformat(),
-        "expires": expires.isoformat(),
-        "reminded": False,
-        "note": (note or "")[:120],
-        "history": (existing.get("history", []) if existing else []) + [
-            {"plan": plan.value, "price": p["price"], "at": now.isoformat(), "by": interaction.user.display_name}
-        ],
-    }
-    save_subs(subs)
-    ok = await _sub_grant_role(interaction.guild, member.id)
+    from sigma.payments import activate
+    from sigma.errors import UserError
     try:
-        dm = discord.Embed(
-            title="Scient Pro activated \U0001F389",
-            description=(
-                f"Your **{p['label']}** is live.\n"
-                f"**Access until:** {expires.strftime('%d %b %Y')}\n\n"
-                f"You'll get a renewal reminder {SUB_REMINDER_DAYS} days before it ends."
-            ),
-            color=GOLD,
-        )
-        await member.send(embed=dm)
-    except Exception:
-        pass
+        rec = await activate(member.id, plan, by=interaction.user.display_name, note=note or "")
+    except UserError as e:
+        await interaction.followup.send(e.message, ephemeral=True)
+        return
+    expires = datetime.fromisoformat(rec["expires"])
     await interaction.followup.send(
-        f"\u2705 **{member.display_name}** -> {p['label']}\n"
-        f"Expires: **{expires.strftime('%d %b %Y')}** | role {'granted' if ok else 'FAILED - check manually'}",
+        f"\u2705 **{member.display_name}** -> {_plan_label(plan)}\n"
+        f"Expires: **{'lifetime' if rec.get('days', 0) >= 36500 else expires.strftime('%d %b %Y')}** - logged in mod-log.",
         ephemeral=True,
     )
 
@@ -349,14 +332,20 @@ async def revoke_cmd(interaction: discord.Interaction, member: discord.Member):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
+    from sigma.services import subs as subsvc
+    from sigma.errors import UserError
+    from sigma.payments import mod_log
     subs = load_subs()
-    if str(member.id) not in subs:
-        await interaction.followup.send("No subscription on record for that member.", ephemeral=True)
+    try:
+        rec = subsvc.revoke(subs, member.id)
+    except UserError as e:
+        await interaction.followup.send(e.message, ephemeral=True)
         return
-    subs.pop(str(member.id), None)
     save_subs(subs)
+    _archive_lapsed(str(member.id), rec, "revoked")
     await _sub_remove_role(interaction.guild, member.id)
-    await interaction.followup.send(f"Subscription revoked for **{member.display_name}** - role removed.", ephemeral=True)
+    await mod_log(f"**Revoked** {_plan_label(rec.get('plan'))} from {member.display_name} (`{member.id}`) by {interaction.user.display_name}", color=RED)
+    await interaction.followup.send(f"Subscription revoked for **{member.display_name}** - role removed, logged in mod-log.", ephemeral=True)
 
 # (moved to /admin - registered in sigma.commands_admin)
 async def subs_cmd(interaction: discord.Interaction):
@@ -378,8 +367,8 @@ async def subs_cmd(interaction: discord.Interaction):
         except Exception:
             days_left = -1
         total_rev += sum(h.get("price", 0) for h in s.get("history", []))
-        flag = "\U0001F7E2" if days_left > SUB_REMINDER_DAYS else ("\U0001F7E1" if days_left >= 0 else "\U0001F534")
-        rows.append((days_left, f"{flag} **{s.get('name','?')}** - {SUB_PLANS.get(s.get('plan'), {}).get('label', s.get('plan'))} - {days_left}d left"))
+        flag = "\U0001F7E2" if days_left > max(SUB_REMINDER_DAYS) else ("\U0001F7E1" if days_left >= 0 else "\U0001F534")
+        rows.append((days_left, f"{flag} **{s.get('name','?')}** - {_plan_label(s.get('plan'))} - {days_left}d left"))
     rows.sort(key=lambda r: r[0])
     embed = discord.Embed(title="\U0001F4B3 Subscriptions", color=NAVY, timestamp=now)
     embed.description = "\n".join(r[1] for r in rows[:30])
@@ -399,15 +388,27 @@ async def mysub_cmd(interaction: discord.Interaction):
         exp = datetime.fromisoformat(s["expires"])
         days_left = (exp - datetime.now(timezone.utc)).days
         await interaction.followup.send(
-            f"**{SUB_PLANS.get(s.get('plan'), {}).get('label', 'Pro')}**\n"
+            f"**{_plan_label(s.get('plan'))}**\n"
             f"Expires: **{exp.strftime('%d %b %Y')}** ({days_left} days left)",
             ephemeral=True,
         )
     except Exception:
         await interaction.followup.send("Couldn't read your subscription record - ping an admin.", ephemeral=True)
 
+def _archive_lapsed(uid: str, rec: dict, why: str):
+    """Keep expired / revoked records (for revenue + churn) in payments.json - subs.json only holds active ones."""
+    from sigma.storage import load_payments, save_payments
+    st = load_payments()
+    rec = dict(rec); rec.update({"uid": uid, "lapsed_at": datetime.now(timezone.utc).isoformat(), "why": why})
+    st.setdefault("lapsed", []).append(rec)
+    st["lapsed"] = st["lapsed"][-500:]
+    save_payments(st)
+
+
 @tasks.loop(time=dt_time(hour=4, minute=30, tzinfo=timezone.utc))  # 10:00 AM IST daily
 async def subs_check_loop():
+    from sigma.services import subs as subsvc
+    from sigma.payments import mod_log
     subs = load_subs()
     if not subs:
         return
@@ -417,37 +418,47 @@ async def subs_check_loop():
     now = datetime.now(timezone.utc)
     changed = False
     for uid, s in list(subs.items()):
-        try:
-            exp = datetime.fromisoformat(s["expires"])
-        except Exception:
+        dl = subsvc.days_left(s, now)
+        if dl is None:
             continue
-        days_left = (exp - now).days
-        if exp <= now:
-            # expired: remove role, DM, drop record
+        if dl < 0:
             await _sub_remove_role(guild, int(uid))
+            if ALUMNI_ROLE_ID:
+                try:
+                    m = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
+                    role = guild.get_role(ALUMNI_ROLE_ID)
+                    if m and role and role not in m.roles:
+                        await m.add_roles(role, reason="Subscription lapsed")
+                except Exception:
+                    pass
             try:
                 user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
                 await user.send(
-                    "Your **Scient Pro** access has ended. It's been great having you in the full lounge - "
-                    "renew any time via the payment options in the server to jump back in. \U0001F91D"
+                    "Your **Sigma Pro** access has ended. It's been great having you in the full lounge - "
+                    "renew any time from the payment channel in the server to jump back in. \U0001F91D"
                 )
             except Exception:
                 pass
             subs.pop(uid, None)
             changed = True
+            _archive_lapsed(uid, s, "expired")
+            await mod_log(f"**Expired** {_plan_label(s.get('plan'))} - {s.get('name')} (`{uid}`)" + (" · Alumni role set" if ALUMNI_ROLE_ID else ""), color=GREY)
             print(f"[subs] expired + removed: {s.get('name')} ({uid})", flush=True)
-        elif days_left <= SUB_REMINDER_DAYS and not s.get("reminded"):
+            continue
+        th = subsvc.due_reminder(s, SUB_REMINDER_DAYS, now)
+        if th is not None:
             try:
+                exp = datetime.fromisoformat(s["expires"])
                 user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
                 await user.send(
-                    f"Heads up - your **Scient Pro** expires in **{max(days_left,0)} day(s)** "
-                    f"({exp.strftime('%d %b %Y')}). Renew via the payment options in the server to keep uninterrupted access. \U0001F514"
+                    f"Heads up - your **Sigma Pro** expires in **{max(dl, 0)} day(s)** "
+                    f"({exp.strftime('%d %b %Y')}). Renew from the payment channel in the server to keep uninterrupted access. \U0001F514"
                 )
             except Exception:
                 pass
-            s["reminded"] = True
+            subsvc.mark_reminded(s, th, SUB_REMINDER_DAYS)
             changed = True
-            print(f"[subs] reminder sent: {s.get('name')} ({uid})", flush=True)
+            print(f"[subs] reminder ({th}d) sent: {s.get('name')} ({uid})", flush=True)
     if changed:
         save_subs(subs)
 

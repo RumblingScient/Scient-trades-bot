@@ -77,6 +77,12 @@ def load_digest() -> dict: return _load(DIGEST_FILE)
 def save_digest(d: dict): _save(DIGEST_FILE, d)
 
 SUBS_FILE = _ROOT.joinpath("subscriptions.json")
+PAYMENTS_FILE = _ROOT.joinpath("payments.json")
+PLANS_FILE = _ROOT.joinpath("plans.json")
+def load_plans() -> dict: return _load(PLANS_FILE)
+def save_plans(d: dict): _save(PLANS_FILE, d)
+def load_payments() -> dict: return _load(PAYMENTS_FILE)
+def save_payments(d: dict): _save(PAYMENTS_FILE, d)
 
 def load_subs() -> dict: return _load(SUBS_FILE)
 

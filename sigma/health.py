@@ -22,6 +22,7 @@ from sigma.xfeed import x_poll_loop
 from sigma.jobs import backup_loop, funding_guard_loop
 from sigma.results import results_watch_loop
 from sigma.recaps import sigma_monthly_loop, sigma_recap_loop
+from sigma.payments import payment_watch_loop
 
 
 async def on_app_command_error(interaction: discord.Interaction, error: Exception):
@@ -78,7 +79,7 @@ def _loops():
                       ("monthly", sigma_monthly_loop), ("weekly", sigma_recap_loop), ("backup", backup_loop),
                       ("x_poll", x_poll_loop), ("alerts", alert_check_loop), ("tg_move", tg_move_loop),
                       ("tg_brief", tg_brief_loop), ("tg_sources", tg_sources_loop), ("tg_digest", tg_digest_loop),
-                      ("funding", funding_guard_loop))
+                      ("funding", funding_guard_loop), ("payments", payment_watch_loop))
     return _ALL_LOOPS
 
 # (moved to /admin - registered in sigma.commands_admin)

@@ -23,6 +23,9 @@ from sigma.liquidations import liq_binance_loop, liq_bybit_loop, liq_okx_loop
 from sigma.xfeed import x_poll_loop
 from sigma.jobs import backup_loop, funding_guard_loop
 from sigma.health import _loops, _self_heal, _validate_startup, on_app_command_error
+from sigma.payments import PaymentPanel, QuoteView, payment_watch_loop
+from sigma.storage import load_payments
+from sigma.config import SOL_WALLET
 
 
 @bot.event
@@ -39,6 +42,12 @@ async def on_ready():
         await ops_alert("startup problems: " + "; ".join(probs), key="startup")
     log.info(f"[boot] ready - ops_channel={'set' if OPS_CHANNEL_ID else 'unset'}, corrupt={sorted(_CORRUPT) or 'none'}")
     bot.add_view(FollowPanel())
+    bot.add_view(PaymentPanel())
+    for _sid, _s in (load_payments().get("sessions") or {}).items():
+        if not _s.get("paid"):
+            bot.add_view(QuoteView(_sid))
+    if SOL_WALLET and not payment_watch_loop.is_running():
+        payment_watch_loop.start()
     await refresh_board()
     await refresh_spot_board()
     if X_AUTO_ENABLED and not x_poll_loop.is_running():

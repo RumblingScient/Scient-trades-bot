@@ -583,4 +583,27 @@ async def setup_xpost(interaction: discord.Interaction, link: str, comment: str 
     await _run(interaction, body())
 
 
+@setup.command(name="referrals", description="Your referral codes - members brought, revenue, what you're owed")
+async def setup_referrals(interaction: discord.Interaction):
+    if not await _gate(interaction, "see referrals"):
+        return
+    from sigma.services import plans as plansvc
+    from sigma.storage import load_payments
+    st = load_payments()
+    mine = [c for c, r in plansvc.promos().items() if r.get("owner_id") == interaction.user.id]
+    summ = plansvc.referral_summary(st, interaction.user.id).get(interaction.user.id)
+    if not mine and not summ:
+        await _reply(interaction, "No referral code is set up for you yet - ask an admin for one.")
+        return
+    e = discord.Embed(title="Your referrals", color=discord.Color.gold())
+    e.add_field(name="Codes", value=", ".join(f"`{c}`" for c in mine) or "-", inline=False)
+    if summ:
+        e.add_field(name="Members brought", value=str(summ["members"]), inline=True)
+        e.add_field(name="Revenue", value=f"${summ['usd']:,.0f}", inline=True)
+        e.add_field(name="Your share", value=f"owed ${summ['owed']:,.2f} · paid ${summ['settled']:,.2f}", inline=True)
+    else:
+        e.description = "No payments with your code yet."
+    await interaction.followup.send(embed=e, ephemeral=True)
+
+
 bot.tree.add_command(setup)

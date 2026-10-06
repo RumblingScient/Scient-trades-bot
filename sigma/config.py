@@ -48,12 +48,29 @@ PRO_ROLE_IDS = {1500476858477576374, 1484576832362905630}  # Scient Pass (referr
 SUB_ROLE_ID = 1484576832362905630  # role granted/removed by the subscription system (Scient Pro)
 
 SUB_PLANS = {
-    "1month":  {"days": 30,  "price": 50,  "label": "Scient Pro - 1 Month ($50)"},
-    "3months": {"days": 90,  "price": 140, "label": "Scient Pro - 3 Months ($140)"},
-    "6months": {"days": 180, "price": 250, "label": "Scient Pro - 6 Months ($250)"},
+    "1month":   {"days": 30,    "price": 100,  "label": "Sigma Pro - Monthly ($100)",         "short": "Monthly"},
+    "3months":  {"days": 90,    "price": 270,  "label": "Sigma Pro - 3 Months ($270)",        "short": "3 months"},
+    "6months":  {"days": 180,   "price": 500,  "label": "Sigma Pro - 6 Months ($500)",        "short": "6 months"},
+    "1year":    {"days": 365,   "price": 1000, "label": "Sigma Pro - Yearly ($1,000)",        "short": "Yearly"},
+    "lifetime": {"days": 36500, "price": 1999, "label": "Founding Lifetime ($1,999)",         "short": "Lifetime", "seats": 25},
 }
 
-SUB_REMINDER_DAYS = 3  # DM a renewal reminder this many days before expiry
+SUB_REMINDER_DAYS = (7, 3, 1)   # DM a renewal reminder at each of these days-before-expiry
+
+ALUMNI_ROLE_ID = int(os.getenv("SIGMA_ALUMNI_ROLE_ID", "0") or 0)        # lapsed members, read-only (0 = off)
+MOD_LOG_CHANNEL_ID = int(os.getenv("SIGMA_MODLOG_CHANNEL_ID", "0") or 0)  # every grant/revoke/expiry lands here (0 = ops channel)
+
+# ─── Payments: SOL to a fixed wallet, unique amount per session, chain-verified ───
+PAYMENT_CHANNEL_ID = int(os.getenv("SIGMA_PAYMENT_CHANNEL_ID", "0") or 0)   # #join-via-payment
+SOL_WALLET = os.getenv("SIGMA_SOL_WALLET", "").strip()                      # receiving address - .env only
+SOL_RPC = os.getenv("SIGMA_SOL_RPC", "https://api.mainnet-beta.solana.com").strip()
+PAY_SESSION_MIN = 30          # quote valid this long
+PAY_LATE_GRACE_H = 24         # a payment that lands after expiry still matches within this window
+PAY_MATCH_TOL = 0.000005      # SOL - exact-amount match tolerance (wallets send 9-decimal exact; quotes are 0.00001 apart)
+PAY_FEE_SLACK = 0.02          # SOL - exchange withdrawals arrive short by their fee; accept if it points to ONE open quote
+PAY_MIN_SOL = 0.005           # ignore dust below this (no alert, just a log line)
+PAY_VALUE_FLOOR = 0.95        # received SOL must still be worth >= 95% of the quoted USD at the time it lands
+PAY_POLL_SEC = 30
 
 FREE_ALERT_LIMIT = 5      # max active alerts for non-pro members
 
