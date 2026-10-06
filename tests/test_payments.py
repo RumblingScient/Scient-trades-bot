@@ -453,3 +453,156 @@ def test_pentest_admin_gates_on_sensitive_views(bot_mod):
         assert "administrator" in src or "_admin_only" in src, name
     pay = __import__("sigma.payments", fromlist=["x"])
     assert "administrator" in inspect.getsource(pay.MembersCSVView.send)
+
+
+def test_grant_with_explicit_expiry_for_import():
+    subs = {}
+    r = subsvc.grant(subs, 9, "Old", "1month", by="admin", expires_at="2099-11-15", usd=0.0)
+    assert r["expires"].startswith("2099-11-15") and r["history"][-1]["usd"] == 0.0
+    with pytest.raises(UserError, match="past"):
+        subsvc.grant({}, 9, "Old", "1month", by="admin", expires_at="2020-01-01")
+    with pytest.raises(UserError, match="Date"):
+        subsvc.grant({}, 9, "Old", "1month", by="admin", expires_at="someday")
+
+
+def test_panel_has_visuals(bot_mod, plans_store, monkeypatch):
+    pay_mod = __import__("sigma.payments", fromlist=["x"])
+    monkeypatch.setattr(pay_mod, "load_subs", lambda: {})
+    e = pay_mod.panel_embed()
+    assert e.image.url == "attachment://pay_banner.png" and pay_mod._banner_path().exists()
+    assert "<@&" in e.description and "Monthly" in e.description
+    opts = pay_mod.PaymentPanel().children[0].options
+    assert all(o.emoji is not None for o in opts)
+
+
+def test_old_bot_card_parsing_and_plan_mapping(bot_mod, plans_store):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    assert pay.parse_old_plan("Sigma Pro $500/6months") == (180, 500)
+    assert pay.parse_old_plan("Sigma Pro $100/Monthly") == (30, 100)
+    assert pay.parse_old_plan("Sigma Pro $1000/yearly") == (365, 1000)
+    assert pay.parse_old_plan("Sigma Pro $270/3months") == (90, 270)
+    assert pay.parse_old_plan("hello") is None
+    assert pay.plan_key_for_days(180) == "6months" and pay.plan_key_for_days(365) == "1year" and pay.plan_key_for_days(31) == "1month"
+    import types
+    now = datetime.now(timezone.utc)
+    f = [types.SimpleNamespace(name="User", value="<@42>"), types.SimpleNamespace(name="Plan", value="Sigma Pro $270/3months"),
+         types.SimpleNamespace(name="Session", value="x")]
+    msg = types.SimpleNamespace(embeds=[types.SimpleNamespace(title="Plan selected", fields=f)], created_at=now)
+    assert pay._parse_old_card(msg) == (42, 90, 270, now)
+    msg2 = types.SimpleNamespace(embeds=[types.SimpleNamespace(title="Something else", fields=f)], created_at=now)
+    assert pay._parse_old_card(msg2) is None
+
+
+def test_import_apply_uses_preview_and_skips_expired(bot_mod, plans_store, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    now = datetime.now(timezone.utc)
+    state = {"import_preview": {
+        "1": {"name": "A", "plan": "3months", "expires": (now + timedelta(days=40)).isoformat(), "source": "audit log + plan card", "already_expired": False},
+        "2": {"name": "B", "plan": "1month", "expires": (now - timedelta(days=2)).isoformat(), "source": "plan card only", "already_expired": True},
+    }}
+    monkeypatch.setattr(pay, "load_payments", lambda: state)
+    monkeypatch.setattr(pay, "save_payments", lambda d: state.update(d))
+    calls = []
+    async def _act(uid, plan, by, tx=None, usd=None, note="", expires_at=None): calls.append((uid, plan, expires_at is not None))
+    monkeypatch.setattr(pay, "activate", _act)
+    done, skipped = asyncio.run(pay.apply_import("admin"))
+    assert (done, skipped) == (1, 1) and calls == [(1, "3months", True)] and state["import_preview"] == {}
+
+
+# ---------------------------------------------------------------- USDC / USDT on Solana
+
+USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+USDT = "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB"
+
+
+def _spl_tx(amount: float, mint=USDC, owner=WALLET, pre=250.0, err=None):
+    """jsonParsed shape for an SPL transfer: the wallet owns a token account for `mint`; its balance rises by `amount`."""
+    def bal(v):
+        return {"accountIndex": 2, "mint": mint, "owner": owner,
+                "uiTokenAmount": {"uiAmount": v, "uiAmountString": f"{v:.6f}", "decimals": 6, "amount": str(int(round(v * 1e6)))}}
+    return {"transaction": {"message": {"accountKeys": [{"pubkey": "SenderXYZ"}, {"pubkey": "SenderTokenAcct"}, {"pubkey": "OurTokenAcct"},
+                                                        {"pubkey": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"}]}},
+            "meta": {"err": err, "preBalances": [5_000_000_000, 2_039_280, 2_039_280, 1], "postBalances": [4_999_995_000, 2_039_280, 2_039_280, 1],
+                     "preTokenBalances": [bal(pre), {"accountIndex": 1, "mint": mint, "owner": "SenderXYZ", "uiTokenAmount": {"uiAmount": 900, "uiAmountString": "900", "decimals": 6, "amount": "900000000"}}],
+                     "postTokenBalances": [bal(pre + amount), {"accountIndex": 1, "mint": mint, "owner": "SenderXYZ", "uiTokenAmount": {"uiAmount": 900 - amount, "uiAmountString": f"{900 - amount:.6f}", "decimals": 6, "amount": str(int(round((900 - amount) * 1e6)))}}]}}
+
+
+def test_spl_parsing(bot_mod):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    assert pay.received_token(_spl_tx(100.0), WALLET, USDC) == pytest.approx(100.0)
+    assert pay.received_token(_spl_tx(100.0), WALLET, USDT) is None                 # wrong mint
+    assert pay.received_token(_spl_tx(100.0, owner="Someone"), WALLET, USDC) is None  # not our token account
+    assert pay.received_token(_spl_tx(100.0, err={"x": 1}), WALLET, USDC) is None
+    assert pay.received_all(_spl_tx(100.0), WALLET) == [("USDC", 100.0)]            # SOL delta is 0 -> not listed
+    assert pay.received_all(_spl_tx(50.5, mint=USDT), WALLET) == [("USDT", 50.5)]
+    assert pay.received_all(_tx(1.25), WALLET) == [("SOL", 1.25)]
+
+
+def test_stable_amounts_round_first_then_cents(bot_mod):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    taken = set()
+    a = pay.quote_amount(100, 1.0, taken, "USDC"); taken.add(a)
+    assert a == 100.0
+    b = pay.quote_amount(100, 1.0, taken, "USDC"); taken.add(b)
+    assert b == 100.01                                           # second concurrent quote: smallest cents tail
+    c = pay.quote_amount(100, 1.0, set(), "USDT")
+    assert c == 100.0                                            # tokens are separate namespaces (caller passes per-token taken)
+    assert pay.quote_amount(270, 1.0, set(), "USDT") == 270.0
+    assert pay.fmt_amt(100.0, "USDC") == "100.00 USDC" and pay.fmt_amt(100.01, "USDT") == "100.01 USDT" and pay.fmt_amt(0.82611, "SOL") == "0.82611 SOL"
+
+
+def test_match_is_per_token_and_stables_have_no_fee_slack(bot_mod):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    now = datetime.now(timezone.utc)
+    sess = {"u": {"amount": 100.0, "token": "USDC", "created": now.isoformat(), "paid": False},
+            "t": {"amount": 100.0, "token": "USDT", "created": now.isoformat(), "paid": False},
+            "s": {"amount": 100.0, "token": "SOL", "created": now.isoformat(), "paid": False}}
+    assert pay.match_session(sess, 100.0, now, token="USDC") == ("u", "exact")
+    assert pay.match_session(sess, 100.0, now, token="USDT") == ("t", "exact")
+    assert pay.match_session(sess, 100.0, now, token="SOL") == ("s", "exact")
+    assert pay.match_session(sess, 99.99, now, token="USDC") == (None, "")        # no fee slack on stables
+    assert pay.match_session({"s": sess["s"]}, 99.99, now, token="SOL") == ("s", "fee")
+    legacy = {"old": {"amount": 1.5, "created": now.isoformat(), "paid": False}}  # pre-upgrade session has no token key
+    assert pay.match_session(legacy, 1.5, now, token="SOL") == ("old", "exact")
+    assert pay.match_session(legacy, 1.5, now, token="USDC") == (None, "")
+
+
+def test_usdc_payment_end_to_end(bot_mod, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    sessions = {"u": {**_sess(7, 100.0, 100, plan="1month"), "token": "USDC", "sol_price": 1.0},
+                "s": _sess(8, 0.82611, 100, plan="1month")}
+    state, acts, alerts = _env(pay, monkeypatch, sessions)
+    txs = {"sigU": _spl_tx(100.0), "sigS": _tx(0.82611), "sigT": _spl_tx(100.0, mint=USDT)}
+    async def _sigs(limit=25): return ["sigT", "sigS", "sigU"]
+    async def _tx_fetch(sig): return txs[sig]
+    monkeypatch.setattr(pay, "recent_signatures", _sigs)
+    monkeypatch.setattr(pay, "fetch_tx", _tx_fetch)
+    found = asyncio.run(pay._watch_once())
+    assert found == 3
+    assert sorted(acts) == [(7, "1month", "sigU"), (8, "1month", "sigS")]
+    assert state["sessions"]["u"]["paid"] and state["sessions"]["u"]["received"] == 100.0
+    assert len(state["unmatched"]) == 1 and state["unmatched"][0]["token"] == "USDT"   # nobody quoted USDT -> alert, not a grant
+    assert "100.00 USDT" in alerts[0]
+
+
+def test_quote_flow_with_token(bot_mod, plans_store, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    state = {"sessions": {}}
+    monkeypatch.setattr(pay, "SOL_WALLET", WALLET)
+    monkeypatch.setattr(pay, "load_payments", lambda: state)
+    monkeypatch.setattr(pay, "save_payments", lambda d: state.update(d))
+    monkeypatch.setattr(pay, "load_subs", lambda: {})
+    async def _px(): raise AssertionError("stables must not fetch the SOL price")
+    monkeypatch.setattr(pay, "sol_price", _px)
+    async def _lq(s, sid, title): pass
+    monkeypatch.setattr(pay, "log_quote", _lq)
+    import types
+    u = types.SimpleNamespace(id=5, __str__=lambda s: "u5")
+    emb, view = asyncio.run(pay.new_quote(u, "3months", "USDT"))
+    s = next(iter(state["sessions"].values()))
+    assert s["token"] == "USDT" and s["amount"] == 270.0 and "270.00 USDT" in emb.description and "Solana network (SPL)" in emb.description
+    assert "Not Ethereum, not BSC, not Tron" in emb.description
+    with pytest.raises(UserError):
+        asyncio.run(pay.new_quote(u, "3months", "DOGE"))
+    tp = pay.TokenPick("3months")
+    assert [o.value for o in tp.children[0].options] == ["SOL", "USDC", "USDT"] and tp.children[0].custom_id == "sigma:pay:token:3months"
