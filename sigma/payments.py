@@ -286,11 +286,10 @@ def panel_embed() -> discord.Embed:
     e = discord.Embed(title="Sigma Pro - choose your plan", color=NAVY)
     role = f"<@&{SUB_ROLE_ID}>" if SUB_ROLE_ID else "**Sigma Pro**"
     lines = [f"{plan_emote(k)} {plansvc.describe(p, subsvc.seats_left(subs, k))}" for k, p in plansvc.all(enabled_only=True).items()]
-    e.description = (f"Every plan unlocks {role}: live futures and spot setups, the full terminal, results board and monthly journals.\n\n"
+    e.description = (f"Unlocks {role} - live setups, terminal, results board, journals.\n\n"
                      + "\n".join(lines)
-                     + "\n\nPick a plan below, then how you want to pay - SOL, USDC or USDT, all on Solana. "
-                       "You get a private message with the wallet and the exact amount; send it and access switches on by itself once it lands on chain."
-                     + ("\nHave a promo code? Pick a plan first, then tap **Promo code** on your quote." if plansvc.promos() else ""))
+                     + "\n\nPick a plan, pay in SOL, USDC or USDT on Solana, send the exact amount. Access switches on by itself."
+                     + ("\nPromo code? Tap **Promo code** on your quote." if plansvc.promos() else ""))
     try:
         if bot.user and bot.user.display_avatar:
             e.set_thumbnail(url=bot.user.display_avatar.url)
@@ -299,7 +298,7 @@ def panel_embed() -> discord.Embed:
     if _banner_path().exists():
         e.set_image(url="attachment://pay_banner.png")
     try:
-        e.set_footer(text="Sigma Trading · SOL / USDC / USDT on Solana · we never DM you first, never ask for keys",
+        e.set_footer(text="Sigma Trading · we never DM you first, never ask for keys",
                      icon_url=(bot.user.display_avatar.url if bot.user else None))
     except Exception:
         e.set_footer(text="Sigma Trading · payments in SOL")
@@ -352,17 +351,14 @@ class PlanSelect(discord.ui.Select):
             await interaction.followup.send("That plan isn't open right now.", ephemeral=True)
             return
         eff, _ = plansvc.effective_price(p)
-        await interaction.followup.send(f"**{p['label']}** - ${eff:,.0f}. How do you want to pay? All three are on the **Solana** network.",
-                                        view=TokenPick(plan), ephemeral=True)
+        await interaction.followup.send(f"**{p['short']}** · ${eff:,.0f} · Solana", view=TokenPick(plan), ephemeral=True)
 
 
 class TokenSelect(discord.ui.Select):
     def __init__(self, plan: str):
         self.plan = plan
-        opts = [discord.SelectOption(label=tk, value=tk, emoji=cfg["emoji"],
-                                     description=("Native SOL - price locked for 30 min" if tk == "SOL" else f"{tk} on Solana (SPL) - exact dollar amount"))
-                for tk, cfg in PAY_TOKENS.items()]
-        super().__init__(placeholder="Pay with...", options=opts, custom_id=f"sigma:pay:token:{plan}", min_values=1, max_values=1)
+        opts = [discord.SelectOption(label=tk, value=tk) for tk in PAY_TOKENS]      # plain on purpose - no icons, no blurbs
+        super().__init__(placeholder="Pay with", options=opts, custom_id=f"sigma:pay:token:{plan}", min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -509,7 +505,7 @@ async def log_quote(s: dict, sid: str, title: str):
 def quote_embed(s: dict, sid: str) -> discord.Embed:
     p = plansvc.get(s["plan"])
     exp = datetime.fromisoformat(s["created"]) + timedelta(minutes=PAY_SESSION_MIN)
-    e = discord.Embed(title=f"{p['label']} - payment", color=GOLD)
+    e = discord.Embed(title=f"{p['label']} - pay with {s.get('token', 'SOL')}", color=GOLD)
     price_line = f"plan `${s['usd']:,.0f}`" + (f" (list ${s.get('list_usd', p['price']):,.0f} - {', '.join(s['why'])})" if s.get("why") else "")
     token = s.get("token", "SOL")
     if token == "SOL":
