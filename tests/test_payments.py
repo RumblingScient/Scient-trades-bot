@@ -608,14 +608,12 @@ def test_quote_flow_with_token(bot_mod, plans_store, monkeypatch):
     assert [o.value for o in tp.children[0].options] == ["SOL", "USDC", "USDT"] and tp.children[0].custom_id == "sigma:pay:token:3months"
 
 
-def test_select_emojis_are_real_emoji(bot_mod):
-    """A non-emoji character in a SelectOption makes Discord reject the whole message (silent failure)."""
+def test_token_picker_is_plain(bot_mod):
+    """Plain labels only - a non-emoji character in a SelectOption makes Discord reject the whole message."""
     pay = __import__("sigma.payments", fromlist=["x"])
-    import unicodedata
-    for v in pay.TokenPick("1month").children[0].options:
-        em = str(v.emoji)
-        assert em and all(ord(c) > 0x2000 for c in em), em
-        assert unicodedata.category(em[0]) in ("So", "Sk", "Cs") or ord(em[0]) >= 0x1F000, em
+    opts = pay.TokenPick("1month").children[0].options
+    assert [o.label for o in opts] == ["SOL", "USDC", "USDT"]
+    assert all(o.emoji is None and not o.description for o in opts)
 
 
 def test_views_surface_errors(bot_mod):
