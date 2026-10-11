@@ -7,7 +7,7 @@ Remove this module (and its import in bot.py / the shim) in the release after th
     /trade        -> /setup futures      /health        -> /admin health
     /spot         -> /setup spot         /recap_month   -> /admin recap kind:month
     /update       -> /setup update       /journal_month -> /admin recap kind:journal
-    /spot_update  -> /setup update       /tg_send       -> /admin tg
+    /spot_update  -> /setup spot_update  /tg_send       -> /admin tg
     /spot_close   -> /setup close
     /edit         -> /setup edit
     /spot_edit    -> /setup fix
@@ -30,7 +30,7 @@ SETUP_ALIASES = {
     "trade": ("/setup futures", "futures"),
     "spot": ("/setup spot", "spot"),
     "update": ("/setup update", "update"),
-    "spot_update": ("/setup update", "update"),
+    "spot_update": ("/setup spot_update", "spot_update"),
     "spot_close": ("/setup close", "close"),
     "edit": ("/setup edit", "edit"),
     "spot_edit": ("/setup fix", "fix"),

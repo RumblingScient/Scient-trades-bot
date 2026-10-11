@@ -98,9 +98,39 @@ def test_futures_stop_events():
     out = svc.apply_event("fut", t, "SL", price="96")
     assert out.closed and t["result"] == "LOSS" and t["sl_hit"]
     t = fut()
+    with pytest.raises(UserError, match="Entry isn't filled"):
+        svc.apply_event("fut", t, "BE")
+    t = fut(entry1_filled=True)
     svc.apply_event("fut", t, "BE")
+    assert t["sl"] == "100" and t["be"] and t["initial_sl"] == "95"     # the card now shows the stop AT entry
     out = svc.apply_event("fut", t, "SL")   # BE stop = exit at entry
-    assert t["result"] == "BE" and not t["sl_hit"]
+    assert t["result"] == "BE" and t["sl_hit"] and "at entry" in out.desc
+
+
+def test_moving_the_stop_never_changes_r():
+    """TP1 at +2R, then stop trailed above entry: R:R, TP R and the final grade all stay on the posted risk."""
+    from sigma.calculations import display_rr, signed_r, stop_trailed, stop_locked_r
+    t = fut(entry1_filled=True)
+    assert display_rr(t) == "6.0"                      # tp3 130 vs risk 5
+    svc.apply_event("fut", t, "TPN")                   # 50% @ 110 = +2R
+    out = svc.apply_event("fut", t, "SLU", price="102.5")
+    assert t["sl"] == "102.5" and t["initial_sl"] == "95" and not t["be"] and stop_trailed(t)
+    assert display_rr(t) == "6.0" and signed_r(t, 110) == pytest.approx(2.0)   # unchanged
+    assert stop_locked_r(t) == pytest.approx(0.5) and "+0.5R" in out.desc
+    svc.apply_event("fut", t, "SL")                    # trailed stop hit: 50% @ 110 + 50% @ 102.5 -> avg 106.25 -> +1.25R
+    assert t["result"] == "WIN" and t["result_r"] == pytest.approx(1.25) and t["sl_hit"]
+    # stop moved to exactly entry via SLU flags BE too
+    t = fut(entry1_filled=True)
+    svc.apply_event("fut", t, "SLU", price="100")
+    assert t["be"]
+    # legacy record (no initial_sl) picks it up from the live stop on the first move
+    t = fut(entry1_filled=True); t.pop("initial_sl", None)
+    svc.apply_event("fut", t, "BE")
+    assert t["initial_sl"] == "95" and signed_r(t, 110) == pytest.approx(2.0)
+    # /setup edit on the stop is a correction of the posted stop - original risk follows it
+    t = fut(entry1_filled=True)
+    svc.edit("fut", t, {"stop": "90"})
+    assert t["initial_sl"] == "90" and signed_r(t, 110) == pytest.approx(1.0)
 
 
 def test_futures_close_grades_and_partial_math():

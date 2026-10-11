@@ -12,9 +12,9 @@ from datetime import datetime, timezone
 from sigma.config import BLUE, DGREY, GREEN, GREY, RED, SPOT_STATUSES
 from sigma.errors import UserError
 from sigma.calculations import (
-    _is_tp_fill, _sync_tp_flags, entry_num, fills_pct, finalize_close, first_num, fnum,
+    _is_tp_fill, _sync_tp_flags, entry_num, fills_pct, finalize_close, first_num, fnum, initial_sl_num,
     parse_num, parse_sl, parse_spot_split, sl_num, spot_num, spot_ref_entry, spot_signed_r,
-    spot_weighted_entry, spot_zone_projection,
+    spot_weighted_entry, spot_zone_projection, stop_locked_r, stop_trailed,
 )
 
 BE_R_BAND = 0.05      # |R| at or under this = breakeven
@@ -23,21 +23,41 @@ BE_PCT_BAND = 0.5     # spot with no invalidation: |%| at or under this = breake
 FUT_TP_KEYS = ("tp1", "tp2", "tp3", "tp4")
 SPOT_TP_KEYS = ("t1", "t2", "t3")
 
-# (value, label) - the single event list for /setup update, both markets
-EVENTS = [
-    ("EF1",  "Entry filled - futures entry 1"),
-    ("EF2",  "Entry 2 filled - futures DCA"),
-    ("BUY",  "Buy filled - spot: price, pct of the bag (optional)"),
-    ("ZONE", "Zone filled - spot: now holding, price = your real avg entry"),
-    ("TPN",  "Preset TP reached - next planned one, or all up to price"),
-    ("PTP",  "Take profit at a price - any level, needs price + tp_pct"),
-    ("BE",   "Stop to entry - risk-free (futures)"),
-    ("SLU",  "Stop updated - new level or condition (spot: invalidation)"),
-    ("SL",   "Stop hit - closes the trade (futures)"),
-    ("CI",   "Invalidated - never triggered / thesis gone"),
+# (value, label) - event pickers. Futures and spot each get their own list (/setup update, /setup spot_update);
+# apply_event() is still the single code path underneath.
+FUT_EVENTS = [
+    ("EF1",  "Entry filled (DCA: entry 1)"),
+    ("EF2",  "Entry 2 filled - DCA leg, full position live"),
+    ("TPN",  "Preset TP reached - next one, or all up to price"),
+    ("PTP",  "Take profit at a price - needs price + pct"),
+    ("BE",   "Stop to entry - risk-free, R:R stays on the original risk"),
+    ("SLU",  "Stop moved - trail it (price). R:R stays on the original risk"),
+    ("SL",   "Stop hit - closes and grades the trade"),
+    ("CI",   "Invalidated - never triggered"),
     ("UL",   "Undo last take profit"),
     ("RTP",  "Rebuild TP list from recorded fills (repair)"),
 ]
+SPOT_EVENTS = [
+    ("BUY",  "Buy filled - price, pct of the bag (optional)"),
+    ("ZONE", "Zone filled - now holding, price = your real avg entry"),
+    ("TPN",  "Preset target reached - next one, or all up to price"),
+    ("PTP",  "Sold at a price - needs price + pct"),
+    ("SLU",  "Invalidation updated - new level (price)"),
+    ("CI",   "Invalidated - never filled / thesis gone"),
+    ("UL",   "Undo last sell"),
+    ("RTP",  "Rebuild target list from recorded sells (repair)"),
+]
+EVENTS = FUT_EVENTS + [e for e in SPOT_EVENTS if e[0] not in {v for v, _ in FUT_EVENTS}]   # union, for callers that need every value
+
+
+def _num_str(x: float) -> str:
+    return f"{x:.10g}"
+
+
+def _remember_initial_stop(t: dict):
+    """Records without initial_sl (posted before trailing existed) get it from the live stop the first time it moves."""
+    if not t.get("initial_sl") and t.get("sl"):
+        t["initial_sl"] = str(t["sl"])
 
 
 @dataclass
@@ -123,6 +143,7 @@ def build_futures(*, analyst: dict, pair: str, direction: str, entry: str, stop:
         "pair": pair, "direction": direction, "timeframe": timeframe,
         "framework": frameworks[0] if frameworks else None, "frameworks": frameworks, "setup_detail": context,
         "entry": entry, "entry2": entry2, "entry_split": split_disp, "tp_split": tp_plan, "sl": s_num,
+        "initial_sl": s_num,
         "entry_type": "MARKET" if is_market else "LIMIT",
         "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4, "risk": risk or "1", "notes": notes,
         "created_at": _now(),
@@ -337,10 +358,19 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
 
     if ev == "BE":
         if spot:
-            raise UserError("Spot has no stop to move - update the invalidation with **Stop updated** if the thesis changed.")
+            raise UserError("Spot has no stop to move - update the invalidation with **Invalidation updated** if the thesis changed.")
+        if not (t.get("entry1_filled") or t.get("entry2_filled")):
+            raise UserError("Entry isn't filled yet - mark **Entry filled** first, then move the stop to entry.")
+        e = entry_num(t)
+        if e is None:
+            raise UserError("Couldn't read the entry price on this trade - fix it with /setup edit.")
+        _remember_initial_stop(t)
+        t["sl"] = _num_str(e)
+        t["sl_condition"] = None
         t["be"] = True
-        d = "SL moved to entry - trade is risk-free"
-        return Outcome(desc=d, title="Stop to entry", color=GREY, line=d + ".")
+        d = f"SL moved to entry ({fnum(e)}) - trade is risk-free"
+        return Outcome(desc=d, title="Stop to entry", color=GREY,
+                       line=d + f".\nR:R and results stay measured against the original stop ({fnum(initial_sl_num(t))}).")
 
     if ev == "SLU":
         raw = price if price not in (None, "") else None
@@ -353,12 +383,19 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
             t["invalidation"] = str(raw).strip()
             d = f"invalidation -> {t['invalidation']}"
             return Outcome(desc=d, title="Invalidation updated", color=GREY, line=d)
+        _remember_initial_stop(t)
         t["sl"] = s_num
         t["sl_condition"] = s_cond
-        t["be"] = False
+        e = entry_num(t)
+        t["be"] = bool(e is not None and abs(float(s_num) - e) <= 1e-9)
         shown = (s_cond + " " if s_cond else "") + s_num
-        d = "SL updated -> " + shown
-        return Outcome(desc=d, title="Stop updated", color=GREY, line=d)
+        locked = stop_locked_r(t)
+        tail = ""
+        if locked is not None and (t.get("entry1_filled") or t.get("entry2_filled")):
+            tail = f" - locks {locked:+.1f}R" if locked > 0.05 else (" - at entry, risk-free" if abs(locked) <= 0.05 else f" - risk now {locked:+.1f}R")
+        d = "SL moved -> " + shown + tail
+        return Outcome(desc=d, title="Stop moved", color=GREY,
+                       line=d + f"\nR:R and results stay measured against the original stop ({fnum(initial_sl_num(t))}).")
 
     if ev == "SL":
         if spot:
@@ -368,8 +405,9 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
         exit_px = px if px is not None else (entry_num(t) if t.get("be") else sl_num(t))
         if exit_px is None:
             raise UserError("Couldn't read the SL price - pass `price` with this update.")
-        t["sl_hit"] = not t.get("be")
-        return _close_futures(t, exit_px, note, desc="Stopped out - closed")
+        t["sl_hit"] = True
+        where = "at entry" if t.get("be") else ("trailed stop" if stop_trailed(t) else "")
+        return _close_futures(t, exit_px, note, desc="Stopped out" + (f" {where}" if where else "") + " - closed")
 
     if ev == "CI":
         if spot:
@@ -552,8 +590,11 @@ def edit(kind: str, t: dict, fields: dict) -> list:
             e_num, e_cond = parse_sl(v["stop"])
             if not e_num:
                 raise UserError("Couldn't find a price in the stop.")
+            # edit = the posted stop was wrong, so the original risk changes too (a trail goes through /setup update)
             t["sl"] = e_num
+            t["initial_sl"] = e_num
             t["sl_condition"] = e_cond
+            t["be"] = False
             ch.append("stop")
         if v.get("risk") is not None:
             t["risk"] = v["risk"]; ch.append("risk")

@@ -92,8 +92,8 @@ def test_update_preset_tp_flow(bot_mod, env):
     assert it.followup.sent[-1].startswith("Updated: TP1 reached")
 
 
-def test_update_status_only_on_spot(bot_mod, env):
-    cmd = _sub(bot_mod, "update")
+def test_spot_update_status_only(bot_mod, env):
+    cmd = _sub(bot_mod, "spot_update")
     it = FakeInteraction(FakeUser(uid=2), command=cmd)
     asyncio.run(cmd.callback(it, trade="s:22", event=None, price=None, pct=None, status=_choice("HOLDING"), note=None))
     assert env["spots"]["22"]["status"] == "HOLDING" and env["calls"]["feed"][0][0] == "Status updated"
@@ -102,12 +102,42 @@ def test_update_status_only_on_spot(bot_mod, env):
     assert it.followup.sent[-1].startswith("Pick an **event**")
 
 
-def test_update_refuses_other_analysts_trade(bot_mod, env):
+def test_update_commands_are_market_specific(bot_mod, env):
+    """/setup update is futures only, /setup spot_update is spot only - a mismatched pick is refused before anything changes."""
     cmd = _sub(bot_mod, "update")
-    it = FakeInteraction(FakeUser(uid=1), command=cmd)
+    it = FakeInteraction(FakeUser(uid=2), command=cmd)
     asyncio.run(cmd.callback(it, trade="s:22", event=_choice("TPN"), price=None, pct=None, note=None))
+    assert "/setup spot_update" in it.followup.sent[-1] and env["spots"]["22"]["sells"] == []
+    cmd = _sub(bot_mod, "spot_update")
+    it = FakeInteraction(FakeUser(uid=1), command=cmd)
+    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("TPN"), price=None, pct=None, status=None, note=None))
+    assert "/setup update" in it.followup.sent[-1] and env["trades"]["11"]["fills"] == []
+    assert env["calls"]["card"] == 0
+
+
+def test_update_refuses_other_analysts_trade(bot_mod, env):
+    cmd = _sub(bot_mod, "spot_update")
+    it = FakeInteraction(FakeUser(uid=1), command=cmd)
+    asyncio.run(cmd.callback(it, trade="s:22", event=_choice("TPN"), price=None, pct=None, status=None, note=None))
     assert "Only the analyst who posted" in it.followup.sent[-1]
     assert env["spots"]["22"]["sells"] == [] and env["calls"]["card"] == 0
+
+
+def test_update_be_shows_on_card_after_tp(bot_mod, env):
+    """TP1 taken, then stop to entry: the card's stop field and status both say so; R:R stays on the posted risk."""
+    cmd = _sub(bot_mod, "update")
+    it = FakeInteraction(FakeUser(uid=1), command=cmd)
+    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("EF1"), price=None, pct=None, note=None))
+    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("TPN"), price=None, pct=None, note=None))
+    rr_before = bot_mod.display_rr(env["trades"]["11"])
+    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("BE"), price=None, pct=None, note=None))
+    t = env["trades"]["11"]
+    assert t["be"] and t["sl"] == t["entry"] and bot_mod.display_rr(t) == rr_before
+    e = bot_mod.build_embed(t)
+    f = {x.name: x.value for x in e.fields}
+    assert "at entry - risk-free" in f["Stop Loss"] and "initial" in f["Stop Loss"]
+    assert f["Status"].startswith("TP1 HIT") and "SL at entry" in f["Status"]
+    assert env["calls"]["feed"][-1][0] == "Stop to entry"
 
 
 def test_non_analyst_is_gated_before_defer(bot_mod, env):

@@ -1,7 +1,8 @@
 """sigma.commands_setup - the /setup group: everything an analyst does to a trade.
 
     /setup futures | spot        post a new setup / play
-    /setup update                one event list for both markets
+    /setup update                futures events: fills, TPs, stop to entry / trailed, stop hit
+    /setup spot_update           spot events: buys, zone filled, targets, invalidation, phase
     /setup close                 price only - the bot grades WIN / LOSS / BE
     /setup edit                  card-field typos (window) + spot avg entry / status
     /setup fix                   remove or correct a recorded take profit / buy, any time
@@ -176,6 +177,19 @@ async def open_futures_ac(interaction: discord.Interaction, current: str):
     return [app_commands.Choice(name=lbl[:100], value=val) for _, lbl, val in rows[:25]]
 
 
+async def open_spot_ac(interaction: discord.Interaction, current: str):
+    uid = None if _is_admin(interaction) else interaction.user.id
+    rows = []
+    for kind, key, rec in store.open_records(uid):
+        if kind != store.SPOT:
+            continue
+        label = _ac_label(rec, spot=True)
+        if current.lower() in label.lower():
+            rows.append((_ac_sortkey(rec, spot=True, uid=interaction.user.id), label, store.make_id(kind, key)))
+    rows.sort(key=lambda r: r[0])
+    return [app_commands.Choice(name=lbl[:100], value=val) for _, lbl, val in rows[:25]]
+
+
 async def closed_own_ac(interaction: discord.Interaction, current: str):
     uid = None if _is_admin(interaction) else interaction.user.id
     rows = []
@@ -197,16 +211,16 @@ _FW = [app_commands.Choice(name=f, value=f) for f in FRAMEWORKS]
 @app_commands.describe(
     pair="Pair, e.g. BTC or BTC/USDT",
     direction="Long or Short",
-    entry="Entry price. With entry2 this is Entry 1",
+    entry_type="Limit = one order. Market = filled now. DCA = two entries (give entry2)",
+    entry="Entry price. For DCA this is Entry 1",
     stop="Stop level - a number (63000) or a condition (4h close below 63000)",
+    entry2="DCA only - Entry 2 price",
+    entry_split="DCA only - size split, e.g. 20/80 - blank = 50/50",
     tp1="Take-profit 1 price. R:R is calculated for you",
     tp2="Take-profit 2 price",
     tp3="Take-profit 3 price",
     tp4="Take-profit 4 price",
-    tp_split="Planned % to close at each TP, e.g. 25/50/25 - blank = you give tp_pct on each update",
-    entry_type="Blank = Limit. Market = filled now. Giving entry2 makes it DCA automatically",
-    entry2="Entry 2 price - makes the setup DCA",
-    entry_split="DCA size split, e.g. 20/80 - blank = 50/50",
+    tp_split="Planned % to close at each TP, e.g. 25/50/25 - blank = you give pct on each update",
     risk="Account risk %, just the number - blank = 1",
     timeframe="Setup timeframe, e.g. 4H",
     framework="Setup framework",
@@ -218,14 +232,16 @@ _FW = [app_commands.Choice(name=f, value=f) for f in FRAMEWORKS]
 @app_commands.choices(
     direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")],
     entry_type=[
-        app_commands.Choice(name="Limit - one order, fills when price gets there (default)", value="LIMIT"),
+        app_commands.Choice(name="Limit - one order, fills when price gets there", value="LIMIT"),
         app_commands.Choice(name="Market - filled now", value="MARKET"),
+        app_commands.Choice(name="DCA - two entries, fill entry2 (and entry_split)", value="DCA"),
     ],
     framework=_FW, framework2=_FW,
 )
-async def setup_futures(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str], entry: str, stop: str,
+async def setup_futures(interaction: discord.Interaction, pair: str, direction: app_commands.Choice[str],
+                        entry_type: app_commands.Choice[str], entry: str, stop: str,
+                        entry2: str = None, entry_split: str = None,
                         tp1: str = None, tp2: str = None, tp3: str = None, tp4: str = None, tp_split: str = None,
-                        entry_type: app_commands.Choice[str] = None, entry2: str = None, entry_split: str = None,
                         risk: str = None, timeframe: str = None, framework: app_commands.Choice[str] = None,
                         framework2: app_commands.Choice[str] = None, context: str = None,
                         chart: discord.Attachment = None, notes: str = None):
@@ -233,10 +249,12 @@ async def setup_futures(interaction: discord.Interaction, pair: str, direction: 
         return
 
     async def body():
+        if entry_type.value != "DCA" and entry2:
+            raise UserError("You gave **entry2** but the entry type isn't DCA - pick **DCA** as the entry type, or drop entry2.")
         rec = svc.build_futures(
             analyst=_analyst_ctx(interaction.user), pair=pair, direction=direction.value, entry=entry, stop=stop,
             tp1=tp1, tp2=tp2, tp3=tp3, tp4=tp4, tp_split=tp_split,
-            entry_type=(entry_type.value if entry_type else None), entry2=entry2, entry_split=entry_split,
+            entry_type=entry_type.value, entry2=entry2, entry_split=entry_split,
             risk=risk or "1", timeframe=timeframe,
             frameworks=[f.value for f in (framework, framework2) if f], context=context, notes=notes)
         msg, channel = await _post_card(interaction, rec, TRADES_CHANNEL_ID, False, chart,
@@ -297,33 +315,63 @@ async def setup_spot(interaction: discord.Interaction, pair: str, zone: str, tp1
 
 # ----------------------------------------------------------------------------- update / close
 
-@setup.command(name="update", description="Log what happened on a live trade - fills, take profits, stop moves, invalidation")
+@setup.command(name="update", description="Futures - log what happened: entry filled, take profits, stop to entry / trailed, stop hit")
 @app_commands.describe(
-    trade="Pick the trade",
+    trade="Pick the futures setup",
     event="What happened",
-    price="The price it happened at - TP, stop move, spot buy, real avg entry on zone filled. Blank = preset level",
-    pct="Take profit: % of the position closed (blank = planned %). Spot buy: % of the bag (blank = equal buys)",
-    status="Spot only - change the phase by hand (Watching / Accumulating / Holding / Trimmed / Distributing)",
+    price="Price it happened at - TP fill, new stop level. Blank = the preset level",
+    pct="Take profit: % of the position closed at this level (blank = planned % from the card)",
+    note="Note - shown in the update and the thread",
+)
+@app_commands.choices(event=[app_commands.Choice(name=n, value=v) for v, n in svc.FUT_EVENTS])
+@app_commands.autocomplete(trade=open_futures_ac)
+@_with_state_lock
+async def setup_update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str],
+                       price: str = None, pct: str = None, note: str = None):
+    if not await _gate(interaction):
+        return
+
+    async def body():
+        kind, key, rec, data = store.find(trade)
+        if kind == store.SPOT:
+            raise UserError("That's a spot play - use **/setup spot_update** for it.")
+        _own(interaction, rec)
+        if rec.get("closed"):
+            raise UserError("That trade is closed. **/setup reopen** it first if the close was wrong.")
+        out = svc.apply_event(kind, rec, event.value, price=price, pct=pct, note=note)
+        await _finish(interaction, kind, key, rec, data, out, note)
+    await _run(interaction, body())
+
+
+@setup.command(name="spot_update", description="Spot - log what happened: buys, zone filled, targets sold, invalidation, phase")
+@app_commands.describe(
+    trade="Pick the spot play",
+    event="What happened",
+    price="Price it happened at - buy price, sell price, real avg entry on zone filled, new invalidation level",
+    pct="Sell: % of the bag sold (blank = planned %). Buy: % of the planned bag this buy was (optional)",
+    status="Change the phase by hand (Watching / Accumulating / Holding / Trimmed / Distributing)",
     note="Note - shown in the update and the thread",
 )
 @app_commands.choices(
-    event=[app_commands.Choice(name=n, value=v) for v, n in svc.EVENTS],
+    event=[app_commands.Choice(name=n, value=v) for v, n in svc.SPOT_EVENTS],
     status=[app_commands.Choice(name=s.capitalize(), value=s) for s in SPOT_STATUSES],
 )
-@app_commands.autocomplete(trade=open_any_ac)
+@app_commands.autocomplete(trade=open_spot_ac)
 @_with_state_lock
-async def setup_update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str] = None,
-                       price: str = None, pct: str = None, status: app_commands.Choice[str] = None, note: str = None):
+async def setup_spot_update(interaction: discord.Interaction, trade: str, event: app_commands.Choice[str] = None,
+                            price: str = None, pct: str = None, status: app_commands.Choice[str] = None, note: str = None):
     if not await _gate(interaction):
         return
 
     async def body():
         if event is None and status is None:
-            raise UserError("Pick an **event**, or a **status** for a spot play.")
+            raise UserError("Pick an **event**, or a **status**.")
         kind, key, rec, data = store.find(trade)
+        if kind != store.SPOT:
+            raise UserError("That's a futures setup - use **/setup update** for it.")
         _own(interaction, rec)
         if rec.get("closed"):
-            raise UserError("That trade is closed. **/setup reopen** it first if the close was wrong.")
+            raise UserError("That play is closed. **/setup reopen** it first if the close was wrong.")
         if event is not None:
             out = svc.apply_event(kind, rec, event.value, price=price, pct=pct, note=note)
             if status is not None and not out.closed:
@@ -411,7 +459,7 @@ async def setup_edit(interaction: discord.Interaction, trade: str, pair: str = N
                   "avg_entry": avg_entry, "status": status.value if status else None, "chart": chart, "notes": notes}
         state_only = {k for k, v in fields.items() if v is not None} <= {"avg_entry", "status", "notes"}
         if not _is_admin(interaction) and not state_only and not within_edit_window(rec):
-            raise UserError(f"Edit window ({EDIT_WINDOW_MIN // 60}h) has passed. Use **/setup update** for what happened since, "
+            raise UserError(f"Edit window ({EDIT_WINDOW_MIN // 60}h) has passed. Use **/setup update** (or **/setup spot_update**) for what happened since, "
                             f"**/setup fix** for a wrong fill, or ask an admin.")
         changes = svc.edit(kind, rec, fields)
         data[key] = rec
@@ -500,7 +548,7 @@ async def setup_track(interaction: discord.Interaction, trade: str, mode: app_co
     async def body():
         kind, key, rec, data = store.find(trade)
         if kind == store.SPOT:
-            raise UserError("Spot plays aren't auto-tracked - log buys and TPs with /setup update.")
+            raise UserError("Spot plays aren't auto-tracked - log buys and sells with /setup spot_update.")
         _own(interaction, rec)
         txt = svc.set_tracking(rec, mode.value == "on")
         data[key] = rec

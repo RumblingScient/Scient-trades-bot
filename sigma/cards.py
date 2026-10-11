@@ -11,7 +11,25 @@ import logging, logging.handlers, builtins, time as _time, traceback as _tb
 import functools as _functools
 from sigma.config import EDIT_WINDOW_MIN, GUILD_ID, IST, NAVY, TRADE_UPDATES_CHANNEL_ID
 from sigma.core import bot
-from sigma.calculations import _tp_presets, _tp_taken, any_entry_filled, display_rr, entry_num, fills_pct, fmt_frameworks, fmt_risk, fnum, signed_r, spot_pct_text, spot_result_r, spot_signed_r, spot_status_line, spot_zone_projection, tf
+from sigma.calculations import (_tp_presets, _tp_taken, any_entry_filled, display_rr, entry_num, fills_pct, fmt_frameworks,
+                                fmt_risk, fnum, initial_sl_num, signed_r, sl_num, spot_pct_text, spot_result_r, spot_signed_r,
+                                spot_status_line, spot_zone_projection, stop_locked_r, stop_trailed, tf)
+
+
+def stop_state(t: dict) -> str:
+    """Short phrase for a moved stop: 'at entry - risk-free' / 'trailed, +0.5R locked' / ''."""
+    if t.get("closed") or not stop_trailed(t):
+        return ""
+    if t.get("be"):
+        return "at entry - risk-free"
+    locked = stop_locked_r(t)
+    if locked is None:
+        return "trailed"
+    if locked > 0.05:
+        return f"trailed, {locked:+.1f}R locked"
+    if locked < -0.05:
+        return f"trailed, risk {locked:+.1f}R"
+    return "at entry - risk-free"
 
 
 _EMO_CACHE: dict = {}
@@ -96,36 +114,31 @@ def full_status(t: dict) -> str:
         }.get(t.get("result"), "CLOSED")
     closed_pct = fills_pct(t)
     pct_txt = f" - {closed_pct:g}% closed" if closed_pct > 0 else ""
-    if t.get("tp4_hit"):
-        return f"TP4 HIT{pct_txt}"
-    if t.get("tp3_hit"):
-        return f"TP3 HIT{pct_txt}"
-    if t.get("tp2_hit"):
-        return f"TP2 HIT{pct_txt}"
-    if t.get("tp1_hit"):
-        return f"TP1 HIT{pct_txt}"
-    if t.get("be"):
-        return "SL AT ENTRY - RISK-FREE" + pct_txt
+    stop_txt = stop_state(t)
+    stop_txt = f" · SL {stop_txt}" if stop_txt else ""
+    for n in (4, 3, 2, 1):
+        if t.get(f"tp{n}_hit"):
+            return f"TP{n} HIT{pct_txt}{stop_txt}"
     if t.get("entry2") and t.get("entry1_filled") and not t.get("entry2_filled"):
-        return "ACTIVE - Entry 1 filled, DCA pending"
+        return "ACTIVE - Entry 1 filled, DCA pending" + stop_txt
     if any_entry_filled(t):
-        return "ACTIVE" + pct_txt
+        return "ACTIVE" + pct_txt + stop_txt
     return "PENDING - waiting for fill"
 
 def short_status(t: dict) -> str:
-    if t.get("tp4_hit"):
-        return "TP4"
-    if t.get("tp3_hit"):
-        return "TP3"
-    if t.get("tp2_hit"):
-        return "TP2"
-    if t.get("tp1_hit"):
-        return "TP1"
+    base = "Pending"
+    for n in (4, 3, 2, 1):
+        if t.get(f"tp{n}_hit"):
+            base = f"TP{n}"
+            break
+    else:
+        if any_entry_filled(t):
+            base = "Active"
     if t.get("be"):
-        return "BE"
-    if any_entry_filled(t):
-        return "Active"
-    return "Pending"
+        return base + " · BE"
+    if stop_trailed(t) and not t.get("closed"):
+        return base + " · trailed"
+    return base
 
 def jump_url(t: dict) -> str:
     return f"https://discord.com/channels/{GUILD_ID}/{t['channel_id']}/{t['message_id']}"
@@ -170,7 +183,13 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
 
     sl_mark = f" {emo('invalid', '')}(hit)" if t.get("sl_hit") else ""
     type_label = "Market" if t.get("entry_type") == "MARKET" else "Limit"
-    sl_val = f"{(t.get('sl_condition') + ' ') if t.get('sl_condition') else ''}{t['sl']}{sl_mark}"
+    sl_shown = fnum(sl_num(t)) if sl_num(t) is not None else str(t.get("sl"))
+    sl_val = f"{(t.get('sl_condition') + ' ') if t.get('sl_condition') else ''}{sl_shown}{sl_mark}"
+    if stop_trailed(t):
+        # the live stop moved - say so, and keep the posted stop visible because R is measured from it
+        st = stop_state(t)
+        sl_val += f"\n{st}\n" if st else "\n"
+        sl_val += f"initial {fnum(initial_sl_num(t))}"
 
     # Row 1: three inline columns - Entry | Stop Loss | Risk / R:R
     entry_val = entry_display(t) or "-"

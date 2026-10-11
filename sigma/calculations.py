@@ -75,11 +75,28 @@ def entry_num(t):
 def sl_num(t):
     return first_num(t.get("sl"))
 
+def initial_sl_num(t):
+    """The stop the setup was posted with. R is always measured against this one - moving the stop
+    later (to entry, trailing) protects the trade, it does not change what 1R was."""
+    if t.get("initial_sl"):
+        return first_num(t.get("initial_sl"))
+    return sl_num(t)
+
+def stop_trailed(t) -> bool:
+    """True once the live stop differs from the posted one (stop to entry counts)."""
+    cur, ini = sl_num(t), initial_sl_num(t)
+    return cur is not None and ini is not None and abs(cur - ini) > 1e-12
+
 def risk_per_unit(t):
-    e, s = entry_num(t), sl_num(t)
+    e, s = entry_num(t), initial_sl_num(t)
     if e is None or s is None or e == s:
         return None
     return abs(e - s)
+
+def stop_locked_r(t):
+    """R the current stop guarantees if it gets hit (+0.5 = half an R locked in). None if unknown."""
+    s = sl_num(t)
+    return signed_r(t, s) if s is not None else None
 
 def signed_r(t, price):
     e = entry_num(t)
