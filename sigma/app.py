@@ -34,14 +34,24 @@ async def on_ready():
     guild = discord.Object(id=GUILD_ID)
     bot.tree.copy_global_to(guild=guild)
     bot.tree.on_error = on_app_command_error
-    await bot.tree.sync(guild=guild)
+    # a failed sync must not abort the rest of boot (loops, panels, subs reminders kept running before this guard)
+    sync_state = "ok"
+    try:
+        await bot.tree.sync(guild=guild)
+    except Exception as ex:
+        sync_state = "FAILED"
+        log.error(f"[boot] COMMAND SYNC FAILED - Discord is serving the previous command list: {ex}")
+        try:
+            await ops_alert(f"command sync failed on boot - members see the OLD commands until this is fixed: {str(ex)[:300]}", key="sync")
+        except Exception:
+            pass
     for nm, lp in _loops():
         if not getattr(lp, "_sigma_healed", False):
             _self_heal(lp, nm); lp._sigma_healed = True
     probs = _validate_startup()
     if probs:
         await ops_alert("startup problems: " + "; ".join(probs), key="startup")
-    log.info(f"[boot] ready - ops_channel={'set' if OPS_CHANNEL_ID else 'unset'}, corrupt={sorted(_CORRUPT) or 'none'}")
+    log.info(f"[boot] ready - sync={sync_state}, ops_channel={'set' if OPS_CHANNEL_ID else 'unset'}, corrupt={sorted(_CORRUPT) or 'none'}")
     bot.add_view(FollowPanel())
     bot.add_view(PaymentPanel())
     for _pk in _plansvc.all():
@@ -76,4 +86,4 @@ async def on_ready():
     # tg_digest_loop disabled - TG updates are manual now via /tg_send
     if TG_NEWS_CHANNELS and not tg_sources_loop.is_running():
         tg_sources_loop.start()
-    print(f"Logged in as {bot.user} - commands synced.")
+    print(f"Logged in as {bot.user} - commands {'synced' if sync_state == 'ok' else 'NOT synced (see error above)'}.")

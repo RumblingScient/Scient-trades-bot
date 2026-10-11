@@ -207,27 +207,46 @@ async def closed_own_ac(interaction: discord.Interaction, current: str):
 _FW = [app_commands.Choice(name=f, value=f) for f in FRAMEWORKS]
 
 
+async def framework_ac(interaction: discord.Interaction, current: str):
+    """Framework picker for /setup edit - autocomplete instead of choices keeps the /setup group under Discord's 8000-char cap."""
+    cur = current.lower()
+    return [app_commands.Choice(name=f, value=f) for f in FRAMEWORKS if cur in f.lower()][:25]
+
+
+def _framework_value(text):
+    """Typed framework -> canonical name from the list (case-insensitive). Blank stays blank."""
+    if text is None:
+        return None
+    t = str(text).strip()
+    if not t:
+        return ""
+    for f in FRAMEWORKS:
+        if f.lower() == t.lower():
+            return f
+    raise UserError(f"Unknown framework `{t}` - pick one from the list.")
+
+
 @setup.command(name="futures", description="Post a futures setup")
 @app_commands.describe(
     pair="Pair, e.g. BTC or BTC/USDT",
     direction="Long or Short",
-    entry_type="Limit = one order. Market = filled now. DCA = two entries (give entry2)",
+    entry_type="Limit / Market / DCA (two entries - give entry2)",
     entry="Entry price. For DCA this is Entry 1",
-    stop="Stop level - a number (63000) or a condition (4h close below 63000)",
+    stop="Stop - a number (63000) or a condition (4h close below 63000)",
     entry2="DCA only - Entry 2 price",
     entry_split="DCA only - size split, e.g. 20/80 - blank = 50/50",
     tp1="Take-profit 1 price. R:R is calculated for you",
     tp2="Take-profit 2 price",
     tp3="Take-profit 3 price",
     tp4="Take-profit 4 price",
-    tp_split="Planned % to close at each TP, e.g. 25/50/25 - blank = you give pct on each update",
+    tp_split="Planned % per TP, e.g. 25/50/25 - blank = give pct on each update",
     risk="Account risk %, just the number - blank = 1",
     timeframe="Setup timeframe, e.g. 4H",
     framework="Setup framework",
     framework2="Second framework, if the setup uses two",
-    context="One line of specifics, e.g. sweep + reclaim of range low - shown on the card",
+    context="One line of specifics, shown on the card - e.g. sweep + reclaim of range low",
     chart="Chart image",
-    notes="Reasoning - posted in the trade thread, not on the card",
+    notes="Reasoning - posted in the thread, not on the card",
 )
 @app_commands.choices(
     direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")],
@@ -279,9 +298,9 @@ async def setup_futures(interaction: discord.Interaction, pair: str, direction: 
     tp2="Take-profit 2 price",
     tp3="Take-profit 3 price",
     tp_split="Planned % to sell at each TP, e.g. 30/30/40 - under 100 leaves a moonbag",
-    stop="Invalidation - level that kills the thesis, e.g. Weekly close below 48. Spot R is measured from it",
+    stop="Invalidation - level that kills the thesis, e.g. Weekly close below 48. R is measured from it",
     avg_entry="Average entry so far - give it if you're already partly or fully in",
-    play_type="Blank = Fresh (or Scaling when avg_entry is given). Filled = position built, now holding",
+    play_type="Blank = Fresh, or Scaling when avg_entry is given. Filled = position built",
     allocation="Suggested portfolio allocation %, just the number",
     horizon="Expected hold, e.g. 3-6 months",
     chart="Chart image",
@@ -422,27 +441,26 @@ async def setup_close(interaction: discord.Interaction, trade: str, price: str =
     tp4="Take-profit 4 - futures",
     tp_split="Planned % per TP e.g. 25/50/25 - a space clears it",
     timeframe="Timeframe - futures",
-    framework="Framework - futures",
+    framework="Framework - futures (pick from the list)",
     framework2="Second framework - futures",
     context="Setup context line - futures",
-    avg_entry="Spot: set the average entry by hand (no time limit)",
-    status="Spot: phase, only if the auto status is wrong (no time limit)",
+    avg_entry="Spot: set the average entry by hand",
+    status="Spot: phase, if the auto status is wrong",
     chart="Replacement chart image",
     notes="Reasoning / thesis - posted in the thread",
 )
 @app_commands.choices(
     direction=[app_commands.Choice(name="Long", value="LONG"), app_commands.Choice(name="Short", value="SHORT")],
     entry_type=[app_commands.Choice(name="Market - filled now", value="MARKET"), app_commands.Choice(name="Limit", value="LIMIT")],
-    framework=_FW, framework2=_FW,
     status=[app_commands.Choice(name=s.capitalize(), value=s) for s in SPOT_STATUSES],
 )
-@app_commands.autocomplete(trade=open_any_ac)
+@app_commands.autocomplete(trade=open_any_ac, framework=framework_ac, framework2=framework_ac)
 @_with_state_lock
 async def setup_edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None,
                      entry_type: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, entry_split: str = None,
                      stop: str = None, risk: str = None, tp1: str = None, tp2: str = None, tp3: str = None, tp4: str = None,
-                     tp_split: str = None, timeframe: str = None, framework: app_commands.Choice[str] = None,
-                     framework2: app_commands.Choice[str] = None, context: str = None, avg_entry: str = None,
+                     tp_split: str = None, timeframe: str = None, framework: str = None,
+                     framework2: str = None, context: str = None, avg_entry: str = None,
                      status: app_commands.Choice[str] = None, chart: discord.Attachment = None, notes: str = None):
     if not await _gate(interaction):
         return
@@ -454,8 +472,8 @@ async def setup_edit(interaction: discord.Interaction, trade: str, pair: str = N
         fields = {"pair": pair, "direction": direction.value if direction else None,
                   "entry_type": entry_type.value if entry_type else None, "entry": entry, "entry2": entry2,
                   "entry_split": entry_split, "stop": stop, "risk": risk, "tp1": tp1, "tp2": tp2, "tp3": tp3, "tp4": tp4,
-                  "tp_split": tp_split, "timeframe": timeframe, "framework": framework.value if framework else None,
-                  "framework2": framework2.value if framework2 else None, "context": context,
+                  "tp_split": tp_split, "timeframe": timeframe, "framework": _framework_value(framework),
+                  "framework2": _framework_value(framework2), "context": context,
                   "avg_entry": avg_entry, "status": status.value if status else None, "chart": chart, "notes": notes}
         state_only = {k for k, v in fields.items() if v is not None} <= {"avg_entry", "status", "notes"}
         if not _is_admin(interaction) and not state_only and not within_edit_window(rec):

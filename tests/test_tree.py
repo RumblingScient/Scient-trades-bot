@@ -77,3 +77,17 @@ def test_discord_limits(tree):
             assert len(p.choices or []) <= 25
             for ch in p.choices or []:
                 assert len(ch.name) <= 100, f"{c.qualified_name}.{p.name}: {ch.name}"
+
+
+def _size(d):
+    n = len(d.get("name") or "") + len(d.get("description") or "")
+    n += sum(_size(o) for o in (d.get("options") or []))
+    n += sum(len(str(c.get("name", ""))) + len(str(c.get("value", ""))) for c in (d.get("choices") or []))
+    return n
+
+
+def test_total_size_under_discord_cap(tree):
+    """Discord refuses the whole sync (HTTP 400 50035 'Command exceeds maximum size (8000)') when one top-level
+    command's names + descriptions + choices pass 8000 chars - subcommands included. Keep headroom."""
+    for c in tree.get_commands():
+        assert _size(c.to_dict(tree)) <= 7600, f"/{c.name} is {_size(c.to_dict(tree))} chars - trim descriptions or move choices to autocomplete"

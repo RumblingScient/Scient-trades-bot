@@ -29,7 +29,7 @@ for must in ("open", "recent", "stats", "results", "help", "setup", "admin"):
 def _group(nm):
     g = next((c for c in cmds if c.name == nm), None)
     return {s.name for s in getattr(g, "commands", []) or []}
-check("/setup subcommands", _group("setup") == {"futures","spot","update","close","edit","fix","track","reopen","xpost","referrals"}, str(sorted(_group("setup"))))
+check("/setup subcommands", _group("setup") == {"futures","spot","update","spot_update","close","edit","fix","track","reopen","xpost","referrals"}, str(sorted(_group("setup"))))
 check("/admin subcommands", _group("admin") >= {"health","terminal_check","board","results","override","recap","tg","panel","grant","revoke","subs","members","plans","promo","import"}, str(sorted(_group("admin"))))
 _adm = next((c for c in cmds if c.name == "admin"), None)
 check("/admin hidden from members", _adm is not None and _adm.default_permissions is not None and _adm.default_permissions.administrator)
@@ -54,6 +54,16 @@ for c in _walk_cmds(cmds):
     if len(getattr(c, "parameters", []) or []) > 25: lim_bad.append(f"/{c.name} >25 params")
 check("Discord limits (names/descriptions/choices)", not lim_bad, ("; ".join(lim_bad[:5]) if lim_bad else ""))
 check("command count <= 100", len(cmds) <= 100, f"({len(cmds)})")
+# 8000-char cap per top-level command (names + descriptions + choice names/values, subcommands included)
+def _cmd_size(d):
+    n = len(d.get("name") or "") + len(d.get("description") or "")
+    n += sum(_cmd_size(o) for o in (d.get("options") or []))
+    n += sum(len(str(ch.get("name", ""))) + len(str(ch.get("value", ""))) for ch in (d.get("choices") or []))
+    return n
+_sizes = {c.name: _cmd_size(c.to_dict(m.bot.tree)) for c in cmds}
+_too_big = {k: v for k, v in _sizes.items() if v > 7600}
+check("every command under Discord's 8000-char cap (7600 with headroom)", not _too_big,
+      ", ".join(f"/{k}={v}" for k, v in _too_big.items()) or f"largest: /{max(_sizes, key=_sizes.get)}={max(_sizes.values())}")
 
 
 t = {"direction":"LONG","entry":"100","sl":"95","fills":[{"price":110,"pct":50,"label":"TP1"}]}
