@@ -112,6 +112,12 @@ def _select(view, row):
     return next(i for i in view.children if isinstance(i, (discord.ui.Select, discord.ui.UserSelect)) and i.row == row)
 
 
+def _confirm(view, env):
+    import discord
+    b = next(i for i in view.children if isinstance(i, discord.ui.Button) and i.label.startswith("\u2714 Confirm"))
+    asyncio.run(b.callback(FakeInteraction(FakeUser(), env["guild"])))
+
+
 def _submit(it, env, vals):
     modal = it.response.modal
     assert modal is not None, "expected a popup"
@@ -182,6 +188,8 @@ def test_plans_section_edit_discount_toggle_add_remove(env):
     _submit(it3, env, {"pct": "25", "until": ""})
     assert env["plans"].get("1month")["discount_pct"] == 25 and "$90" in view.last
     asyncio.run(_btn(view, "Disable").callback(FakeInteraction(FakeUser(), env["guild"])))
+    assert env["plans"].get("1month")["enabled"] is True and view.pending           # waits for Confirm
+    _confirm(view, env)
     assert env["plans"].get("1month")["enabled"] is False and "Enable" in _labels(view)
     it4 = FakeInteraction(FakeUser(), env["guild"])
     asyncio.run(_btn(view, "Add plan").callback(it4))
@@ -214,6 +222,7 @@ def test_promos_add_remove_and_settle(env):
     r = env["plans"].promos()["TEN"]
     assert r["usd"] == 10 and r["uses_left"] == 5 and r["plans"] == ["1month"] and r.get("until")
     asyncio.run(_btn(view, "Remove selected").callback(FakeInteraction(FakeUser(), env["guild"])))
+    _confirm(view, env)
     assert "TEN" not in env["plans"].promos() and "SIGMA-OWAIS" in env["plans"].promos()
     # payouts + settle
     asyncio.run(_btn(view, "Payouts").callback(FakeInteraction(FakeUser(), env["guild"])))

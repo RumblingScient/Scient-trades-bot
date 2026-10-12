@@ -14,7 +14,7 @@ from sigma.core import bot
 from sigma.calculations import (_tp_presets, _tp_taken, any_entry_filled, display_rr, entry_num, fills_pct, fmt_frameworks,
                                 fmt_risk, fnum, initial_sl_num, signed_r, sl_num, spot_pct_text, spot_result_r, spot_signed_r,
                                 spot_status_line, spot_zone_projection, stop_locked_r, stop_trailed, tf,
-                                banked_r, first_num, progress_bar, spot_inv_num, spot_num)
+                                banked_r, first_num, progress_bar, risk_per_unit, spot_inv_num, spot_num)
 
 
 def stop_state(t: dict) -> str:
@@ -196,46 +196,94 @@ def _chips(items) -> str:
     return " ".join(f"`{x}`" for x in items if x)
 
 
+def targets_inline(t: dict, spot: bool = False) -> str:
+    """One line: ✅ 104,000 +1.3R (40%) · ○ 108,000 +2.7R (30%) · ○ 112,000 +4.0R (30%)"""
+    taken = _tp_taken(t, spot)
+    presets = _tp_presets(t, spot)
+    tick = emo("tracked", "\u2705")
+    pxf = (lambda v: f"{v:g}") if spot else fnum
+    parts = []
+    for f in taken:
+        px = f["price"]
+        if spot:
+            extra = spot_pct_text(t, px).strip()
+            rr = spot_signed_r(t, px)
+            extra = (f"{rr:+.1f}R" if rr is not None else extra)
+        else:
+            r = signed_r(t, px)
+            extra = f"{r:+.1f}R" if r is not None else ""
+        parts.append(f"{tick} {pxf(px)} {extra} ({f['pct']:g}%)".replace("  ", " "))
+    for _i, k, px, planned in presets:
+        if t.get(f"{k}_hit"):
+            continue
+        if spot:
+            extra = spot_pct_text(t, px).strip()
+        else:
+            r = signed_r(t, px)
+            extra = f"{r:+.1f}R" if r is not None else ""
+        ptxt = f" ({planned:g}%)" if planned is not None else ""
+        parts.append(f"\u25cb {pxf(px)} {extra}{ptxt}".replace("  ", " "))
+    return " \u00b7 ".join(parts)
+
+
+def next_target(t: dict, spot: bool = False):
+    """(label, price, extra) of the first pending preset, or None."""
+    for i, k, px, planned in _tp_presets(t, spot):
+        if t.get(f"{k}_hit"):
+            continue
+        if spot:
+            extra = spot_pct_text(t, px).strip()
+        else:
+            r = signed_r(t, px)
+            extra = f"{r:+.1f}R" if r is not None else ""
+        bits = [f"TP{i + 1}", extra] + ([f"{planned:g}%"] if planned is not None else [])
+        return (" \u00b7 ".join(b for b in bits if b), px)
+    return None
+
+
 def build_embed(t: dict, image_url: str = None) -> discord.Embed:
+    """Dashboard card: chips + progress on top, Entry | Stop | Next, targets on one line, setup."""
     is_long = t["direction"] == "LONG"
     closed = t.get("closed")
     result = t.get("result")
     arrow = "\u25b2 LONG" if is_long else "\u25bc SHORT"
     tftxt = tf(t)
     prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "") if closed else ""
-    title = f"{prefix}{arrow} {t['pair'].upper()}" + (f" \u00b7 {tftxt}" if tftxt else "") + f" \u2014 {full_status(t)}"
+    title = f"{prefix}{arrow} {t['pair'].upper()}" + (f" \u00b7 {tftxt}" if tftxt else "")
     embed = discord.Embed(title=title[:256], color=card_color(t))
 
-    # KPI chips + progress (description)
     rr = display_rr(t)
-    chips = [f"R:R {rr}" if rr else None, f"risk {fmt_risk(t.get('risk')) or '1%'}"]
-    br = banked_r(t)
+    chips = []
     if closed:
         r = t.get("result_r")
-        chips.insert(0, f"result {r:+.2f}R" if isinstance(r, (int, float)) else None)
-        if t.get("avg_exit") is not None:
-            chips.append(f"avg exit {fnum(t['avg_exit'])}")
-    else:
+        chips.append(f"result {r:+.2f}R" if isinstance(r, (int, float)) else {"INVALID": "invalidated"}.get(result, "closed"))
+    chips += [f"R:R {rr}" if rr else None, f"risk {fmt_risk(t.get('risk')) or '1%'}"]
+    if not closed:
+        br = banked_r(t)
         if br is not None and abs(br) > 0.005:
             chips.append(f"{br:+.1f}R banked")
         st = stop_state(t)
         if st:
             chips.append("stop " + (st.split(" - ")[0] if st.startswith("at entry") else st.replace("trailed, ", "")))
         if not any_entry_filled(t):
-            chips.append("limit \u00b7 waiting for fill" if t.get("entry_type") != "MARKET" else "market")
+            chips.append("waiting for fill" if t.get("entry_type") != "MARKET" else "market")
+        elif t.get("entry2") and not t.get("entry2_filled"):
+            chips.append("entry 1 filled \u00b7 DCA pending")
     desc = _chips(chips)
     closed_pct = fills_pct(t)
     n_tp = len(_tp_presets(t))
     hit = next((n for n in (4, 3, 2, 1) if t.get(f"tp{n}_hit")), 0)
     if closed or closed_pct > 0:
         bar = progress_bar(100 if closed else closed_pct)
-        tail = f"{closed_pct:g}% closed" if not closed else "position closed"
+        tail = "position closed" if closed else f"{closed_pct:g}% closed"
         if hit and n_tp:
             tail += f" \u00b7 TP{hit} of {n_tp}"
         desc += f"\n{bar} {tail}"
+    elif any_entry_filled(t) and n_tp:
+        desc += f"\n{progress_bar(0)} live \u00b7 0 of {n_tp} targets"
     embed.description = desc
 
-    # Entry | Stop
+    # Entry | Stop | Next
     type_label = "market" if t.get("entry_type") == "MARKET" else "limit"
     e1 = first_num(t.get("entry"))
     e2 = first_num(t.get("entry2")) if t.get("entry2") else None
@@ -252,26 +300,34 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
         entry_val += f"\n{sub}"
     else:
         entry_val = fnum(e1) if e1 is not None else str(t.get("entry"))
-        if not closed:
-            entry_val += f"\n{type_label} \u00b7 {'filled' if t.get('entry1_filled') else 'pending'}"
-        else:
-            entry_val += f"\n{type_label}"
+        entry_val += f"\n{type_label} \u00b7 {'filled' if t.get('entry1_filled') else 'pending'}" if not closed else f"\n{type_label}"
     embed.add_field(name="Entry", value=entry_val, inline=True)
 
     sl_shown = fnum(sl_num(t)) if sl_num(t) is not None else str(t.get("sl"))
     sl_val = f"{(t.get('sl_condition') + ' ') if t.get('sl_condition') else ''}{sl_shown}"
     if t.get("sl_hit"):
-        sl_val += f" {emo('invalid', '')}(hit)"
+        sl_val += " (hit)"
     if stop_trailed(t):
         st = stop_state(t)
-        if st and not closed:
-            sl_val += f" \u00b7 {st.split(' - ')[0] if st.startswith('at entry') else st}"
-        sl_val += f"\nposted {fnum(initial_sl_num(t))}"
+        sub = ("at entry" if (st.startswith("at entry") or t.get("be")) else "trailed") if not closed else "final"
+        sl_val += f"\n{sub} \u00b7 posted {fnum(initial_sl_num(t))}"
+    else:
+        rpu = risk_per_unit(t)
+        sl_val += f"\n1R = {fnum(rpu)}" if rpu else "\nposted"
     embed.add_field(name="Stop", value=sl_val, inline=True)
 
-    _tpt = unified_tp_text(t)
-    if _tpt:
-        embed.add_field(name="Targets", value=_tpt[:1020], inline=False)
+    if closed:
+        ax = t.get("avg_exit")
+        nxt_name, nxt_val = "Exit", (f"{fnum(ax)}\navg exit" if ax is not None else "-")
+    else:
+        nt = next_target(t)
+        nxt_name = "Next"
+        nxt_val = f"{fnum(nt[1])}\n{nt[0]}" if nt else "-\nall targets hit"
+    embed.add_field(name=nxt_name, value=nxt_val, inline=True)
+
+    tl = targets_inline(t)
+    if tl:
+        embed.add_field(name="Targets", value=tl[:1020], inline=False)
 
     fw = fmt_frameworks(t)
     if t.get("setup_detail"):
@@ -292,25 +348,17 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
     closed = p.get("closed")
     result = p.get("result")
     prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "") if closed else ""
-    status = spot_status_line(p)
-    if not closed:
-        status = status.replace(" - ", " \u00b7 ").capitalize()
-        status = status.replace("Target", "target")
-    else:
-        status = {"WIN": f"closed {p.get('result_pct') or ''}".strip(), "LOSS": f"closed {p.get('result_pct') or ''}".strip(),
-                  "BE": "closed breakeven", "INVALID": "invalidated"}.get(result, "closed")
-    title = f"{prefix}\u25c6 SPOT {p['pair'].upper()} \u2014 {status}"
+    title = f"{prefix}\u25c6 SPOT {p['pair'].upper()}"
     embed = discord.Embed(title=title[:256], color=card_color(p, spot=True))
 
     chips = []
     if closed:
         _rr = spot_result_r(p)
-        if p.get("result_pct"):
-            chips.append(f"result {p['result_pct']}")
+        chips.append(f"result {p['result_pct']}" if p.get("result_pct") else {"INVALID": "invalidated"}.get(result, "closed"))
         if _rr is not None:
             chips.append(f"{_rr:+.2f}R")
-        if p.get("avg_exit"):
-            chips.append(f"avg exit {p['avg_exit']}")
+    else:
+        chips.append((p.get("status") or "accumulating").lower())
     if p.get("allocation"):
         chips.append(f"alloc {fmt_risk(p['allocation'])}")
     if p.get("horizon"):
@@ -325,24 +373,28 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
         if top and n_t:
             tail += f" \u00b7 target {top} of {n_t}"
         desc += f"\n{bar} {tail}"
+    elif (p.get("zone_filled") or (p.get("buys") or [])) and n_t:
+        desc += f"\n{progress_bar(0)} holding \u00b7 0 of {n_t} targets"
     embed.description = desc
 
     zone_val = str(p.get("dca_zone") or "-")
-    if not closed:
-        zone_val += "\n" + ("filled" if p.get("zone_filled") else "bidding")
-    embed.add_field(name="Zone", value=zone_val, inline=True)
-    if p.get("invalidation"):
-        embed.add_field(name="Invalidation", value=str(p["invalidation"]), inline=True)
-    avg_val = str(p.get("avg_entry") or "")
-    if not avg_val and not p.get("zone_filled") and not closed:
+    if p.get("avg_entry"):
+        zone_val += f"\navg {p['avg_entry']}"
+    elif not closed and not p.get("zone_filled"):
         proj = spot_zone_projection(p)
-        if proj:
-            avg_val = f"\u2248 {proj:g}\nif the zone fills"
-    if avg_val:
-        embed.add_field(name="Avg entry", value=avg_val, inline=True)
-    _spt = unified_tp_text(p, spot=True)
-    if _spt:
-        embed.add_field(name="Targets", value=_spt[:1020], inline=False)
+        zone_val += f"\nif it fills \u2248 {proj:g}" if proj else "\nbidding"
+    elif not closed:
+        zone_val += "\nfilled"
+    embed.add_field(name="Zone", value=zone_val, inline=True)
+    embed.add_field(name="Invalidation", value=str(p.get("invalidation") or "-"), inline=True)
+    if closed:
+        embed.add_field(name="Exit", value=(f"{p['avg_exit']}\navg exit" if p.get("avg_exit") else "-"), inline=True)
+    else:
+        nt = next_target(p, spot=True)
+        embed.add_field(name="Next", value=(f"{nt[1]:g}\n{nt[0].replace('TP', 'T')}" if nt else "-\nall targets hit"), inline=True)
+    tl = targets_inline(p, spot=True)
+    if tl:
+        embed.add_field(name="Targets", value=tl[:1020], inline=False)
     if closed and p.get("close_note"):
         embed.add_field(name="Note", value=p["close_note"][:1020], inline=False)
 

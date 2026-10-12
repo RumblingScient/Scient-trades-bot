@@ -74,6 +74,7 @@ class Desk(discord.ui.View):
         self.kind, self.key = kind, key
         self.spot = kind == store.SPOT
         self.last = ""
+        self.pending = None          # (label, coroutine factory) - an instant action waiting for Confirm
         self.rebuild()
 
     # ---- state
@@ -137,6 +138,11 @@ class Desk(discord.ui.View):
         try:
             t = self.rec()
         except UserError:
+            return
+        if self.pending:
+            label, _fn = self.pending
+            self._btn(f"\u2714 Confirm: {label}"[:80], self.on_confirm, discord.ButtonStyle.success, row=0)
+            self._btn("\u2716 Cancel", self.on_cancel, discord.ButtonStyle.secondary, row=0)
             return
         closed = bool(t.get("closed"))
         if closed:
@@ -224,11 +230,35 @@ class Desk(discord.ui.View):
     def _form(self, title, fields, on_ok):
         return Form(title, fields, on_ok)
 
+    async def _ask(self, interaction, label: str, what: str, run):
+        """Instant actions (no popup) park here first: the panel shows Confirm / Cancel, nothing changes until Confirm."""
+        self.pending = (label, run)
+        self.last = f"**{label}** - {what}\nPress Confirm to apply, Cancel to keep the trade as it is."
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        await self._refresh(interaction)
+
+    async def on_confirm(self, interaction):
+        if not self.pending:
+            await self._refresh(interaction); return
+        _label, run = self.pending
+        self.pending = None
+        await run(interaction)
+
+    async def on_cancel(self, interaction):
+        self.pending = None
+        self.last = "Cancelled - nothing changed."
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        await self._refresh(interaction)
+
     # ---- futures actions
     async def on_entry(self, interaction):
         t = self.rec()
         ev = "EF2" if (t.get("entry2") and t.get("entry1_filled") and not t.get("entry2_filled")) else "EF1"
-        await self._event(interaction, ev)
+        label = "Entry 2 filled" if ev == "EF2" else "Entry filled"
+        await self._ask(interaction, label, "marks the entry as filled and announces it in the update feed.",
+                        lambda i: self._event(i, ev))
 
     async def on_tp(self, interaction):
         t = self.rec()
@@ -252,7 +282,8 @@ class Desk(discord.ui.View):
         ], ok))
 
     async def on_be(self, interaction):
-        await self._event(interaction, "BE")
+        await self._ask(interaction, "Stop to entry", "moves the stop to the entry price - the trade becomes risk-free.",
+                        lambda i: self._event(i, "BE"))
 
     async def on_trail(self, interaction):
         async def ok(i, v):
@@ -394,21 +425,30 @@ class Desk(discord.ui.View):
         if val == "reopen":
             async def run(kind, key, rec, data):
                 return await actions.reopen_trade(kind, key, rec, data)
-            await self._apply(interaction, run); return
+            await self._ask(interaction, "Reopen", "reverses the close, deletes the results card and rebuilds the summary.",
+                            lambda i: self._apply(i, run)); return
         if val in ("ci", "ul", "rtp"):
-            await self._event(interaction, val.upper()); return
+            what = {"ci": "closes the trade as never triggered / thesis gone - it goes to results as Invalidated.",
+                    "ul": "removes the last recorded take profit.",
+                    "rtp": "re-derives the TP ticks from the recorded fills (repair only)."}[val]
+            label = {"ci": "Invalidated", "ul": "Undo last take profit", "rtp": "Rebuild TP list"}[val]
+            await self._ask(interaction, label, what, lambda i, ev=val.upper(): self._event(i, ev)); return
         if val.startswith("st:"):
             async def run(kind, key, rec, data):
                 out = svc.set_status(kind, rec, val[3:])
                 return await actions.commit(kind, key, rec, data, out)
-            await self._apply(interaction, run); return
+            await self._ask(interaction, f"Phase: {val[3:].capitalize()}", "changes the phase shown on the card and posts it to the feed.",
+                            lambda i: self._apply(i, run)); return
         if val == "track":
             async def run(kind, key, rec, data):
                 txt = svc.set_tracking(rec, bool(rec.get("watch_disabled")))
                 data[key] = rec
                 store.save(kind, data)
                 return f"Auto-tracking {txt}"
-            await self._apply(interaction, run); return
+            t = self.rec()
+            await self._ask(interaction, "Tracking " + ("ON" if t.get("watch_disabled") else "OFF"),
+                            "re-arms the price tracker for this setup." if t.get("watch_disabled") else "stops the tracker - fills and stops by hand only.",
+                            lambda i: self._apply(i, run)); return
         if val == "inv":
             async def ok(i, v):
                 await self._event(i, "SLU", price=v["level"], note=(v["note"] or None))

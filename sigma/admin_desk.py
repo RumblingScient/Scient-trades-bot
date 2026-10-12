@@ -158,6 +158,7 @@ class AdminDesk(discord.ui.View):
         self.plan_key = None
         self.promo_code = None
         self.last = ""
+        self.pending = None
         self.rebuild()
 
     # ---- rendering
@@ -183,6 +184,11 @@ class AdminDesk(discord.ui.View):
 
     def rebuild(self):
         self.clear_items()
+        if self.pending:
+            label, _fn = self.pending
+            self._btn(f"\u2714 Confirm: {label}"[:80], self.on_confirm, discord.ButtonStyle.success, row=0)
+            self._btn("\u2716 Cancel", self.on_cancel, discord.ButtonStyle.secondary, row=0)
+            return
         for key, label in TABS:
             active = self.section is None and self.tab == key
             b = discord.ui.Button(label=label, style=(discord.ButtonStyle.primary if active else discord.ButtonStyle.secondary), row=0)
@@ -282,6 +288,23 @@ class AdminDesk(discord.ui.View):
         except Exception as ex:
             print(f"[admin-desk] action error: {ex!r}", flush=True)
             self.last = "⚠ Something broke - check the logs."
+        await self._show(interaction)
+
+    async def _ask(self, interaction, label, what, run):
+        self.pending = (label, run)
+        self.last = f"**{label}** - {what}\nPress Confirm to apply, Cancel to leave it."
+        await self._show(interaction)
+
+    async def on_confirm(self, interaction):
+        if not self.pending:
+            await self._show(interaction); return
+        _l, run = self.pending
+        self.pending = None
+        await run(interaction)
+
+    async def on_cancel(self, interaction):
+        self.pending = None
+        self.last = "Cancelled - nothing changed."
         await self._show(interaction)
 
     async def _log(self, text, color=None):
@@ -443,6 +466,8 @@ class AdminDesk(discord.ui.View):
     async def on_plan_toggle(self, interaction):
         key = self.plan_key
         who = interaction.user.display_name
+        p0 = plansvc.all().get(key) or {}
+        turning_on = not p0.get("enabled", True)
 
         async def run():
             from sigma.payments import refresh_panel
@@ -455,7 +480,9 @@ class AdminDesk(discord.ui.View):
             msg = f"**{pp['short']}** {'enabled' if on else 'disabled'}."
             await self._log(f"**Plans** - {who}: {msg}")
             return msg
-        await self._apply(interaction, run)
+        await self._ask(interaction, f"{'Enable' if turning_on else 'Disable'} {p0.get('short', key)}",
+                        "shows it on the payment panel again." if turning_on else "hides it from the payment panel - existing members keep access.",
+                        lambda i: self._apply(i, run))
 
     async def on_plan_remove(self, interaction):
         key = self.plan_key
@@ -564,7 +591,8 @@ class AdminDesk(discord.ui.View):
             msg = f"Code **{r['code']}** removed."
             await self._log(f"**Promo** - {who}: {msg}")
             return msg
-        await self._apply(interaction, run)
+        await self._ask(interaction, f"Remove code {code}", "the code stops working immediately; past payments with it stay recorded.",
+                        lambda i: self._apply(i, run))
 
     # ---- unrecorded bulk tools (staff - Analyst role / admins - are always skipped)
     async def on_bulk_grant(self, interaction):

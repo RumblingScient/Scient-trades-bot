@@ -98,6 +98,33 @@ def _select(view):
     return next(i for i in view.children if isinstance(i, discord.ui.Select))
 
 
+def _confirm(view, user=None):
+    """Instant actions park behind Confirm - press it (as the given user)."""
+    import discord
+    b = next(i for i in view.children if isinstance(i, discord.ui.Button) and i.label.startswith("\u2714 Confirm"))
+    it = FakeInteraction(user or FakeUser(uid=1))
+    asyncio.run(b.callback(it))
+    return it
+
+
+def _click(view, label, user=None):
+    """Click a button; if it asks for confirmation, confirm it too."""
+    it = FakeInteraction(user or FakeUser(uid=1))
+    asyncio.run(_button(view, label).callback(it))
+    if view.pending:
+        return _confirm(view, user)
+    return it
+
+
+def _pick(view, value, user=None):
+    """Pick a More... option; confirm if asked."""
+    it = FakeInteraction(user or FakeUser(uid=1), values=[value])
+    asyncio.run(_select(view).callback(it))
+    if view.pending:
+        return _confirm(view, user)
+    return it
+
+
 def _submit(it, vals):
     """The popup the last click opened, answered with vals."""
     modal = it.response.modal
@@ -130,13 +157,18 @@ def test_futures_buttons_follow_state(env):
     it2 = FakeInteraction(FakeUser(uid=1))
     asyncio.run(_button(view, "Entry filled").callback(it2))
     t = env["trades"]["11"]
-    assert t["entry1_filled"] and it2.response.deferred and it2.edits and env["calls"]["feed"][-1][0] == "Entry filled"
+    assert not t["entry1_filled"] and view.pending and it2.edits              # parked behind Confirm, nothing changed yet
+    assert [b.label for b in view.children][0].startswith("\u2714 Confirm: Entry filled")
+    asyncio.run(_button(view, "\u2716 Cancel").callback(FakeInteraction(FakeUser(uid=1))))
+    assert not view.pending and not t["entry1_filled"] and view.last.startswith("Cancelled")
+    it2 = _click(view, "Entry filled")
+    assert t["entry1_filled"] and it2.edits and env["calls"]["feed"][-1][0] == "Entry filled"
     assert _button(view, "Entry filled").disabled and not _button(view, "TP hit").disabled    # panel re-rendered
 
 
 def test_futures_tp_be_trail_close_flow(env):
     it, view = _panel(env, "fut", "11", FakeUser(uid=1))
-    asyncio.run(_button(view, "Entry filled").callback(FakeInteraction(FakeUser(uid=1))))
+    _click(view, "Entry filled")
     # TP hit popup is pre-filled with the next preset + planned %
     it2 = FakeInteraction(FakeUser(uid=1))
     asyncio.run(_button(view, "TP hit").callback(it2))
@@ -147,7 +179,7 @@ def test_futures_tp_be_trail_close_flow(env):
     assert t["tp1_hit"] and t["fills"][0] == {"price": 110.0, "pct": 50.0, "label": "TP1"}
     assert env["calls"]["feed"][-1][0] == "TP1 reached" and "> clean" in env["calls"]["feed"][-1][1]
     # stop to entry - one click, shows on the panel and the card data
-    asyncio.run(_button(view, "Stop to entry").callback(FakeInteraction(FakeUser(uid=1))))
+    _click(view, "Stop to entry")
     assert t["be"] and t["sl"] == "100" and t["initial_sl"] == "95" and _button(view, "Stop to entry").disabled
     assert "at entry" in view.embed().description
     # trail above entry - R:R unchanged
@@ -177,7 +209,7 @@ def test_futures_tp_be_trail_close_flow(env):
 
 def test_futures_stopped_out_and_more(env):
     it, view = _panel(env, "fut", "11", FakeUser(uid=1))
-    asyncio.run(_button(view, "Entry filled").callback(FakeInteraction(FakeUser(uid=1))))
+    _click(view, "Entry filled")
     it2 = FakeInteraction(FakeUser(uid=1))
     asyncio.run(_button(view, "Stopped out").callback(it2))
     assert it2.response.modal.inputs["price"].default == "95"
@@ -190,19 +222,18 @@ def test_more_menu_invalidated_undo_track(env):
     it, view = _panel(env, "fut", "11", FakeUser(uid=1))
     vals = [o.value for o in _select(view).options]
     assert vals == ["ci", "ul", "fix", "track", "rtp"]
-    sel = _select(view)
-    asyncio.run(sel.callback(FakeInteraction(FakeUser(uid=1), values=["track"])))
+    _pick(view, "track")
     assert env["trades"]["11"]["watch_disabled"] is True and "OFF" in view.last
-    asyncio.run(sel.callback(FakeInteraction(FakeUser(uid=1), values=["ul"])))
-    assert view.last.startswith("⚠ Nothing to undo")
-    asyncio.run(_select(view).callback(FakeInteraction(FakeUser(uid=1), values=["ci"])))
+    _pick(view, "ul")
+    assert view.last.startswith("\u26a0 Nothing to undo")
+    _pick(view, "ci")
     t = env["trades"]["11"]
     assert t["closed"] and t["result"] == "INVALID" and env["calls"]["feed"][-1][0] == "Invalidated"
 
 
 def test_fix_a_fill_from_panel(env):
     it, view = _panel(env, "fut", "11", FakeUser(uid=1))
-    asyncio.run(_button(view, "Entry filled").callback(FakeInteraction(FakeUser(uid=1))))
+    _click(view, "Entry filled")
     it2 = FakeInteraction(FakeUser(uid=1))
     asyncio.run(_button(view, "TP hit").callback(it2))
     _submit(it2, {"price": "110", "pct": "50", "note": ""})
@@ -245,8 +276,7 @@ def test_spot_panel_flow(env):
     _submit(it2, {"price": "1.0", "pct": "", "note": ""})
     p = env["spots"]["22"]
     assert p["buys"][-1]["price"] == 1.0 and p["avg_entry"] == "1.05" and env["calls"]["feed"][-1][0] == "Buy filled"
-    sel = _select(view)
-    asyncio.run(sel.callback(FakeInteraction(FakeUser(uid=2), values=["st:HOLDING"])))
+    _pick(view, "st:HOLDING", FakeUser(uid=2))
     assert p["status"] == "HOLDING" and env["calls"]["feed"][-1][0] == "Status updated"
     it3 = FakeInteraction(FakeUser(uid=2))
     asyncio.run(_button(view, "Sold").callback(it3))
