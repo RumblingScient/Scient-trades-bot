@@ -89,7 +89,7 @@ def build_trades_csv(trades: list, analyst_name: str) -> io.BytesIO:
     buf = io.StringIO()
     w = _csv.writer(buf)
     w.writerow(["date", "analyst", "pair", "direction", "timeframe", "entry_type",
-                "entry", "entry2", "sl", "risk_pct", "tp1", "tp2", "tp3", "tp4",
+                "entry", "entry2", "sl", "final_sl", "risk_pct", "tp1", "tp2", "tp3", "tp4",
                 "fills", "avg_exit", "result", "result_r", "status", "frameworks", "edited"])
     for t in trades:
         fills = "; ".join(f"{f.get('label','')}@{f.get('price','')}x{f.get('pct','')}%" for f in t.get("fills", []) or [])
@@ -98,7 +98,7 @@ def build_trades_csv(trades: list, analyst_name: str) -> io.BytesIO:
         w.writerow([
             created[:10], analyst_name, t.get("pair", ""), t.get("direction", ""),
             t.get("timeframe", ""), t.get("entry_type", ""),
-            t.get("entry", ""), t.get("entry2", ""), t.get("sl", ""), t.get("risk", ""),
+            t.get("entry", ""), t.get("entry2", ""), t.get("initial_sl") or t.get("sl", ""), t.get("sl", ""), t.get("risk", ""),
             t.get("tp1", ""), t.get("tp2", ""), t.get("tp3", ""), t.get("tp4", ""),
             fills, t.get("avg_exit", ""), t.get("result", ""), t.get("result_r", ""),
             status, " + ".join(t.get("frameworks", []) or []), "yes" if t.get("edited") else "",

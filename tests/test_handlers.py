@@ -1,4 +1,5 @@
-"""/setup handlers end to end with a fake Interaction: gate -> service -> save -> refresh -> feed -> reply."""
+"""The Manage panel (sigma.desk) and /setup edit end to end with a fake Interaction:
+gate -> button / popup -> service -> save -> card refresh -> board -> feed -> thread -> panel re-render."""
 import asyncio
 import types
 import pytest
@@ -22,10 +23,11 @@ class FakeUser:
 
 
 class FakeResponse:
-    def __init__(self): self.sent = []; self.deferred = False
-    async def send_message(self, msg, **kw): self.sent.append(msg)
+    def __init__(self): self.sent = []; self.deferred = False; self.modal = None; self.kw = {}
+    async def send_message(self, msg=None, **kw): self.sent.append(msg); self.kw = kw
+    async def send_modal(self, modal): self.modal = modal
     async def defer(self, **kw): self.deferred = True
-    def is_done(self): return self.deferred or bool(self.sent)
+    def is_done(self): return self.deferred or bool(self.sent) or self.modal is not None
 
 
 class FakeFollowup:
@@ -34,25 +36,31 @@ class FakeFollowup:
 
 
 class FakeInteraction:
-    def __init__(self, user, command=None):
+    def __init__(self, user, command=None, values=None):
         self.user = user
         self.response = FakeResponse()
         self.followup = FakeFollowup()
         self.command = command
+        self.data = {"values": values or []}
+        self.edits = []
+    async def edit_original_response(self, **kw): self.edits.append(kw)
 
 
 @pytest.fixture
 def env(bot_mod, monkeypatch):
     """In-memory stores + silenced Discord side effects. Returns a dict to inspect."""
     from sigma.services import store
-    import sigma.commands_setup as cs
-    trades = {"11": {"direction": "LONG", "entry": "100", "sl": "95", "tp1": "110", "tp2": "120", "tp_split": [50, 50],
+    import sigma.actions as ac
+    import sigma.desk as desk
+    trades = {"11": {"direction": "LONG", "entry": "100", "sl": "95", "initial_sl": "95", "tp1": "110", "tp2": "120", "tp_split": [50, 50],
                      "fills": [], "closed": False, "analyst_id": 1, "analyst_name": "Scient", "pair": "BTC",
-                     "channel_id": 1, "message_id": 11, "entry1_filled": False, "tp1_hit": False, "tp2_hit": False, "be": False}}
-    spots = {"22": {"kind": "spot", "pair": "FET", "avg_entry": "1.1", "invalidation": "0.9", "t1": "1.5", "t2": "2.0",
+                     "channel_id": 1, "message_id": 11, "entry1_filled": False, "tp1_hit": False, "tp2_hit": False, "be": False,
+                     "created_at": "2099-01-01T00:00:00+00:00"}}
+    spots = {"22": {"kind": "spot", "pair": "FET", "dca_zone": "1.2 - 1.0", "avg_entry": "1.1", "invalidation": "0.9", "t1": "1.5", "t2": "2.0",
                     "tp_split": [50, 50], "t1_hit": False, "t2_hit": False, "t3_hit": False, "sells": [],
                     "buys": [{"price": 1.1, "pct": None}], "closed": False, "analyst_id": 2, "analyst_name": "Owais",
-                    "channel_id": 1, "message_id": 22, "status": "ACCUMULATING", "zone_filled": False}}
+                    "channel_id": 1, "message_id": 22, "status": "ACCUMULATING", "zone_filled": False,
+                    "created_at": "2099-01-01T00:00:00+00:00"}}
     calls = {"feed": [], "thread": [], "card": 0, "board": 0, "results": 0}
     monkeypatch.setattr(store, "load_trades", lambda: trades)
     monkeypatch.setattr(store, "load_spot", lambda: spots)
@@ -64,137 +72,249 @@ def env(bot_mod, monkeypatch):
     async def _feed(rec, title, color, line, footer=None): calls["feed"].append((title, line, footer))
     async def _thread(rec, text): calls["thread"].append(text)
     async def _results(): calls["results"] += 1
-    monkeypatch.setattr(cs, "refresh_and_edit", _card)
-    monkeypatch.setattr(cs, "refresh_board", _board)
-    monkeypatch.setattr(cs, "post_update_feed", _feed)
-    monkeypatch.setattr(cs, "thread_note", _thread)
-    monkeypatch.setattr(cs, "_results_watch_tick", _results)
-    return {"trades": trades, "spots": spots, "calls": calls, "cs": cs}
+    for mod in (ac,):
+        monkeypatch.setattr(mod, "refresh_and_edit", _card)
+        monkeypatch.setattr(mod, "refresh_board", _board)
+        monkeypatch.setattr(mod, "post_update_feed", _feed)
+        monkeypatch.setattr(mod, "thread_note", _thread)
+        monkeypatch.setattr(mod, "_results_watch_tick", _results)
+    return {"trades": trades, "spots": spots, "calls": calls, "desk": desk, "ac": ac}
 
 
-def _sub(bot_mod, name):
-    g = next(c for c in bot_mod.bot.tree.get_commands() if c.name == "setup")
-    return next(s for s in g.commands if s.name == name)
+def _panel(env, kind, key, user):
+    """Open the Manage panel as `user`; returns (interaction, view)."""
+    it = FakeInteraction(user)
+    asyncio.run(env["desk"].open_panel(it, kind, key))
+    return it, it.response.kw.get("view")
 
 
-def _choice(value):
-    return types.SimpleNamespace(value=value, name=value)
+def _button(view, label):
+    import discord
+    return next(i for i in view.children if isinstance(i, discord.ui.Button) and i.label == label)
 
 
-def test_update_preset_tp_flow(bot_mod, env):
-    cmd = _sub(bot_mod, "update")
-    it = FakeInteraction(FakeUser(uid=1), command=cmd)
-    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("TPN"), price=None, pct=None, note="clean"))
+def _select(view):
+    import discord
+    return next(i for i in view.children if isinstance(i, discord.ui.Select))
+
+
+def _submit(it, vals):
+    """The popup the last click opened, answered with vals."""
+    modal = it.response.modal
+    assert modal is not None, "expected a popup"
+    it2 = FakeInteraction(it.user)
+    asyncio.run(modal.on_ok(it2, {k: vals.get(k, "") for k in modal.inputs}))
+    return it2
+
+
+# ----------------------------------------------------------------------------- gate
+
+def test_panel_gate(env):
+    it, view = _panel(env, "fut", "11", FakeUser(uid=5, analyst=False))
+    assert view is None and "Analyst controls" in it.response.sent[0]
+    it, view = _panel(env, "fut", "11", FakeUser(uid=2))          # another analyst
+    assert view is None and "Only the analyst who posted" in it.response.sent[0]
+    it, view = _panel(env, "fut", "11", FakeUser(uid=99, admin=True))
+    assert view is not None and it.response.kw.get("ephemeral") is True
+    it, view = _panel(env, "fut", "404", FakeUser(uid=1))
+    assert view is None and "isn't in the log" in it.response.sent[0]
+
+
+# ----------------------------------------------------------------------------- futures
+
+def test_futures_buttons_follow_state(env):
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    labels = [b.label for b in view.children if hasattr(b, "label")]
+    assert labels == ["Entry filled", "TP hit", "Stop to entry", "Trail stop", "Stopped out", "Close", "Edit"]
+    assert _button(view, "TP hit").disabled and _button(view, "Stop to entry").disabled and not _button(view, "Entry filled").disabled
+    it2 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "Entry filled").callback(it2))
     t = env["trades"]["11"]
-    assert it.response.deferred and t["tp1_hit"] and t["fills"][0]["pct"] == 50.0
-    assert env["calls"]["card"] == 1 and env["calls"]["board"] == 1
-    assert env["calls"]["feed"][0][0] == "TP1 reached" and "> clean" in env["calls"]["feed"][0][1]
-    assert it.followup.sent[-1].startswith("Updated: TP1 reached")
+    assert t["entry1_filled"] and it2.response.deferred and it2.edits and env["calls"]["feed"][-1][0] == "Entry filled"
+    assert _button(view, "Entry filled").disabled and not _button(view, "TP hit").disabled    # panel re-rendered
 
 
-def test_spot_update_status_only(bot_mod, env):
-    cmd = _sub(bot_mod, "spot_update")
-    it = FakeInteraction(FakeUser(uid=2), command=cmd)
-    asyncio.run(cmd.callback(it, trade="s:22", event=None, price=None, pct=None, status=_choice("HOLDING"), note=None))
-    assert env["spots"]["22"]["status"] == "HOLDING" and env["calls"]["feed"][0][0] == "Status updated"
-    it = FakeInteraction(FakeUser(uid=2), command=cmd)
-    asyncio.run(cmd.callback(it, trade="s:22", event=None, price=None, pct=None, status=None, note=None))
-    assert it.followup.sent[-1].startswith("Pick an **event**")
-
-
-def test_update_commands_are_market_specific(bot_mod, env):
-    """/setup update is futures only, /setup spot_update is spot only - a mismatched pick is refused before anything changes."""
-    cmd = _sub(bot_mod, "update")
-    it = FakeInteraction(FakeUser(uid=2), command=cmd)
-    asyncio.run(cmd.callback(it, trade="s:22", event=_choice("TPN"), price=None, pct=None, note=None))
-    assert "/setup spot_update" in it.followup.sent[-1] and env["spots"]["22"]["sells"] == []
-    cmd = _sub(bot_mod, "spot_update")
-    it = FakeInteraction(FakeUser(uid=1), command=cmd)
-    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("TPN"), price=None, pct=None, status=None, note=None))
-    assert "/setup update" in it.followup.sent[-1] and env["trades"]["11"]["fills"] == []
-    assert env["calls"]["card"] == 0
-
-
-def test_update_refuses_other_analysts_trade(bot_mod, env):
-    cmd = _sub(bot_mod, "spot_update")
-    it = FakeInteraction(FakeUser(uid=1), command=cmd)
-    asyncio.run(cmd.callback(it, trade="s:22", event=_choice("TPN"), price=None, pct=None, status=None, note=None))
-    assert "Only the analyst who posted" in it.followup.sent[-1]
-    assert env["spots"]["22"]["sells"] == [] and env["calls"]["card"] == 0
-
-
-def test_update_be_shows_on_card_after_tp(bot_mod, env):
-    """TP1 taken, then stop to entry: the card's stop field and status both say so; R:R stays on the posted risk."""
-    cmd = _sub(bot_mod, "update")
-    it = FakeInteraction(FakeUser(uid=1), command=cmd)
-    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("EF1"), price=None, pct=None, note=None))
-    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("TPN"), price=None, pct=None, note=None))
-    rr_before = bot_mod.display_rr(env["trades"]["11"])
-    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("BE"), price=None, pct=None, note=None))
+def test_futures_tp_be_trail_close_flow(env):
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    asyncio.run(_button(view, "Entry filled").callback(FakeInteraction(FakeUser(uid=1))))
+    # TP hit popup is pre-filled with the next preset + planned %
+    it2 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "TP hit").callback(it2))
+    m = it2.response.modal
+    assert m.inputs["price"].default == "110" and m.inputs["pct"].default == "50"
+    _submit(it2, {"price": "110", "pct": "", "note": "clean"})
     t = env["trades"]["11"]
-    assert t["be"] and t["sl"] == t["entry"] and bot_mod.display_rr(t) == rr_before
-    e = bot_mod.build_embed(t)
-    f = {x.name: x.value for x in e.fields}
-    assert "at entry - risk-free" in f["Stop Loss"] and "initial" in f["Stop Loss"]
-    assert f["Status"].startswith("TP1 HIT") and "SL at entry" in f["Status"]
-    assert env["calls"]["feed"][-1][0] == "Stop to entry"
+    assert t["tp1_hit"] and t["fills"][0] == {"price": 110.0, "pct": 50.0, "label": "TP1"}
+    assert env["calls"]["feed"][-1][0] == "TP1 reached" and "> clean" in env["calls"]["feed"][-1][1]
+    # stop to entry - one click, shows on the panel and the card data
+    asyncio.run(_button(view, "Stop to entry").callback(FakeInteraction(FakeUser(uid=1))))
+    assert t["be"] and t["sl"] == "100" and t["initial_sl"] == "95" and _button(view, "Stop to entry").disabled
+    assert "at entry" in view.embed().description
+    # trail above entry - R:R unchanged
+    it3 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "Trail stop").callback(it3))
+    _submit(it3, {"level": "105", "note": ""})
+    assert t["sl"] == "105" and not t["be"] and env["calls"]["feed"][-1][0] == "Stop moved"
+    from sigma.calculations import display_rr
+    assert display_rr(t) == "4.0"
+    # discretionary TP below the next preset -> PTP needs pct
+    it4 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "TP hit").callback(it4))
+    _submit(it4, {"price": "115", "pct": "", "note": ""})
+    assert len(t["fills"]) == 1 and view.last.startswith("⚠ **% is required**")
+    _submit(it4, {"price": "115", "pct": "25", "note": ""})
+    assert len(t["fills"]) == 2 and t["fills"][1]["label"] == "TP2"
+    # close the rest
+    it5 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "Close").callback(it5))
+    assert "25% still open" in str(it5.response.modal.inputs["price"].label)
+    _submit(it5, {"price": "120", "note": "done"})
+    assert t["closed"] and t["result"] == "WIN" and env["calls"]["results"] == 1
+    assert t["result_r"] == pytest.approx((0.5 * 110 + 0.25 * 115 + 0.25 * 120 - 100) / 5, abs=1e-6)
+    # closed panel: only Reopen is offered
+    assert [o.value for o in _select(view).options] == ["reopen"]
 
 
-def test_non_analyst_is_gated_before_defer(bot_mod, env):
-    cmd = _sub(bot_mod, "close")
-    it = FakeInteraction(FakeUser(uid=5, analyst=False), command=cmd)
-    asyncio.run(cmd.callback(it, trade="f:11", price="120", note=None))
-    assert not it.response.deferred and "Analyst" in it.response.sent[0]
-
-
-def test_close_grades_and_refreshes_results(bot_mod, env):
-    cmd = _sub(bot_mod, "close")
-    it = FakeInteraction(FakeUser(uid=1), command=cmd)
-    asyncio.run(cmd.callback(it, trade="f:11", price="120", note=None))
+def test_futures_stopped_out_and_more(env):
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    asyncio.run(_button(view, "Entry filled").callback(FakeInteraction(FakeUser(uid=1))))
+    it2 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "Stopped out").callback(it2))
+    assert it2.response.modal.inputs["price"].default == "95"
+    _submit(it2, {"price": "", "note": ""})
     t = env["trades"]["11"]
-    assert t["closed"] and t["result"] == "WIN" and abs(t["result_r"] - 4.0) < 1e-9
-    assert env["calls"]["results"] == 1
-    assert env["calls"]["feed"][0][0].startswith("Closed - Win (+4.00R)")
-    assert it.followup.sent[-1].startswith("Closed: Closed (+4.00R)")
+    assert t["closed"] and t["result"] == "LOSS" and t["sl_hit"] and t["result_r"] == -1.0
 
 
-def test_admin_can_close_spot_and_alias_adds_moved_note(bot_mod, env):
-    cmds = {c.name: c for c in bot_mod.bot.tree.get_commands()}
-    alias = cmds["spot_close"]
-    it = FakeInteraction(FakeUser(uid=99, admin=True), command=alias)
-    asyncio.run(alias.callback(it, trade="s:22", price="1.3", note=None))
+def test_more_menu_invalidated_undo_track(env):
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    vals = [o.value for o in _select(view).options]
+    assert vals == ["ci", "ul", "fix", "track", "rtp"]
+    sel = _select(view)
+    asyncio.run(sel.callback(FakeInteraction(FakeUser(uid=1), values=["track"])))
+    assert env["trades"]["11"]["watch_disabled"] is True and "OFF" in view.last
+    asyncio.run(sel.callback(FakeInteraction(FakeUser(uid=1), values=["ul"])))
+    assert view.last.startswith("⚠ Nothing to undo")
+    asyncio.run(_select(view).callback(FakeInteraction(FakeUser(uid=1), values=["ci"])))
+    t = env["trades"]["11"]
+    assert t["closed"] and t["result"] == "INVALID" and env["calls"]["feed"][-1][0] == "Invalidated"
+
+
+def test_fix_a_fill_from_panel(env):
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    asyncio.run(_button(view, "Entry filled").callback(FakeInteraction(FakeUser(uid=1))))
+    it2 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "TP hit").callback(it2))
+    _submit(it2, {"price": "110", "pct": "50", "note": ""})
+    it3 = FakeInteraction(FakeUser(uid=1), values=["fix"])
+    asyncio.run(_select(view).callback(it3))
+    assert "`1.` 50% @ 110" in view.last and it3.response.modal is not None
+    _submit(it3, {"item": "1", "price": "", "pct": "", "what": "tp"})
+    t = env["trades"]["11"]
+    assert t["fills"] == [] and not t["tp1_hit"] and env["calls"]["thread"][-1].startswith("**Correction** - removed take profit #1")
+
+
+def test_edit_popup_changes_only_what_changed(env):
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    it2 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "Edit").callback(it2))
+    m = it2.response.modal
+    assert m.inputs["targets"].default == "110 / 120" and m.inputs["stop"].default == "95"
+    _submit(it2, {"entry": "100", "stop": "94", "targets": "110 / 120 / 130", "risk_tf": "1 / 4H", "context": ""})
+    t = env["trades"]["11"]
+    assert t["sl"] == "94" and t["initial_sl"] == "94" and t["tp3"] == "130" and t["timeframe"] == "4H"
+    assert env["calls"]["thread"][-1].startswith("**Edited** - corrected: stop, risk, TP1, TP2, TP3, TP4, timeframe")
+    # outside the window a non-admin is refused, an admin is not
+    t["created_at"] = "2020-01-01T00:00:00+00:00"
+    it3 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "Edit").callback(it3))
+    assert it3.response.modal is None and "Edit window" in view.last
+    it4 = FakeInteraction(FakeUser(uid=99, admin=True))
+    asyncio.run(_button(view, "Edit").callback(it4))
+    assert it4.response.modal is not None
+
+
+# ----------------------------------------------------------------------------- spot
+
+def test_spot_panel_flow(env):
+    it, view = _panel(env, "spot", "22", FakeUser(uid=2))
+    labels = [b.label for b in view.children if hasattr(b, "label")]
+    assert labels == ["Buy", "Zone filled", "Sold", "Close", "Edit"]
+    it2 = FakeInteraction(FakeUser(uid=2))
+    asyncio.run(_button(view, "Buy").callback(it2))
+    _submit(it2, {"price": "1.0", "pct": "", "note": ""})
     p = env["spots"]["22"]
-    assert p["closed"] and p["result"] == "WIN" and abs(p["result_r"] - 1.0) < 1e-9
-    assert it.followup.sent[-1].startswith("Moved to `/setup close`")
-    assert env["calls"]["feed"][0][2] == "Sigma Trading - Spot Plays"
+    assert p["buys"][-1]["price"] == 1.0 and p["avg_entry"] == "1.05" and env["calls"]["feed"][-1][0] == "Buy filled"
+    sel = _select(view)
+    asyncio.run(sel.callback(FakeInteraction(FakeUser(uid=2), values=["st:HOLDING"])))
+    assert p["status"] == "HOLDING" and env["calls"]["feed"][-1][0] == "Status updated"
+    it3 = FakeInteraction(FakeUser(uid=2))
+    asyncio.run(_button(view, "Sold").callback(it3))
+    assert it3.response.modal.inputs["price"].default == "1.5"
+    _submit(it3, {"price": "1.5", "pct": "", "note": ""})
+    assert p["t1_hit"] and p["sells"][0]["pct"] == 50.0
+    it4 = FakeInteraction(FakeUser(uid=2))
+    asyncio.run(_button(view, "Close").callback(it4))
+    _submit(it4, {"price": "1.3", "note": ""})
+    assert p["closed"] and p["result"] == "WIN" and env["calls"]["feed"][-1][2] == "Sigma Trading - Spot Plays"
 
 
-def test_user_error_is_one_plain_line(bot_mod, env):
-    cmd = _sub(bot_mod, "update")
+def test_other_analyst_blocked_at_action_time(env):
+    """Panel opened as admin, but the record's owner check still runs on every action (uid swap mid-panel)."""
+    it, view = _panel(env, "spot", "22", FakeUser(uid=99, admin=True))
+    asyncio.run(_button(view, "Zone filled").callback(FakeInteraction(FakeUser(uid=1))))
+    it2 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "Zone filled").callback(it2))
+    _submit(it2, {"avg": "", "note": ""})
+    assert not env["spots"]["22"]["zone_filled"] and "Only the analyst who posted" in view.last
+
+
+# ----------------------------------------------------------------------------- /setup edit (rare fields) + autocomplete
+
+def test_setup_edit_targets_and_framework(bot_mod, env, monkeypatch):
+    import sigma.commands_setup as cs
+    g = next(c for c in bot_mod.bot.tree.get_commands() if c.name == "setup")
+    cmd = next(s for s in g.commands if s.name == "edit")
+
+    class Msg:
+        attachments = []
+        async def edit(self, **kw): pass
+
+    class Ch:
+        async def fetch_message(self, mid): return Msg()
+    monkeypatch.setattr(cs.bot, "get_channel", lambda cid: Ch())
+    async def _board(): env["calls"]["board"] += 1
+    monkeypatch.setattr(cs, "refresh_board", _board)
     it = FakeInteraction(FakeUser(uid=1), command=cmd)
-    asyncio.run(cmd.callback(it, trade="f:11", event=_choice("PTP"), price="105", pct=None, note=None))
-    assert it.followup.sent[-1].startswith("**tp_pct is required**")
-    assert env["trades"]["11"]["fills"] == []
-
-
-def test_fix_list_and_remove(bot_mod, env):
-    upd = _sub(bot_mod, "update"); fix = _sub(bot_mod, "fix")
-    it = FakeInteraction(FakeUser(uid=1), command=upd)
-    asyncio.run(upd.callback(it, trade="f:11", event=_choice("TPN"), price=None, pct=None, note=None))
-    it2 = FakeInteraction(FakeUser(uid=1), command=fix)
-    asyncio.run(fix.callback(it2, trade="f:11", action=_choice("list"), item=None, price=None, pct=None, note=None))
-    assert "`1.` 50% @" in it2.followup.sent[-1]
-    it3 = FakeInteraction(FakeUser(uid=1), command=fix)
-    asyncio.run(fix.callback(it3, trade="f:11", action=_choice("remove_tp"), item=1, price=None, pct=None, note="fat finger"))
-    assert env["trades"]["11"]["fills"] == [] and not env["trades"]["11"]["tp1_hit"]
-    assert env["calls"]["thread"][-1].startswith("**Correction** - removed take profit #1")
+    kw = {p.name: None for p in cmd.parameters}
+    kw.update(trade="f:11", targets="111 / 121", framework="FVG + Order Block")
+    asyncio.run(cmd.callback(it, **kw))
+    t = env["trades"]["11"]
+    assert t["tp1"] == "111" and t["tp2"] == "121" and t["tp3"] == "" and t["frameworks"] == ["FVG", "Order Block"]
+    assert it.followup.sent[-1].startswith("Updated (framework, TP1, TP2, TP3, TP4)")
+    it = FakeInteraction(FakeUser(uid=1), command=cmd)
+    kw.update(targets=None, framework="Nope")
+    asyncio.run(cmd.callback(it, **kw))
+    assert it.followup.sent[-1].startswith("Unknown framework")
 
 
 def test_open_autocomplete_filters_to_own_trades(bot_mod, env):
-    cs = env["cs"]
+    import sigma.commands_setup as cs
     it = FakeInteraction(FakeUser(uid=1))
     own = asyncio.run(cs.open_any_ac(it, ""))
     assert [c.value for c in own] == ["f:11"]
     it = FakeInteraction(FakeUser(uid=99, admin=True))
     allv = asyncio.run(cs.open_any_ac(it, ""))
     assert sorted(c.value for c in allv) == ["f:11", "s:22"]
+
+
+def test_parse_targets(env):
+    from sigma.actions import parse_targets
+    from sigma.errors import UserError
+    assert parse_targets("104000 / 108,000, 112000", 4) == ["104000", "108,000", "112000"]
+    assert parse_targets(".5 / .75", 3) == [".5", ".75"]
+    assert parse_targets("0.0000037 0.00000395", 3) == ["0.0000037", "0.00000395"]
+    with pytest.raises(UserError, match="Up to 3"):
+        parse_targets("1/2/3/4", 3)
+    with pytest.raises(UserError, match="isn't a price"):
+        parse_targets("1 / abc", 3)

@@ -53,6 +53,8 @@ async def on_ready():
         await ops_alert("startup problems: " + "; ".join(probs), key="startup")
     log.info(f"[boot] ready - sync={sync_state}, ops_channel={'set' if OPS_CHANNEL_ID else 'unset'}, corrupt={sorted(_CORRUPT) or 'none'}")
     bot.add_view(FollowPanel())
+    from sigma.actions import ensure_card_views
+    asyncio.create_task(ensure_card_views())      # open cards get the Manage button once
     bot.add_view(PaymentPanel())
     for _pk in _plansvc.all():
         bot.add_view(TokenPick(_pk))

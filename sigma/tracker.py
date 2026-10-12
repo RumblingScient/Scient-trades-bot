@@ -117,7 +117,7 @@ async def _pw_process_trade(tid: str, t: dict, candles):
                 events.append(("Ambiguous candle - tracking paused", GREY,
                                f"One 1-minute candle touched both {what} and the stop ({fnum(stop_now)}). "
                                f"The order inside the candle can't be proven from OHLC, so nothing was recorded. "
-                               f"Check your exchange fills and resolve with /setup update, then /setup track On if you want the tracker back."))
+                               f"Check your exchange fills and resolve from Manage on the card, then More > Tracking ON if you want the tracker back."))
                 break
         # entry fills (limit only - market fills at post)
         if e1 and not t.get("entry1_filled") and t.get("entry_type") != "MARKET" and crossed_entry(e1, lo, hi):
@@ -137,7 +137,7 @@ async def _pw_process_trade(tid: str, t: dict, candles):
                     continue
                 if crossed_tp(tp_px, lo, hi):
                     try:
-                        out = _svc.apply_event("fut", t, key.upper())      # planned % from the card, same path as /setup update
+                        out = _svc.apply_event("fut", t, key.upper())      # planned % from the card, same path as the Manage panel
                         events.append((out.title + " - auto-tracked", GREEN, out.line or out.desc))
                     except UserError:
                         # no planned % (or nothing left to close): tick the level, let the analyst record size
@@ -145,7 +145,7 @@ async def _pw_process_trade(tid: str, t: dict, candles):
                         for prev in ("tp1", "tp2", "tp3", "tp4")[:idx]:
                             t[f"{prev}_hit"] = True
                         events.append((f"{key.upper()} tagged @ {fnum(tp_px)}", GREEN,
-                                       "Auto-tracked - no split % on the card, record size with /setup update"))
+                                       "Auto-tracked - no split % on the card, record the size with Manage > TP hit"))
         # SL - once the analyst moved the stop to entry, ENTRY is the stop
         stop_lvl = (entry_num(t) if t.get("be") else slv)
         if stop_lvl and not t.get("closed") and any_entry_filled(t) and crossed_sl(stop_lvl, lo, hi):
@@ -154,13 +154,13 @@ async def _pw_process_trade(tid: str, t: dict, candles):
                 if open_ms - warned > 4 * 3600 * 1000:
                     t["watch_sl_warned_ms"] = open_ms
                     events.append(("Price at soft invalidation", GREY,
-                                   f"Traded through {fnum(stop_lvl)} ({t.get('sl_condition')}) - your call, confirm with /setup update if it closes there."))
+                                   f"Traded through {fnum(stop_lvl)} ({t.get('sl_condition')}) - your call, confirm with Manage > Stopped out if it closes there."))
             elif AUTO_CLOSE_ON_HARD_SL:
                 try:
-                    out = _svc.apply_event("fut", t, "SL", note="Auto-tracked stop")   # same close + grading as /setup update
+                    out = _svc.apply_event("fut", t, "SL", note="Auto-tracked stop")   # same close + grading as the Manage panel
                 except UserError as ex:
                     t["watch_disabled"] = True
-                    events.append(("Tracker could not close this setup", GREY, f"{ex.message} Resolve with /setup update."))
+                    events.append(("Tracker could not close this setup", GREY, f"{ex.message} Resolve from Manage on the card."))
                     break
                 where = "Stop at entry" if t.get("be") else "Stop"
                 events.append((out.title, out.color, f"{where} hit @ {fnum(stop_lvl)} - auto-tracked"))

@@ -14,25 +14,18 @@ def _group(tree, name):
 
 def test_setup_group(tree):
     g, subs = _group(tree, "setup")
-    assert set(subs) == {"futures", "spot", "update", "spot_update", "close", "edit", "fix", "track", "reopen", "xpost", "referrals"}
-    assert [p.name for p in subs["close"].parameters] == ["trade", "price", "note"]
+    assert set(subs) == {"futures", "spot", "edit", "xpost", "referrals"}, "everything after posting lives on the card's Manage button"
     fut = [p.name for p in subs["futures"].parameters]
-    assert fut[:7] == ["pair", "direction", "entry_type", "entry", "stop", "entry2", "entry_split"], "new-setup flow: ticker, side, entry type, entry 1, stop, entry 2"
-    assert all(p.required for p in subs["futures"].parameters[:5]) and not subs["futures"].parameters[5].required
+    assert fut[:6] == ["pair", "direction", "entry_type", "entry", "stop", "targets"], "new-setup flow: ticker, side, entry type, entry, stop, targets"
+    assert all(p.required for p in subs["futures"].parameters[:6]) and not subs["futures"].parameters[6].required
+    assert fut[6:8] == ["entry2", "entry_split"]
+    assert "framework2" not in fut and "tp1" not in fut
     assert [c.value for c in subs["futures"].parameters[2].choices] == ["LIMIT", "MARKET", "DCA"]
-    assert [p.name for p in subs["update"].parameters] == ["trade", "event", "price", "pct", "note"]
-    assert [p.name for p in subs["spot_update"].parameters] == ["trade", "event", "price", "pct", "status", "note"]
-    fut_names = [c.name for c in subs["update"].parameters[1].choices]
-    spot_names = [c.name for c in subs["spot_update"].parameters[1].choices]
-    assert fut_names[0].startswith("Entry filled") and any(n.startswith("Stop to entry") for n in fut_names)
-    assert not any("Buy filled" in n or "Zone filled" in n for n in fut_names), "spot events must not show on the futures picker"
-    assert any(n.startswith("Buy filled") for n in spot_names) and any(n.startswith("Zone filled") for n in spot_names)
-    assert not any(n.startswith("Stop to entry") or n.startswith("Stop hit") or n.startswith("Entry") for n in spot_names)
-    assert all(len(n) <= 62 for n in fut_names + spot_names), "event names must not truncate in the picker"
-    assert subs["spot_update"].parameters[0].autocomplete is not None
+    spot = [p.name for p in subs["spot"].parameters]
+    assert spot[:4] == ["pair", "zone", "targets", "stop"] and "tp1" not in spot
+    assert [p.name for p in subs["edit"].parameters][:2] == ["trade", "pair"] and "targets" in [p.name for p in subs["edit"].parameters]
     assert all(len(p.parameters) <= 25 for p in subs.values())
-    assert subs["update"].parameters[0].autocomplete is not None
-    assert subs["reopen"].parameters[0].autocomplete is not None
+    assert subs["edit"].parameters[0].autocomplete is not None
 
 
 def test_admin_group_hidden(tree):
@@ -44,16 +37,12 @@ def test_admin_group_hidden(tree):
 
 def test_aliases_point_to_same_callbacks(tree, bot_mod):
     cmds = {c.name: c for c in tree.get_commands()}
-    g, subs = _group(tree, "setup")
-    for old, sub in (("trade", "futures"), ("spot", "spot"), ("update", "update"), ("spot_update", "spot_update"),
-                     ("spot_close", "close"), ("edit", "edit"), ("spot_edit", "fix"), ("track", "track"),
-                     ("reopen", "reopen"), ("xpost", "xpost")):
-        assert cmds[old].callback is subs[sub].callback, old
-        assert cmds[old].extras["moved"].startswith("/setup ")
+    for old in ("trade", "update", "spot_update", "spot_close", "spot_edit", "track", "reopen"):
+        assert old not in cmds, f"old analyst name /{old} must be gone - the Manage panel replaced it"
     for old in ("health", "recap_month", "journal_month", "tg_send"):
         assert cmds[old].extras["moved"].startswith("/admin ")
         assert cmds[old].default_permissions.administrator
-    assert len(bot_mod.ALIAS_NAMES) == 14
+    assert len(bot_mod.ALIAS_NAMES) == 4
 
 
 def test_old_admin_names_gone_from_top_level(tree):

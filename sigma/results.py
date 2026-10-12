@@ -100,7 +100,7 @@ def build_result_entry_embed(kind: str, t: dict) -> discord.Embed:
     embed = discord.Embed(title=title, color=color)
     if kind == "fut":
         embed.add_field(name="Entry", value=entry_display(t, marks=False) or "-", inline=True)
-        embed.add_field(name="Invalidation", value=str(t.get("sl") or "-"), inline=True)
+        embed.add_field(name="Invalidation", value=str(t.get("initial_sl") or t.get("sl") or "-"), inline=True)
         if t.get("avg_exit") is not None:
             embed.add_field(name="Avg exit", value=fnum(t["avg_exit"]), inline=True)
     else:
@@ -135,7 +135,7 @@ def _results_csv(entries, label: str) -> discord.File:
             w.writerow([t.get("closed_at", ""), t.get("created_at", ""),
                         t.get("analyst_name", ""), "futures", t.get("pair", "").upper(),
                         t.get("direction", ""), tf(t) or "",
-                        entry_display(t, marks=False) or "", t.get("sl", ""),
+                        entry_display(t, marks=False) or "", t.get("initial_sl") or t.get("sl", ""),
                         t.get("avg_exit", ""), t.get("result", ""),
                         t.get("result_r", ""), "", "yes" if t.get("override") else ""])
         else:

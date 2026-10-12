@@ -68,7 +68,7 @@ def test_futures_preset_tp_uses_plan_and_numbers():
 
 def test_futures_manual_tp_replaces_next_preset_and_needs_pct():
     t = fut()
-    with pytest.raises(UserError, match="tp_pct"):
+    with pytest.raises(UserError, match="% is required"):
         svc.apply_event("fut", t, "PTP", price="105")
     svc.apply_event("fut", t, "PTP", price="105", pct="25")
     # the manual TP takes preset slot 1 (unified ledger): TP1 counts as done, TP2 still pending
@@ -254,7 +254,7 @@ def test_fix_fill_both_markets():
     assert len(t["fills"]) == 1 and t["tp1_hit"] and t["tp2_hit"] and not t["tp3_hit"]
     with pytest.raises(UserError, match="Pick which one"):
         svc.fix_fill("fut", t, "remove_tp", 9)
-    with pytest.raises(UserError, match="setup edit"):
+    with pytest.raises(UserError, match="Edit"):
         svc.fix_fill("fut", t, "remove_buy", 1)
     p = spot(buys=[{"price": 1.2, "pct": 50}, {"price": 1.0, "pct": 50}])
     svc.fix_fill("spot", p, "fix_buy", 2, price="0.8")
@@ -291,3 +291,19 @@ def test_spot_close_chunk_is_not_a_tp_on_the_card():
     assert [s["label"] for s in p["sells"]] == ["TP1", "close"]
     assert len(_tp_taken(p, spot=True)) == 1     # card lists one TP, not two
     assert abs(spot_weighted_exit(p) - 1.4) < 1e-9   # exit math still uses both
+
+
+def test_edit_still_works_after_stop_moved_and_legacy_be_migrates():
+    t = fut(entry1_filled=True)
+    svc.apply_event("fut", t, "BE")
+    assert svc.edit("fut", t, {"context": "sweep"}) == ["context"]          # live stop == entry must not trip the check
+    svc.apply_event("fut", t, "SLU", price="103")
+    assert svc.edit("fut", t, {"tp3": "140"}) == ["TP3"]
+    with pytest.raises(UserError, match="Stop must be below entry"):
+        svc.edit("fut", t, {"stop": "101"})
+    # record from the previous release: be=True, sl never moved
+    old = fut(entry1_filled=True, be=True)
+    assert svc.migrate_legacy_be(old) and old["initial_sl"] == "95" and old["sl"] == "100"
+    assert not svc.migrate_legacy_be(old)
+    out = svc.apply_event("fut", old, "SL")
+    assert old["result"] == "BE"

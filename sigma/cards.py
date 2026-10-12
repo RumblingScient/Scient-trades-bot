@@ -13,7 +13,8 @@ from sigma.config import EDIT_WINDOW_MIN, GUILD_ID, IST, NAVY, TRADE_UPDATES_CHA
 from sigma.core import bot
 from sigma.calculations import (_tp_presets, _tp_taken, any_entry_filled, display_rr, entry_num, fills_pct, fmt_frameworks,
                                 fmt_risk, fnum, initial_sl_num, signed_r, sl_num, spot_pct_text, spot_result_r, spot_signed_r,
-                                spot_status_line, spot_zone_projection, stop_locked_r, stop_trailed, tf)
+                                spot_status_line, spot_zone_projection, stop_locked_r, stop_trailed, tf,
+                                banked_r, first_num, progress_bar, spot_inv_num, spot_num)
 
 
 def stop_state(t: dict) -> str:
@@ -50,40 +51,67 @@ def emo(name: str, fallback: str = "") -> str:
     _EMO_CACHE[name] = val
     return val
 
-def unified_tp_text(t: dict, spot: bool = False) -> str:
-    """ONE list: taken TPs (auto-numbered, ticked) then the presets still pending (plan)."""
+def unified_tp_text(t: dict, spot: bool = False, mark_next: bool = True) -> str:
+    """ONE list: taken TPs (ticked, auto-numbered) then the presets still pending; the next pending one is flagged.
+    Row shape: `✅ TP1  104,000  +1.3R  40% closed` / `○ TP2  108,000  +2.7R  30% ← next`."""
     taken = _tp_taken(t, spot)
     presets = _tp_presets(t, spot)
-    tick = emo("tracked", chr(0x2705))
+    tick = emo("tracked", "\u2705")
+    ring = "\u25cb"
     rows = []
     n = 0
+    pxf = (lambda v: f"{v:g}") if spot else fnum
     for f in taken:
         n += 1
         px = f["price"]
-        extra = ""
         if spot:
-            extra = spot_pct_text(t, px)
+            extra = spot_pct_text(t, px).strip()
             rr = spot_signed_r(t, px)
             if rr is not None:
                 extra += f" {rr:+.1f}R"
         else:
             r = signed_r(t, px)
-            extra = f" ({r:+.1f}R)" if r is not None else ""
-        rows.append(f"TP{n} \u00b7 {f['pct']:g}% @ {(f'{px:g}' if spot else fnum(px))}{extra} {tick}")
+            extra = f"{r:+.1f}R" if r is not None else ""
+        rows.append(f"{tick} TP{n} \u00a0{pxf(px)} \u00a0{extra} \u00a0{f['pct']:g}% {'sold' if spot else 'closed'}")
+    first_pending = True
     for i, k, px, planned in presets:
         if t.get(f"{k}_hit"):
             continue
         n += 1
-        extra = spot_pct_text(t, px) if spot else (f" ({signed_r(t, px):+.1f}R)" if signed_r(t, px) is not None else "")
-        ptxt = f" [{planned:g}%]" if planned is not None else ""
-        rows.append(f"TP{n} \u00b7 {(f'{px:g}' if spot else fnum(px))}{extra}{ptxt}")
-    if not rows:
-        return ""
-    done = sum(x["pct"] for x in taken)
-    if t.get("closed") or not taken:
-        return "\n".join(rows)
-    left = max(0.0, 100 - (fills_pct(t) if not spot else done))
-    return "\n".join(rows) + f"\n{done:g}% {'sold' if spot else 'closed'} \u00b7 {left:g}% {'still held' if spot else 'running'}"
+        if spot:
+            extra = spot_pct_text(t, px).strip()
+        else:
+            r = signed_r(t, px)
+            extra = f"{r:+.1f}R" if r is not None else ""
+        ptxt = f" \u00a0{planned:g}%" if planned is not None else ""
+        nxt = " \u2190 next" if (mark_next and first_pending and taken and not t.get("closed")) else ""
+        rows.append(f"{ring} TP{n} \u00a0{pxf(px)} \u00a0{extra}{ptxt}{nxt}")
+        first_pending = False
+    return "\n".join(rows)
+
+
+def _closed_pct(t: dict, spot: bool) -> float:
+    if spot:
+        return sum(x["pct"] for x in (t.get("sells") or []) if str(x.get("label") or "") != "close")
+    return fills_pct(t)
+
+
+def card_color(t: dict, spot: bool = False) -> discord.Color:
+    """Border by state: pending grey, live = analyst colour, profit taken green, closed = result colour."""
+    if t.get("closed"):
+        return {"WIN": discord.Color.from_str("#3ba55d"), "LOSS": discord.Color.from_str("#ed4245"),
+                "BE": discord.Color.from_str("#747f8d"), "INVALID": discord.Color.from_str("#4f545c")}.get(t.get("result"), discord.Color.from_str("#747f8d"))
+    taken = _tp_taken(t, spot)
+    if taken:
+        return discord.Color.from_str("#3ba55d")
+    live = (t.get("zone_filled") or (t.get("buys") or []) or spot_num(t.get("avg_entry"))) if spot else any_entry_filled(t)
+    if not live:
+        return discord.Color.from_str("#4f545c")
+    try:
+        return discord.Color.from_str(t.get("analyst_color") or "#1C4E80")
+    except Exception:
+        return NAVY
+
 
 def entry_display(t: dict, marks: bool = True) -> str:
     e1 = str(t.get("entry"))
@@ -103,27 +131,30 @@ def entry_display(t: dict, marks: bool = True) -> str:
     return f"{e1} / {e2} (DCA{split_txt})"
 
 def full_status(t: dict) -> str:
+    """One phrase for the title: 'TP1 hit · 40% closed · stop at entry' / 'waiting for fill' / 'closed +1.63R'."""
     if t.get("closed"):
         r = t.get("result_r")
-        rtxt = f" ({r:+.2f}R)" if isinstance(r, (int, float)) else ""
-        return {
-            "WIN": f"CLOSED - WIN{rtxt}",
-            "LOSS": f"CLOSED - LOSS{rtxt}",
-            "BE": f"CLOSED - BREAKEVEN{rtxt}",
-            "INVALID": "INVALIDATED",
-        }.get(t.get("result"), "CLOSED")
+        rtxt = f" {r:+.2f}R" if isinstance(r, (int, float)) else ""
+        return {"WIN": f"closed{rtxt}", "LOSS": f"closed{rtxt}", "BE": "closed breakeven", "INVALID": "invalidated"}.get(t.get("result"), "closed")
     closed_pct = fills_pct(t)
-    pct_txt = f" - {closed_pct:g}% closed" if closed_pct > 0 else ""
-    stop_txt = stop_state(t)
-    stop_txt = f" · SL {stop_txt}" if stop_txt else ""
-    for n in (4, 3, 2, 1):
-        if t.get(f"tp{n}_hit"):
-            return f"TP{n} HIT{pct_txt}{stop_txt}"
-    if t.get("entry2") and t.get("entry1_filled") and not t.get("entry2_filled"):
-        return "ACTIVE - Entry 1 filled, DCA pending" + stop_txt
-    if any_entry_filled(t):
-        return "ACTIVE" + pct_txt + stop_txt
-    return "PENDING - waiting for fill"
+    parts = []
+    hit = next((n for n in (4, 3, 2, 1) if t.get(f"tp{n}_hit")), 0)
+    if hit:
+        parts.append(f"TP{hit} hit")
+    elif t.get("entry2") and t.get("entry1_filled") and not t.get("entry2_filled"):
+        parts.append("entry 1 filled · DCA pending")
+    elif any_entry_filled(t):
+        parts.append("live")
+    else:
+        return "waiting for fill"
+    if closed_pct > 0:
+        parts.append(f"{closed_pct:g}% closed")
+    st = stop_state(t)
+    if st:
+        parts.append("stop " + st.split(",")[0] if st.startswith("trailed") else "stop " + st.replace(" - risk-free", ""))
+        if st.startswith("trailed") and "locked" in st:
+            parts[-1] = "stop " + st.replace("trailed, ", "").replace(" locked", " locked")
+    return " \u00b7 ".join(parts)
 
 def short_status(t: dict) -> str:
     base = "Pending"
@@ -161,123 +192,166 @@ def footer_with_edit(t: dict, base: str) -> str:
         return base + " \u00b7 edited"
     return base
 
+def _chips(items) -> str:
+    return " ".join(f"`{x}`" for x in items if x)
+
+
 def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     is_long = t["direction"] == "LONG"
     closed = t.get("closed")
     result = t.get("result")
-    try:
-        color = discord.Color.from_str(t.get("analyst_color") or "#1C4E80")
-    except Exception:
-        color = NAVY
     arrow = "\u25b2 LONG" if is_long else "\u25bc SHORT"
-    prefix = ""
-    if closed:
-        prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "")
-    elif not any_entry_filled(t):
-        prefix = "[PENDING] "
     tftxt = tf(t)
-    title = f"{prefix}{arrow} | {t['pair'].upper()}"
-    if tftxt:
-        title += f" | {tftxt}"
-    embed = discord.Embed(title=title, color=color)
+    prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "") if closed else ""
+    title = f"{prefix}{arrow} {t['pair'].upper()}" + (f" \u00b7 {tftxt}" if tftxt else "") + f" \u2014 {full_status(t)}"
+    embed = discord.Embed(title=title[:256], color=card_color(t))
 
-    sl_mark = f" {emo('invalid', '')}(hit)" if t.get("sl_hit") else ""
-    type_label = "Market" if t.get("entry_type") == "MARKET" else "Limit"
-    sl_shown = fnum(sl_num(t)) if sl_num(t) is not None else str(t.get("sl"))
-    sl_val = f"{(t.get('sl_condition') + ' ') if t.get('sl_condition') else ''}{sl_shown}{sl_mark}"
-    if stop_trailed(t):
-        # the live stop moved - say so, and keep the posted stop visible because R is measured from it
-        st = stop_state(t)
-        sl_val += f"\n{st}\n" if st else "\n"
-        sl_val += f"initial {fnum(initial_sl_num(t))}"
-
-    # Row 1: three inline columns - Entry | Stop Loss | Risk / R:R
-    entry_val = entry_display(t) or "-"
-    if t.get("entry2") and t.get("entry1_filled") and t.get("entry2_filled") and not closed:
-        avg_e = entry_num(t)
-        if avg_e:
-            entry_val += f"\nAvg {fnum(avg_e)}"
-    embed.add_field(name=f"Entry ({type_label})", value=entry_val, inline=True)
-    embed.add_field(name="Stop Loss", value=sl_val, inline=True)
+    # KPI chips + progress (description)
     rr = display_rr(t)
-    risk_rr = fmt_risk(t.get("risk")) or "-"
-    if rr:
-        risk_rr += f"  ·  R:R {rr}"
-    embed.add_field(name="Risk", value=risk_rr, inline=True)
+    chips = [f"R:R {rr}" if rr else None, f"risk {fmt_risk(t.get('risk')) or '1%'}"]
+    br = banked_r(t)
+    if closed:
+        r = t.get("result_r")
+        chips.insert(0, f"result {r:+.2f}R" if isinstance(r, (int, float)) else None)
+        if t.get("avg_exit") is not None:
+            chips.append(f"avg exit {fnum(t['avg_exit'])}")
+    else:
+        if br is not None and abs(br) > 0.005:
+            chips.append(f"{br:+.1f}R banked")
+        st = stop_state(t)
+        if st:
+            chips.append("stop " + (st.split(" - ")[0] if st.startswith("at entry") else st.replace("trailed, ", "")))
+        if not any_entry_filled(t):
+            chips.append("limit \u00b7 waiting for fill" if t.get("entry_type") != "MARKET" else "market")
+    desc = _chips(chips)
+    closed_pct = fills_pct(t)
+    n_tp = len(_tp_presets(t))
+    hit = next((n for n in (4, 3, 2, 1) if t.get(f"tp{n}_hit")), 0)
+    if closed or closed_pct > 0:
+        bar = progress_bar(100 if closed else closed_pct)
+        tail = f"{closed_pct:g}% closed" if not closed else "position closed"
+        if hit and n_tp:
+            tail += f" \u00b7 TP{hit} of {n_tp}"
+        desc += f"\n{bar} {tail}"
+    embed.description = desc
 
-    # Take profits - one list: taken (ticked) then pending presets
+    # Entry | Stop
+    type_label = "market" if t.get("entry_type") == "MARKET" else "limit"
+    e1 = first_num(t.get("entry"))
+    e2 = first_num(t.get("entry2")) if t.get("entry2") else None
+    if e2 is not None:
+        m1 = " \u2713" if t.get("entry1_filled") and not closed else ""
+        m2 = " \u2713" if t.get("entry2_filled") and not closed else ""
+        entry_val = f"{fnum(e1)}{m1} / {fnum(e2)}{m2}"
+        split = t.get("entry_split")
+        sub = f"DCA{(' ' + split) if split else ''}"
+        if t.get("entry1_filled") and t.get("entry2_filled"):
+            avg_e = entry_num(t)
+            if avg_e:
+                sub += f" \u00b7 avg {fnum(avg_e)}"
+        entry_val += f"\n{sub}"
+    else:
+        entry_val = fnum(e1) if e1 is not None else str(t.get("entry"))
+        if not closed:
+            entry_val += f"\n{type_label} \u00b7 {'filled' if t.get('entry1_filled') else 'pending'}"
+        else:
+            entry_val += f"\n{type_label}"
+    embed.add_field(name="Entry", value=entry_val, inline=True)
+
+    sl_shown = fnum(sl_num(t)) if sl_num(t) is not None else str(t.get("sl"))
+    sl_val = f"{(t.get('sl_condition') + ' ') if t.get('sl_condition') else ''}{sl_shown}"
+    if t.get("sl_hit"):
+        sl_val += f" {emo('invalid', '')}(hit)"
+    if stop_trailed(t):
+        st = stop_state(t)
+        if st and not closed:
+            sl_val += f" \u00b7 {st.split(' - ')[0] if st.startswith('at entry') else st}"
+        sl_val += f"\nposted {fnum(initial_sl_num(t))}"
+    embed.add_field(name="Stop", value=sl_val, inline=True)
+
     _tpt = unified_tp_text(t)
     if _tpt:
-        embed.add_field(name="Take Profits", value=_tpt[:1020], inline=False)
+        embed.add_field(name="Targets", value=_tpt[:1020], inline=False)
 
-    # Setup (full width)
     fw = fmt_frameworks(t)
     if t.get("setup_detail"):
-        fw = f"{fw} - {t['setup_detail']}"
+        fw = f"{fw} \u2014 {t['setup_detail']}" if fw and fw != "-" else t["setup_detail"]
     if fw and fw != "-":
         embed.add_field(name="Setup", value=fw[:1020], inline=False)
-
-    # Status (full width)
-    embed.add_field(name="Status", value=full_status(t), inline=False)
-
-    if closed and t.get("avg_exit") is not None:
-        embed.add_field(name="Avg Exit", value=fnum(t["avg_exit"]), inline=True)
     if closed and t.get("close_note"):
         embed.add_field(name="Note", value=t["close_note"][:1020], inline=False)
 
     embed.set_author(name=t["analyst_name"], icon_url=t.get("analyst_avatar") or None)
-    embed.set_footer(text=footer_with_edit(t, "Journal entry, not financial advice · Risk % = portfolio risked · Never risk more than you can afford to lose"))
+    embed.set_footer(text=footer_with_edit(t, "Journal entry, not financial advice \u00b7 risk % = portfolio risked"))
     if image_url:
         embed.set_image(url=image_url)
     return embed
+
 
 def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
     closed = p.get("closed")
     result = p.get("result")
-    try:
-        color = discord.Color.from_str(p.get("analyst_color") or "#1C4E80")
-    except Exception:
-        color = NAVY
-    prefix = ""
-    if closed:
-        prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "")
-    title = f"{prefix}\u25c6 SPOT | {p['pair'].upper()}"
-    embed = discord.Embed(title=title, color=color)
-
-    if closed:
-        embed.add_field(name="Avg Entry", value=str(p.get("avg_entry") or "-"), inline=True)
-        if p.get("avg_exit"):
-            embed.add_field(name="Avg Exit", value=str(p["avg_exit"]), inline=True)
-        _rr = spot_result_r(p)
-        if p.get("result_pct") or _rr is not None:
-            embed.add_field(name="Result", value=" \u00b7 ".join(x for x in (str(p.get("result_pct") or ""), f"{_rr:+.2f}R" if _rr is not None else "") if x), inline=True)
+    prefix = {"WIN": "[WIN] ", "LOSS": "[LOSS] ", "BE": "[BE] ", "INVALID": "[INV] "}.get(result, "") if closed else ""
+    status = spot_status_line(p)
+    if not closed:
+        status = status.replace(" - ", " \u00b7 ").capitalize()
+        status = status.replace("Target", "target")
     else:
-        zone_mark = " (filled)" if p.get("zone_filled") else ""
-        embed.add_field(name="DCA Zone", value=f"{p['dca_zone']}{zone_mark}", inline=True)
-        if p.get("allocation"):
-            embed.add_field(name="Allocation", value=fmt_risk(p["allocation"]) or "-", inline=True)
-        if p.get("avg_entry"):
-            embed.add_field(name="Avg Entry", value=str(p["avg_entry"]), inline=True)
-        if p.get("horizon"):
-            embed.add_field(name="Horizon", value=str(p["horizon"]), inline=True)
-        if not p.get("zone_filled"):
-            proj = spot_zone_projection(p)
-            if proj:
-                embed.add_field(name="If Zone Fills", value=f"avg entry \u2248 {proj:g}", inline=True)
-        _spt = unified_tp_text(p, spot=True)
-        if _spt:
-            embed.add_field(name="Take Profits", value=_spt[:1020], inline=False)
-        if p.get("invalidation"):
-            embed.add_field(name="Invalidation", value=str(p["invalidation"]), inline=False)
-    embed.add_field(name="Status", value=spot_status_line(p), inline=False)
+        status = {"WIN": f"closed {p.get('result_pct') or ''}".strip(), "LOSS": f"closed {p.get('result_pct') or ''}".strip(),
+                  "BE": "closed breakeven", "INVALID": "invalidated"}.get(result, "closed")
+    title = f"{prefix}\u25c6 SPOT {p['pair'].upper()} \u2014 {status}"
+    embed = discord.Embed(title=title[:256], color=card_color(p, spot=True))
+
+    chips = []
+    if closed:
+        _rr = spot_result_r(p)
+        if p.get("result_pct"):
+            chips.append(f"result {p['result_pct']}")
+        if _rr is not None:
+            chips.append(f"{_rr:+.2f}R")
+        if p.get("avg_exit"):
+            chips.append(f"avg exit {p['avg_exit']}")
+    if p.get("allocation"):
+        chips.append(f"alloc {fmt_risk(p['allocation'])}")
+    if p.get("horizon"):
+        chips.append(f"horizon {p['horizon']}")
+    desc = _chips(chips)
+    sold = _closed_pct(p, True)
+    n_t = len(_tp_presets(p, spot=True))
+    top = max((i for i, k in enumerate(("t1_hit", "t2_hit", "t3_hit"), 1) if p.get(k)), default=0)
+    if closed or sold > 0:
+        bar = progress_bar(100 if closed else sold)
+        tail = "bag sold" if closed else f"{sold:g}% sold"
+        if top and n_t:
+            tail += f" \u00b7 target {top} of {n_t}"
+        desc += f"\n{bar} {tail}"
+    embed.description = desc
+
+    zone_val = str(p.get("dca_zone") or "-")
+    if not closed:
+        zone_val += "\n" + ("filled" if p.get("zone_filled") else "bidding")
+    embed.add_field(name="Zone", value=zone_val, inline=True)
+    if p.get("invalidation"):
+        embed.add_field(name="Invalidation", value=str(p["invalidation"]), inline=True)
+    avg_val = str(p.get("avg_entry") or "")
+    if not avg_val and not p.get("zone_filled") and not closed:
+        proj = spot_zone_projection(p)
+        if proj:
+            avg_val = f"\u2248 {proj:g}\nif the zone fills"
+    if avg_val:
+        embed.add_field(name="Avg entry", value=avg_val, inline=True)
+    _spt = unified_tp_text(p, spot=True)
+    if _spt:
+        embed.add_field(name="Targets", value=_spt[:1020], inline=False)
     if closed and p.get("close_note"):
         embed.add_field(name="Note", value=p["close_note"][:1020], inline=False)
 
     embed.set_author(name=p["analyst_name"], icon_url=p.get("analyst_avatar") or None)
-    embed.set_footer(text=footer_with_edit(p, "Spot journal entry, not financial advice · Never risk more than you can afford to lose"))
+    embed.set_footer(text=footer_with_edit(p, "Spot journal entry, not financial advice"))
     if image_url:
         embed.set_image(url=image_url)
     return embed
+
 
 def _ac_label(t: dict, spot: bool = False) -> str:
     """Grouped autocomplete label: analyst · side · pair - status."""

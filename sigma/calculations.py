@@ -144,6 +144,25 @@ def _is_tp_fill(f: dict) -> bool:
 def fills_pct(t) -> float:
     return sum(f.get("pct", 0) for f in t.get("fills", []))
 
+def banked_r(t) -> float | None:
+    """Realised R so far on the whole position: sum(pct/100 * R at fill) over take-profit fills. None if nothing taken."""
+    fills = [f for f in (t.get("fills") or []) if _is_tp_fill(f)]
+    if not fills:
+        return None
+    tot = 0.0
+    for f in fills:
+        r = signed_r(t, f.get("price"))
+        if r is None:
+            return None
+        tot += float(f.get("pct", 0)) / 100 * r
+    return tot
+
+def progress_bar(pct: float, width: int = 10) -> str:
+    """0..100 -> \u2b1b-free text bar, e.g. ▰▰▰▰▱▱▱▱▱▱"""
+    pct = max(0.0, min(100.0, float(pct or 0)))
+    full = int(round(pct / 100 * width))
+    return "\u25b0" * full + "\u25b1" * (width - full)
+
 def finalize_close(t, final_price=None):
     fills = list(t.get("fills", []))
     rem = 100 - sum(f.get("pct", 0) for f in fills)

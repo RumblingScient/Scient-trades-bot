@@ -93,13 +93,28 @@ class _SizerPctModal(discord.ui.Modal, title="Position size - % of capital"):
         emb.description = f"Risking **{pct:g}%** of `${cap:,.0f}` = `${risk_usd:,.2f}`\n\n" + emb.description
         await interaction.response.send_message(embed=emb, ephemeral=True)
 
+def manage_button(kind: str, tid) -> discord.ui.Button:
+    """The analyst control button on every card - routed by sigma.desk (custom_id prefix 'desk:')."""
+    return discord.ui.Button(label="Manage", emoji="⚙️", style=discord.ButtonStyle.secondary,
+                             custom_id=f"desk:{kind}:{tid}")
+
+
 class TradeSizerView(discord.ui.View):
+    """Futures card components: member sizer buttons + analyst Manage."""
     def __init__(self, tid):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(label="Position size ($ risk)", style=discord.ButtonStyle.secondary,
                                         custom_id=f"tsz:usd:{tid}"))
         self.add_item(discord.ui.Button(label="Position size (% risk)", style=discord.ButtonStyle.secondary,
                                         custom_id=f"tsz:pct:{tid}"))
+        self.add_item(manage_button("fut", tid))
+
+
+class SpotCardView(discord.ui.View):
+    """Spot card components: analyst Manage only."""
+    def __init__(self, tid):
+        super().__init__(timeout=None)
+        self.add_item(manage_button("spot", tid))
 
 @bot.listen("on_interaction")
 async def _sizer_router(interaction: discord.Interaction):
@@ -115,7 +130,7 @@ async def _sizer_router(interaction: discord.Interaction):
             await interaction.response.send_message("This setup isn't in the log anymore.", ephemeral=True)
             return
         e = entry_num(t)
-        s = first_num(t.get("sl"))
+        s = first_num(t.get("initial_sl") or t.get("sl"))   # posted stop = the risk the card's R is built on
         e_def = f"{e:g}" if e else ""
         s_def = f"{s:g}" if s else ""
         pair = (t.get("pair") or "?").upper()

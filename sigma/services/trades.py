@@ -1,8 +1,7 @@
 """sigma.services.trades - every state change on a futures setup or spot play.
 
 Pure functions: they take the record dict, mutate it, and return an Outcome describing what to
-show. They never touch Discord. Slash commands (/setup ...), the old alias commands, card
-buttons (Phase 2) and the tracker all go through here, so there is exactly one code path per
+show. They never touch Discord. The Manage panel (sigma.desk), /setup edit and the tracker all go through here, so there is exactly one code path per
 action. Input problems raise UserError with a plain sentence.
 """
 import re
@@ -23,8 +22,8 @@ BE_PCT_BAND = 0.5     # spot with no invalidation: |%| at or under this = breake
 FUT_TP_KEYS = ("tp1", "tp2", "tp3", "tp4")
 SPOT_TP_KEYS = ("t1", "t2", "t3")
 
-# (value, label) - event pickers. Futures and spot each get their own list (/setup update, /setup spot_update);
-# apply_event() is still the single code path underneath.
+# (value, label) - the event vocabulary, one list per market. The Manage panel (sigma.desk) and the tracker
+# both go through apply_event(); the labels document what each code means.
 FUT_EVENTS = [
     ("EF1",  "Entry filled (DCA: entry 1)"),
     ("EF2",  "Entry 2 filled - DCA leg, full position live"),
@@ -58,6 +57,20 @@ def _remember_initial_stop(t: dict):
     """Records without initial_sl (posted before trailing existed) get it from the live stop the first time it moves."""
     if not t.get("initial_sl") and t.get("sl"):
         t["initial_sl"] = str(t["sl"])
+
+
+def migrate_legacy_be(t: dict) -> bool:
+    """Old release: Stop to entry only set be=True and left sl at the posted stop. Bring such a record to the
+    current shape (initial_sl = posted stop, sl = entry). Returns True when it changed something."""
+    if t.get("be") and not t.get("initial_sl") and not t.get("closed"):
+        e = entry_num(t)
+        if e is None or t.get("sl") is None:
+            return False
+        t["initial_sl"] = str(t["sl"])
+        t["sl"] = _num_str(e)
+        t["sl_condition"] = None
+        return True
+    return False
 
 
 @dataclass
@@ -196,9 +209,9 @@ def _pct_or_plan(t, key, pct, spot):
         if idx < len(plan):
             pct = float(plan[idx])
     if pct is None:
-        raise UserError("**tp_pct is required** - how much was closed at this level? (e.g. 25)")
+        raise UserError("**% is required** - how much was closed at this level? (e.g. 25)")
     if pct <= 0 or pct > 100:
-        raise UserError("tp_pct must be between 0 and 100.")
+        raise UserError("% must be between 0 and 100.")
     done = sum(s["pct"] for s in (t.get("sells") or [])) if spot else fills_pct(t)
     if done + pct > 100.01:
         raise UserError(f"That would close {done + pct:g}% in total - only {100 - done:g}% is left.")
@@ -277,9 +290,9 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
         if px is None:
             raise UserError("**price is required** - where did you take profit?")
         if pct is None:
-            raise UserError("**tp_pct is required** - how much was closed at this price? (e.g. 25)")
+            raise UserError("**% is required** - how much was closed at this price? (e.g. 25)")
         if pct <= 0 or pct > 100:
-            raise UserError("tp_pct must be between 0 and 100.")
+            raise UserError("% must be between 0 and 100.")
         done = sum(s["pct"] for s in (t.get("sells") or [])) if spot else fills_pct(t)
         if done + pct > 100.01:
             raise UserError(f"That would close {done + pct:g}% in total - only {100 - done:g}% is left.")
@@ -363,7 +376,7 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
             raise UserError("Entry isn't filled yet - mark **Entry filled** first, then move the stop to entry.")
         e = entry_num(t)
         if e is None:
-            raise UserError("Couldn't read the entry price on this trade - fix it with /setup edit.")
+            raise UserError("Couldn't read the entry price on this trade - fix it with Edit.")
         _remember_initial_stop(t)
         t["sl"] = _num_str(e)
         t["sl_condition"] = None
@@ -399,12 +412,12 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
 
     if ev == "SL":
         if spot:
-            raise UserError("Spot has no stop - close it with **/setup close** at the price you sold.")
+            raise UserError("Spot has no stop - close it with **Close** at the price you sold.")
         if t.get("sl_condition") and px is None and not t.get("be"):
             raise UserError(f"This trade has a **soft SL** ({t['sl_condition']} {t['sl']}). **price is required** - at what exact price did it close?")
         exit_px = px if px is not None else (entry_num(t) if t.get("be") else sl_num(t))
         if exit_px is None:
-            raise UserError("Couldn't read the SL price - pass `price` with this update.")
+            raise UserError("Couldn't read the stop price - give the exit price.")
         t["sl_hit"] = True
         where = "at entry" if t.get("be") else ("trailed stop" if stop_trailed(t) else "")
         return _close_futures(t, exit_px, note, desc="Stopped out" + (f" {where}" if where else "") + " - closed")
@@ -413,7 +426,7 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
         if spot:
             had = bool(spot_num(t.get("avg_entry")) or t.get("zone_filled") or (t.get("sells") or []))
             if had:
-                raise UserError("This play had fills - close it with **/setup close** at the price you cut, so the journal records it.")
+                raise UserError("This play had fills - close it with **Close** at the price you cut, so the journal records it.")
             t["closed"] = True
             t["result"] = "INVALID"
             t["result_pct"] = None
@@ -479,7 +492,7 @@ def _close_futures(t, exit_px, note, desc="Closed") -> Outcome:
 def close(kind: str, t: dict, price=None, note=None) -> Outcome:
     """Close at a price. The bot grades WIN / LOSS / BE itself. Invalidated is an update event, not a close."""
     if t.get("closed"):
-        raise UserError("Already closed. Use **/setup reopen** first if the close was wrong.")
+        raise UserError("Already closed. Use **More > Reopen** first if the close was wrong.")
     if kind != "spot":
         px = parse_num(price)
         rem = 100 - fills_pct(t)
@@ -490,7 +503,7 @@ def close(kind: str, t: dict, price=None, note=None) -> Outcome:
     px = spot_num(price)
     had_position = bool(spot_num(t.get("avg_entry")) or t.get("zone_filled") or (t.get("sells") or []) or (t.get("buys") or []))
     if not had_position:
-        raise UserError("This play never filled - mark it **Invalidated** with /setup update instead of closing it.")
+        raise UserError("This play never filled - mark it **Invalidated** (More) instead of closing it.")
     sells = list(t.get("sells") or [])
     rem = 100 - sum(s["pct"] for s in sells)
     if rem > 0.01:
@@ -514,7 +527,7 @@ def close(kind: str, t: dict, price=None, note=None) -> Outcome:
     elif pc is not None:
         t["result"] = _grade_pct(pc)
     else:
-        raise UserError("Couldn't grade this play - it has no numeric average entry. Set one with /setup edit, then close.")
+        raise UserError("Couldn't grade this play - it has no numeric average entry. Set one with Edit, then close.")
     t["closed_at"] = _now()
     if note:
         t["close_note"] = note
@@ -590,7 +603,7 @@ def edit(kind: str, t: dict, fields: dict) -> list:
             e_num, e_cond = parse_sl(v["stop"])
             if not e_num:
                 raise UserError("Couldn't find a price in the stop.")
-            # edit = the posted stop was wrong, so the original risk changes too (a trail goes through /setup update)
+            # edit = the posted stop was wrong, so the original risk changes too (a trail goes through Trail stop on the panel)
             t["sl"] = e_num
             t["initial_sl"] = e_num
             t["sl_condition"] = e_cond
@@ -620,20 +633,22 @@ def edit(kind: str, t: dict, fields: dict) -> list:
         ch.append("chart")
     if not ch:
         raise UserError("Nothing to change - fill at least one field.")
-    # a stop/entry change must still make sense for the direction
-    if not spot and t.get("sl") and first_num(t.get("entry")):
-        s, e = float(t["sl"]), first_num(t["entry"])
-        if t.get("direction") == "LONG" and s >= e:
-            raise UserError(f"Stop must be below entry for a long. Stop {fnum(s)} vs entry {fnum(e)}.")
-        if t.get("direction") == "SHORT" and s <= e:
-            raise UserError(f"Stop must be above entry for a short. Stop {fnum(s)} vs entry {fnum(e)}.")
+    # a stop / entry / direction change must still make sense - checked against the POSTED stop
+    # (the live one may sit at or past entry after Stop to entry / a trail)
+    if not spot and any(v.get(k) is not None for k in ("stop", "entry", "direction")):
+        s, e = initial_sl_num(t), first_num(t.get("entry"))
+        if s and e:
+            if t.get("direction") == "LONG" and s >= e:
+                raise UserError(f"Stop must be below entry for a long. Stop {fnum(s)} vs entry {fnum(e)}.")
+            if t.get("direction") == "SHORT" and s <= e:
+                raise UserError(f"Stop must be above entry for a short. Stop {fnum(s)} vs entry {fnum(e)}.")
     t["edited"] = True
     t["edited_at"] = _now()
     return ch
 
 
 def ledger_text(kind: str, t: dict) -> str:
-    """Numbered list of recorded fills - what /setup fix refers to by item number."""
+    """Numbered list of recorded fills - what Fix a fill refers to by item number."""
     spot = kind == "spot"
     fmt = (lambda v: f"{v:g}") if spot else fnum
     lines = []
@@ -660,7 +675,7 @@ def fix_fill(kind: str, t: dict, action: str, item: int = None, price=None, pct=
         return ledger_text(kind, t)
     is_tp = action.endswith("_tp")
     if not is_tp and not spot:
-        raise UserError("Futures entries are flags, not a list - fix the entry price with **/setup edit**.")
+        raise UserError("Futures entries are flags, not a list - fix the entry price with **Edit**.")
     if spot:
         rows = (t.get("sells") if is_tp else t.get("buys")) or []
         store_key = "sells" if is_tp else "buys"
