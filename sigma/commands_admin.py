@@ -330,20 +330,34 @@ async def admin_promo(interaction: discord.Interaction, action: app_commands.Cho
     await interaction.followup.send(msg, embed=_promos_embed(), ephemeral=True)
 
 
-@admin.command(name="import", description="Bring the old Payment Bot's members into this bot - scan the logs channel, then apply")
-@app_commands.describe(action="Scan = build a preview from #logs + audit log. Apply = create the records from the last scan",
+@admin.command(name="import", description="Bring the old Payment Bot's members into this bot - CSV or log scan, then apply")
+@app_commands.describe(action="CSV = preview from the old bot's export. Scan = from #logs + audit log. Apply = create the records",
+                       file="CSV: the old bot's subscriber export",
                        channel="Scan: the channel the old bot logged to (blank = the mod-log channel)")
 @app_commands.choices(action=[
-    app_commands.Choice(name="Scan - preview what would be imported", value="scan"),
-    app_commands.Choice(name="Apply - import everything from the last scan", value="apply"),
+    app_commands.Choice(name="CSV - preview from the old bot's subscriber export (attach file)", value="csv"),
+    app_commands.Choice(name="Scan - preview from the logs channel + audit log", value="scan"),
+    app_commands.Choice(name="Apply - import everything from the last preview", value="apply"),
 ])
-async def admin_import(interaction: discord.Interaction, action: app_commands.Choice[str], channel: discord.TextChannel = None):
+async def admin_import(interaction: discord.Interaction, action: app_commands.Choice[str], file: discord.Attachment = None,
+                       channel: discord.TextChannel = None):
     if not _admin_only(interaction):
         await interaction.response.send_message("Admins only.", ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
-    from sigma.payments import scan_old_bot, import_preview_embed, apply_import
+    from sigma.payments import scan_old_bot, import_preview_embed, apply_import, parse_csv_export
     from sigma.config import MOD_LOG_CHANNEL_ID
+    if action.value == "csv":
+        if file is None:
+            await interaction.followup.send("Attach the CSV with `file`.", ephemeral=True)
+            return
+        raw = await file.read()
+        res = parse_csv_export(raw.decode("utf-8-sig", errors="replace"))
+        if not res["rows"] and not res["lapsed"]:
+            await interaction.followup.send("Couldn't read any members from that file - is it the old bot's subscriber export?", ephemeral=True)
+            return
+        await interaction.followup.send(embed=import_preview_embed(res), ephemeral=True)
+        return
     if action.value == "scan":
         ch = channel or (interaction.guild.get_channel(MOD_LOG_CHANNEL_ID) if MOD_LOG_CHANNEL_ID else None)
         if ch is None:
@@ -355,9 +369,10 @@ async def admin_import(interaction: discord.Interaction, action: app_commands.Ch
             return
         await interaction.followup.send(embed=import_preview_embed(res), ephemeral=True)
         return
-    done, skipped = await apply_import(by=interaction.user.display_name)
-    await mod_log(f"**Import** by {interaction.user.display_name}: {done} member(s) imported, {skipped} skipped")
-    await interaction.followup.send(f"Imported **{done}** member(s), skipped {skipped} (expired / no plan / failed - see mod-log). "
+    done, skipped, archived = await apply_import(by=interaction.user.display_name)
+    await mod_log(f"**Import** by {interaction.user.display_name}: {done} member(s) imported, {skipped} skipped, {archived} expired archived")
+    await interaction.followup.send(f"Imported **{done}** member(s), skipped {skipped} (expired / no plan / failed - see mod-log), "
+                                    f"archived {archived} expired for revenue history. "
                                     f"Run `/admin members view:Unrecorded` to see what's left.", ephemeral=True)
 
 

@@ -229,7 +229,8 @@ async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = No
             member = None
     name = member.display_name if member else str(uid)
     subs = load_subs()
-    rec = subsvc.grant(subs, uid, name, plan, by, note=note, tx=tx, usd=(0.0 if expires_at else usd), expires_at=expires_at)
+    rec = subsvc.grant(subs, uid, name, plan, by, note=note, tx=tx,
+                       usd=(usd if usd is not None else (0.0 if expires_at else None)), expires_at=expires_at)
     save_subs(subs)
     ok = await _sub_grant_role(guild, uid) if guild else False
     p = plansvc.get(plan)
@@ -237,7 +238,7 @@ async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = No
     if member:
         try:
             e = discord.Embed(
-                title="Sigma Pro activated",
+                title="Sigma Pro - membership moved to the new bot" if expires_at else "Sigma Pro activated",
                 description=(f"**{p['label']}** is live.\n**Access until:** "
                              + ("lifetime" if p["days"] >= LIFETIME_DAYS else exp.strftime("%d %b %Y"))
                              + (f"\n\nTx: `{tx[:20]}...`" if tx else "")
@@ -898,11 +899,65 @@ async def scan_old_bot(guild: discord.Guild, log_channel: discord.TextChannel, o
     return {"rows": rows, "skipped": skipped, "cards": cards, "grants": len(grants)}
 
 
+def parse_csv_export(text: str) -> dict:
+    """The old Payment Bot's subscriber CSV -> {rows, lapsed, skipped}. Columns used: Discord User ID, Username,
+    Display Name, Status, Current Plan, Started, Expires, Total Paid (USD). Active -> import rows (preview),
+    expired -> archive rows (revenue + churn history)."""
+    import csv, io
+    rows, lapsed, skipped = {}, [], []
+    reader = csv.DictReader(io.StringIO(text))
+
+    def when(v):
+        v = (v or "").strip().replace(" UTC", "")
+        for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(v, fmt).replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        return None
+    for r in reader:
+        uid = (r.get("Discord User ID") or "").strip()
+        if not uid.isdigit():
+            continue
+        name = (r.get("Display Name") or "").strip() or (r.get("Username") or "").strip() or uid
+        parsed = parse_old_plan(r.get("Current Plan") or "")
+        start, exp = when(r.get("Started")), when(r.get("Expires"))
+        try:
+            usd = float((r.get("Total Paid (USD)") or "0").replace(",", "") or 0)
+        except ValueError:
+            usd = 0.0
+        if not parsed or exp is None:
+            skipped.append((uid, name))
+            continue
+        days, _plan_usd = parsed
+        plan = plan_key_for_days(days)
+        active = (r.get("Status") or "").strip().lower() == "active" and exp > _now()
+        if active:
+            rows[uid] = {"name": name, "days": days, "usd": usd, "start": (start or _now()).isoformat(), "expires": exp.isoformat(),
+                         "plan": plan, "source": "csv export", "already_expired": False}
+        else:
+            lapsed.append({"uid": uid, "name": name, "plan": plan, "price": plansvc.all().get(plan, {}).get("price"), "days": days,
+                           "started": (start or exp).isoformat(), "expires": exp.isoformat(), "reminded": [], "note": "old bot csv",
+                           "history": [{"plan": plan, "price": plansvc.all().get(plan, {}).get("price"), "usd": usd,
+                                        "at": (start or exp).isoformat(), "by": "old bot", "tx": None}],
+                           "lapsed_at": exp.isoformat(), "why": "expired (old bot)"})
+    st = load_payments()
+    st["import_preview"] = dict(rows)
+    st["import_lapsed"] = lapsed
+    save_payments(st)
+    return {"rows": rows, "lapsed": lapsed, "skipped": skipped, "cards": 0, "grants": 0, "source": "csv"}
+
+
 def import_preview_embed(res: dict) -> discord.Embed:
     rows = res["rows"]
     e = discord.Embed(title=f"Import preview - {len(rows)} member(s)", color=NAVY)
-    e.description = (f"Read {res['cards']} plan cards and {res['grants']} role grants from the old bot. "
-                     f"Run `/admin import action:Apply` to create these records (no revenue is counted).")
+    if res.get("source") == "csv":
+        total = sum(float(r.get("usd") or 0) for r in rows.values()) + sum(float(l["history"][0]["usd"] or 0) for l in res.get("lapsed", []))
+        e.description = (f"CSV export: **{len(rows)} active** members to import, **{len(res.get('lapsed', []))} expired** go to the archive "
+                         f"(revenue history ${total:,.0f}, churn). Run `/admin import action:Apply` to create the records.")
+    else:
+        e.description = (f"Read {res['cards']} plan cards and {res['grants']} role grants from the old bot. "
+                         f"Run `/admin import action:Apply` to create these records (no revenue is counted).")
     lines = []
     for uid, r in sorted(rows.items(), key=lambda x: x[1]["expires"]):
         exp = datetime.fromisoformat(r["expires"])
@@ -918,9 +973,11 @@ def import_preview_embed(res: dict) -> discord.Embed:
     return e
 
 
-async def apply_import(by: str) -> tuple[int, int]:
+async def apply_import(by: str) -> tuple[int, int, int]:
+    """Create records from the last preview. Returns (imported, skipped, archived)."""
     st = load_payments()
     rows = st.get("import_preview") or {}
+    pending_lapsed = st.get("import_lapsed") or []
     done = skipped = 0
     for uid, r in rows.items():
         if r.get("already_expired") or not r.get("plan"):
@@ -928,12 +985,22 @@ async def apply_import(by: str) -> tuple[int, int]:
             continue
         try:
             await activate(int(uid), r["plan"], by=by, note=f"imported from old bot ({r['source']})",
-                           expires_at=datetime.fromisoformat(r["expires"]))
+                           usd=r.get("usd"), expires_at=datetime.fromisoformat(r["expires"]))
             done += 1
         except Exception as ex:
             print(f"[import] {uid} failed: {ex}", flush=True)
             skipped += 1
     st = load_payments()
+    archived = 0
+    if pending_lapsed:
+        have = {(l.get("uid"), l.get("expires")) for l in (st.get("lapsed") or [])}
+        for l in pending_lapsed:
+            if (l.get("uid"), l.get("expires")) in have:
+                continue
+            st.setdefault("lapsed", []).append(l)
+            archived += 1
+        st["lapsed"] = st["lapsed"][-1000:]
     st["import_preview"] = {}
+    st["import_lapsed"] = []
     save_payments(st)
-    return done, skipped
+    return done, skipped, archived

@@ -505,8 +505,43 @@ def test_import_apply_uses_preview_and_skips_expired(bot_mod, plans_store, monke
     calls = []
     async def _act(uid, plan, by, tx=None, usd=None, note="", expires_at=None): calls.append((uid, plan, expires_at is not None))
     monkeypatch.setattr(pay, "activate", _act)
-    done, skipped = asyncio.run(pay.apply_import("admin"))
-    assert (done, skipped) == (1, 1) and calls == [(1, "3months", True)] and state["import_preview"] == {}
+    done, skipped, archived = asyncio.run(pay.apply_import("admin"))
+    assert (done, skipped, archived) == (1, 1, 0) and calls == [(1, "3months", True)] and state["import_preview"] == {}
+
+
+CSV_SAMPLE = """Discord User ID,Username,Display Name,In Server,Status,Current Plan,Started,Expires,Days Left,How Granted,Granted By,Total Paid (USD),Paid Purchases,Total Grants,First Seen
+962384339688108032,mika867372,NOTmichele bro,yes,active,Sigma Pro $500/6months,2026-09-30 10:02 UTC,2999-03-29 10:02 UTC,169,crypto payment,,600.00,2,2,2026-09-03 09:03 UTC
+918145305826959380,baap5467,Cryptokabaap,yes,active,Sigma Pro $100/Monthly,2026-10-08 00:49 UTC,2999-11-07 00:49 UTC,27,manual (/addsub),pyouki,0.00,0,1,2026-10-08 00:49 UTC
+1308358731679137843,thhb_0_09201,Thhb,yes,expired,Scient Pro - $250/3 Months,2026-05-29 15:47 UTC,2026-08-27 15:47 UTC,0,crypto payment,,350.00,2,2,2026-04-13 12:55 UTC
+249880856993202187,scient7793,Scient,yes,expired,Scient Pro - $100/Monthly,2026-03-24 13:56 UTC,2026-04-23 13:56 UTC,0,crypto payment,,1.99,1,1,2026-03-24 10:30 UTC
+notanid,x,,yes,active,Sigma Pro $100/Monthly,2026-10-08 00:49 UTC,2999-11-07 00:49 UTC,27,manual,,0,0,1,
+"""
+
+
+def test_csv_export_import_active_and_archive(bot_mod, plans_store, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    state = {}
+    monkeypatch.setattr(pay, "load_payments", lambda: state)
+    monkeypatch.setattr(pay, "save_payments", lambda d: state.update(d))
+    res = pay.parse_csv_export(CSV_SAMPLE)
+    assert set(res["rows"]) == {"962384339688108032", "918145305826959380"}
+    r = res["rows"]["962384339688108032"]
+    assert r["plan"] == "6months" and r["usd"] == 600.0 and r["expires"].startswith("2999-03-29") and not r["already_expired"]
+    assert [l["uid"] for l in res["lapsed"]] == ["1308358731679137843", "249880856993202187"]
+    assert res["lapsed"][0]["plan"] == "3months" and res["lapsed"][0]["history"][0]["usd"] == 350.0 and res["lapsed"][0]["why"].startswith("expired")
+    assert res["skipped"] == []
+    e = pay.import_preview_embed(res)
+    assert "2 active" in e.description and "2 expired" in e.description and "$952" in e.description
+    calls = []
+    async def _act(uid, plan, by, tx=None, usd=None, note="", expires_at=None): calls.append((uid, plan, usd))
+    monkeypatch.setattr(pay, "activate", _act)
+    done, skipped, archived = asyncio.run(pay.apply_import("admin"))
+    assert (done, skipped, archived) == (2, 0, 2) and calls[0] == (962384339688108032, "6months", 600.0)
+    assert len(state["lapsed"]) == 2 and state["import_lapsed"] == [] and state["import_preview"] == {}
+    # re-applying the same archive rows doesn't duplicate them
+    pay.parse_csv_export(CSV_SAMPLE)
+    _d, _s, archived2 = asyncio.run(pay.apply_import("admin"))
+    assert archived2 == 0 and len(state["lapsed"]) == 2
 
 
 # ---------------------------------------------------------------- USDC / USDT on Solana
