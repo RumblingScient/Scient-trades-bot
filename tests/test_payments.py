@@ -448,11 +448,14 @@ def test_pentest_admin_gates_on_sensitive_views(bot_mod):
     admin = next(c for c in tree.get_commands() if c.name == "admin")
     assert admin.default_permissions.administrator
     import inspect
-    for name in ("members", "plans", "promo", "grant", "revoke", "panel"):
+    for name in ("desk", "panel", "import"):
         src = inspect.getsource(next(s for s in admin.commands if s.name == name).callback)
         assert "administrator" in src or "_admin_only" in src, name
     pay = __import__("sigma.payments", fromlist=["x"])
     assert "administrator" in inspect.getsource(pay.MembersCSVView.send)
+    desk = __import__("sigma.admin_desk", fromlist=["x"])
+    assert "_is_admin" in inspect.getsource(desk.open_admin_desk) and "_is_admin" in inspect.getsource(desk.AdminDesk._apply)
+    assert "_is_admin" in inspect.getsource(desk.AdminDesk.on_csv)
 
 
 def test_grant_with_explicit_expiry_for_import():

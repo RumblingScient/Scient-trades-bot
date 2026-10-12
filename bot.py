@@ -32,6 +32,7 @@ import sigma.payments  # noqa: F401
 import sigma.actions  # noqa: F401
 import sigma.desk  # noqa: F401
 import sigma.commands_setup  # noqa: F401
+import sigma.admin_desk  # noqa: F401
 import sigma.commands_admin  # noqa: F401
 import sigma.aliases  # noqa: F401
 import sigma.health  # noqa: F401

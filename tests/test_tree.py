@@ -31,7 +31,8 @@ def test_setup_group(tree):
 def test_admin_group_hidden(tree):
     g, subs = _group(tree, "admin")
     assert g.default_permissions is not None and g.default_permissions.administrator
-    assert {"health", "terminal_check", "board", "results", "override", "recap", "tg", "panel", "grant", "revoke", "subs", "members", "plans", "promo"} <= set(subs)
+    assert {"health", "terminal_check", "board", "results", "override", "recap", "tg", "panel", "desk", "import"} <= set(subs)
+    assert not {"grant", "revoke", "subs", "members", "plans", "promo"} & set(subs), "members / plans / promos live on /admin desk now"
     assert [c.value for c in subs["recap"].parameters[0].choices] == ["week", "month", "journal"]
 
 

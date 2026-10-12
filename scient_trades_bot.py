@@ -34,6 +34,7 @@ _m = _il.import_module('sigma.payments'); globals().update({k: v for k, v in var
 _m = _il.import_module('sigma.actions'); globals().update({k: v for k, v in vars(_m).items() if not k.startswith('__')})
 _m = _il.import_module('sigma.desk'); globals().update({k: v for k, v in vars(_m).items() if not k.startswith('__')})
 _m = _il.import_module('sigma.commands_setup'); globals().update({k: v for k, v in vars(_m).items() if not k.startswith('__')})
+_m = _il.import_module('sigma.admin_desk'); globals().update({k: v for k, v in vars(_m).items() if not k.startswith('__')})
 _m = _il.import_module('sigma.commands_admin'); globals().update({k: v for k, v in vars(_m).items() if not k.startswith('__')})
 _m = _il.import_module('sigma.aliases'); globals().update({k: v for k, v in vars(_m).items() if not k.startswith('__')})
 _m = _il.import_module('sigma.health'); globals().update({k: v for k, v in vars(_m).items() if not k.startswith('__')})
