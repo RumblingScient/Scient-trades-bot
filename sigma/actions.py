@@ -97,6 +97,28 @@ async def commit_fix(kind: str, key: str, rec: dict, data: dict, change: str, no
     return f"Fixed: {change}"
 
 
+async def replace_chart(kind: str, key: str, rec: dict, data: dict, attachment) -> str:
+    """Re-upload the card with a new image (Discord can't swap an attachment in place). Returns the reply line."""
+    from datetime import datetime, timezone
+    from sigma.cards import build_embed, build_spot_embed
+    spot = kind == store.SPOT
+    channel = bot.get_channel(rec["channel_id"]) or await bot.fetch_channel(rec["channel_id"])
+    try:
+        msg = await channel.fetch_message(rec["message_id"])
+    except Exception:
+        raise UserError("Original card not found - it may have been deleted.")
+    f = await attachment.to_file()
+    rec["edited"] = True
+    rec["edited_at"] = datetime.now(timezone.utc).isoformat()
+    embed = (build_spot_embed if spot else build_embed)(rec)
+    embed.set_image(url=f"attachment://{f.filename}")
+    await msg.edit(embed=embed, attachments=[f])
+    data[key] = rec
+    store.save(kind, data)
+    await thread_note(rec, "**Chart replaced**")
+    return "Chart replaced on the card."
+
+
 async def reopen_trade(kind: str, key: str, rec: dict, data: dict) -> str:
     spot = kind == store.SPOT
     svc.reopen(kind, rec)

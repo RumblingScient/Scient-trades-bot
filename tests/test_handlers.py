@@ -152,7 +152,7 @@ def test_panel_gate(env):
 def test_futures_buttons_follow_state(env):
     it, view = _panel(env, "fut", "11", FakeUser(uid=1))
     labels = [b.label for b in view.children if hasattr(b, "label")]
-    assert labels == ["Entry filled", "TP hit", "Stop to entry", "Trail stop", "Stopped out", "Close", "Edit"]
+    assert labels == ["Entry filled", "TP hit", "Stop to entry", "Trail stop", "Stopped out", "Close", "Edit", "Replace chart"]
     assert _button(view, "TP hit").disabled and _button(view, "Stop to entry").disabled and not _button(view, "Entry filled").disabled
     it2 = FakeInteraction(FakeUser(uid=1))
     asyncio.run(_button(view, "Entry filled").callback(it2))
@@ -270,7 +270,7 @@ def test_edit_popup_changes_only_what_changed(env):
 def test_spot_panel_flow(env):
     it, view = _panel(env, "spot", "22", FakeUser(uid=2))
     labels = [b.label for b in view.children if hasattr(b, "label")]
-    assert labels == ["Buy", "Zone filled", "Sold", "Close", "Edit"]
+    assert labels == ["Buy", "Zone filled", "Sold", "Close", "Edit", "Replace chart"]
     it2 = FakeInteraction(FakeUser(uid=2))
     asyncio.run(_button(view, "Buy").callback(it2))
     _submit(it2, {"price": "1.0", "pct": "", "note": ""})
@@ -348,3 +348,37 @@ def test_parse_targets(env):
         parse_targets("1/2/3/4", 3)
     with pytest.raises(UserError, match="isn't a price"):
         parse_targets("1 / abc", 3)
+
+
+def test_replace_chart_from_panel(env, monkeypatch):
+    """Replace chart: the card is re-uploaded with the new image, record marked edited, thread noted."""
+    import sigma.actions as ac
+    edits = []
+
+    class Msg:
+        async def edit(self, **kw): edits.append(kw)
+
+    class Ch:
+        async def fetch_message(self, mid): return Msg()
+    monkeypatch.setattr(ac.bot, "get_channel", lambda cid: Ch())
+
+    class Att:
+        filename = "new.png"; content_type = "image/png"
+        async def to_file(self):
+            import discord, io
+            return discord.File(io.BytesIO(b"x"), filename="new.png")
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    assert "Replace chart" in [b.label for b in view.children if hasattr(b, "label")]
+    it2 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "Replace chart").callback(it2))
+    assert isinstance(it2.response.modal, env["desk"].ChartForm)
+    it3 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(it2.response.modal.on_ok(it3, Att()))
+    t = env["trades"]["11"]
+    assert edits and edits[-1]["attachments"][0].filename == "new.png" and edits[-1]["embed"].image.url == "attachment://new.png"
+    assert t["edited"] and view.last == "Chart replaced on the card." and env["calls"]["thread"][-1] == "**Chart replaced**"
+    # not an image -> refused, nothing edited
+    class Bad(Att):
+        content_type = "application/pdf"
+    asyncio.run(it2.response.modal.on_ok(FakeInteraction(FakeUser(uid=1)), Bad()))
+    assert view.last.startswith("\u26a0 That isn't an image") and len(edits) == 1

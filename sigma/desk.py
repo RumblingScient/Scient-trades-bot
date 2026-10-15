@@ -65,6 +65,27 @@ class Form(discord.ui.Modal):
             pass
 
 
+class ChartForm(discord.ui.Modal):
+    """Popup with a file picker - replaces the chart image on the card."""
+    def __init__(self, on_ok):
+        super().__init__(title="Replace the chart", timeout=600)
+        self.on_ok = on_ok
+        self.upload = discord.ui.FileUpload(custom_id="chart", required=True, min_values=1, max_values=1)
+        self.add_item(discord.ui.Label(text="New chart image", description="PNG / JPG - replaces the one on the card",
+                                       component=self.upload))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        files = list(self.upload.values or [])
+        await self.on_ok(interaction, files[0] if files else None)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print(f"[desk] chart form error: {error!r}", flush=True)
+        try:
+            await interaction.followup.send("Something broke on that upload - try again.", ephemeral=True)
+        except Exception:
+            pass
+
+
 # ----------------------------------------------------------------------------- the panel
 
 class Desk(discord.ui.View):
@@ -154,6 +175,7 @@ class Desk(discord.ui.View):
             self._btn("Sold", self.on_sold, discord.ButtonStyle.success, row=0)
             self._btn("Close", self.on_close, discord.ButtonStyle.danger, row=0)
             self._btn("Edit", self.on_edit, discord.ButtonStyle.secondary, row=1)
+            self._btn("Replace chart", self.on_chart, discord.ButtonStyle.secondary, row=1)
             opts = [("Invalidation - new level", "inv"), ("Invalidated - never filled / thesis gone", "ci"),
                     ("Undo last sell", "ul"), ("Fix a sell or buy (list + correct)", "fix"),
                     ("Rebuild target list from sells (repair)", "rtp")]
@@ -171,6 +193,7 @@ class Desk(discord.ui.View):
         self._btn("Stopped out", self.on_stopped, discord.ButtonStyle.danger, row=0, disabled=not filled)
         self._btn("Close", self.on_close, discord.ButtonStyle.danger, row=1, disabled=not filled)
         self._btn("Edit", self.on_edit, discord.ButtonStyle.secondary, row=1)
+        self._btn("Replace chart", self.on_chart, discord.ButtonStyle.secondary, row=1)
         track = "Tracking: turn ON (tracker re-armed)" if t.get("watch_disabled") else "Tracking: turn OFF (manual updates)"
         self.add_item(self._more([("Invalidated - never triggered", "ci"), ("Undo last take profit", "ul"),
                                   ("Fix a take profit (list + correct)", "fix"), (track, "track"),
@@ -356,6 +379,21 @@ class Desk(discord.ui.View):
             ("pct", "% of the bag sold here", pct_def, not pct_def, "e.g. 30 - blank = planned %"),
             ("note", "Note (optional)", "", False, ""),
         ], ok))
+
+    # ---- chart (both)
+    async def on_chart(self, interaction):
+        await interaction.response.send_modal(ChartForm(self._replace_chart))
+
+    async def _replace_chart(self, interaction, attachment):
+        """Swap the card's image for the uploaded one. No edit window - a wrong chart can be fixed any time."""
+        async def run(kind, key, rec, data):
+            if attachment is None:
+                raise UserError("No image received - pick a PNG or JPG.")
+            ctype = (getattr(attachment, "content_type", "") or "").lower()
+            if ctype and not ctype.startswith("image/"):
+                raise UserError("That isn't an image - upload a PNG or JPG.")
+            return await actions.replace_chart(kind, key, rec, data, attachment)
+        await self._apply(interaction, run)
 
     # ---- edit (both)
     async def on_edit(self, interaction):
