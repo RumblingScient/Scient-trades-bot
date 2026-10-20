@@ -31,8 +31,8 @@ class FakeResponse:
 
 
 class FakeFollowup:
-    def __init__(self): self.sent = []
-    async def send(self, msg=None, **kw): self.sent.append(msg)
+    def __init__(self): self.sent = []; self.views = []
+    async def send(self, msg=None, **kw): self.sent.append(msg); self.views.append(kw.get("view"))
 
 
 class FakeInteraction:
@@ -91,11 +91,6 @@ def _panel(env, kind, key, user):
 def _button(view, label):
     import discord
     return next(i for i in view.children if isinstance(i, discord.ui.Button) and i.label == label)
-
-
-def _select(view):
-    import discord
-    return next(i for i in view.children if isinstance(i, discord.ui.Select))
 
 
 def _confirm(view, user=None):
@@ -245,24 +240,79 @@ def test_fix_a_fill_from_panel(env):
     assert t["fills"] == [] and not t["tp1_hit"] and env["calls"]["thread"][-1].startswith("**Correction** - removed take profit #1")
 
 
-def test_edit_popup_changes_only_what_changed(env):
+def _edit(view, section, user=None):
+    """Press Edit, pick a section, return the interaction holding the popup."""
+    u = user or FakeUser(uid=1)
+    asyncio.run(_button(view, "Edit").callback(FakeInteraction(u)))
+    assert view.editing and _select(view, row=3) is not None
+    it = FakeInteraction(u, values=[section])
+    asyncio.run(_select(view, row=3).callback(it))
+    return it
+
+
+def _select(view, row=None):
+    import discord
+    sels = [i for i in view.children if isinstance(i, discord.ui.Select) and (row is None or i.row == row)]
+    return sels[0] if sels else None
+
+
+def test_edit_sections_cover_every_posting_field(env):
+    """Each section's popup maps back onto svc.edit; only changed fields are applied."""
     it, view = _panel(env, "fut", "11", FakeUser(uid=1))
-    it2 = FakeInteraction(FakeUser(uid=1))
-    asyncio.run(_button(view, "Edit").callback(it2))
-    m = it2.response.modal
-    assert m.inputs["targets"].default == "110 / 120" and m.inputs["stop"].default == "95"
-    _submit(it2, {"entry": "100", "stop": "94", "targets": "110 / 120 / 130", "risk_tf": "1 / 4H", "context": ""})
     t = env["trades"]["11"]
-    assert t["sl"] == "94" and t["initial_sl"] == "94" and t["tp3"] == "130" and t["timeframe"] == "4H"
-    assert env["calls"]["thread"][-1].startswith("**Edited** - corrected: stop, risk, TP1, TP2, TP3, TP4, timeframe")
-    # outside the window a non-admin is refused, an admin is not
+    # targets + split
+    it2 = _edit(view, "targets")
+    m = it2.response.modal
+    assert m.inputs["targets"].default == "110 / 120" and m.inputs["tp_split"].default == "50/50"
+    _submit(it2, {"targets": "110 / 120 / 130", "tp_split": "40/30/30"})
+    assert t["tp3"] == "130" and t["tp_split"] == [40.0, 30.0, 30.0] and not view.editing
+    assert env["calls"]["thread"][-1].startswith("**Edited** - corrected: TP1, TP2, TP3, TP4, TP split")
+    # levels: stop correction moves the posted stop; adding entry 2 turns it DCA
+    it3 = _edit(view, "levels")
+    _submit(it3, {"entry": "100", "entry2": "98", "entry_split": "30/70", "stop": "94"})
+    assert t["sl"] == "94" and t["initial_sl"] == "94" and t["entry2"] == "98" and t["entry_split"] == "30% / 70%"
+    # meta: risk / tf / framework / context
+    it4 = _edit(view, "meta")
+    _submit(it4, {"risk": "0.5", "timeframe": "4H", "framework": "FVG + Order Block", "context": "sweep"})
+    assert t["risk"] == "0.5" and t["timeframe"] == "4H" and t["frameworks"] == ["FVG", "Order Block"] and t["setup_detail"] == "sweep"
+    # identity
+    it5 = _edit(view, "identity")
+    _submit(it5, {"pair": "btc/usdt", "direction": "long", "entry_type": "limit"})
+    assert t["pair"] == "BTC/USDT"
+    _submit(it5, {"pair": "BTC/USDT", "direction": "sideways", "entry_type": "limit"})
+    assert view.last.startswith("\u26a0 Direction must be")
+    # notes -> thread
+    it6 = _edit(view, "notes")
+    _submit(it6, {"notes": "new reasoning"})
+    assert t["notes"] == "new reasoning" and env["calls"]["thread"][-1].startswith("**Reasoning (updated):** new reasoning")
+    # nothing changed -> refused
+    it7 = _edit(view, "notes")
+    _submit(it7, {"notes": "new reasoning"})
+    assert view.last.startswith("\u26a0 Nothing changed")
+    # window: card fields blocked for non-admin after 24h, notes still allowed
     t["created_at"] = "2020-01-01T00:00:00+00:00"
-    it3 = FakeInteraction(FakeUser(uid=1))
-    asyncio.run(_button(view, "Edit").callback(it3))
-    assert it3.response.modal is None and "Edit window" in view.last
-    it4 = FakeInteraction(FakeUser(uid=99, admin=True))
-    asyncio.run(_button(view, "Edit").callback(it4))
-    assert it4.response.modal is not None
+    it8 = _edit(view, "targets")
+    assert it8.response.modal is None and "Edit window" in view.last
+    it9 = _edit(view, "notes")
+    assert it9.response.modal is not None
+    it10 = _edit(view, "targets", FakeUser(uid=99, admin=True))
+    assert it10.response.modal is not None
+
+
+def test_spot_edit_sections(env):
+    it, view = _panel(env, "spot", "22", FakeUser(uid=2))
+    p = env["spots"]["22"]
+    it2 = _edit(view, "levels", FakeUser(uid=2))
+    _submit(it2, {"entry": "1.25 - 1.05", "stop": "weekly close below 0.95", "avg_entry": "1.12"})
+    assert p["dca_zone"] == "1.25 - 1.05" and p["invalidation"] == "weekly close below 0.95" and p["avg_entry"] == "1.12"
+    it3 = _edit(view, "targets", FakeUser(uid=2))
+    _submit(it3, {"targets": "1.5 / 2 / 2.6", "tp_split": "30/30/40"})
+    assert p["t3"] == "2.6" and p["tp_split"] == [30.0, 30.0, 40.0]
+    it4 = _edit(view, "meta", FakeUser(uid=2))
+    _submit(it4, {"risk": "5", "horizon": "3-6 months", "status": "holding"})
+    assert p["allocation"] == "5" and p["horizon"] == "3-6 months" and p["status"] == "HOLDING"
+    _submit(it4, {"risk": "5", "horizon": "3-6 months", "status": "mooning"})
+    assert view.last.startswith("\u26a0 Phase must be")
 
 
 # ----------------------------------------------------------------------------- spot
@@ -363,10 +413,10 @@ def test_replace_chart_from_panel(env, monkeypatch):
     monkeypatch.setattr(ac.bot, "get_channel", lambda cid: Ch())
 
     class Att:
-        filename = "new.png"; content_type = "image/png"
+        filename = "Screenshot 2026-10-21 at 2.22 AM.png"; content_type = "image/png"
         async def to_file(self):
             import discord, io
-            return discord.File(io.BytesIO(b"x"), filename="new.png")
+            return discord.File(io.BytesIO(b"x"), filename=self.filename)
     it, view = _panel(env, "fut", "11", FakeUser(uid=1))
     assert "Replace chart" in [b.label for b in view.children if hasattr(b, "label")]
     it2 = FakeInteraction(FakeUser(uid=1))
@@ -375,7 +425,7 @@ def test_replace_chart_from_panel(env, monkeypatch):
     it3 = FakeInteraction(FakeUser(uid=1))
     asyncio.run(it2.response.modal.on_ok(it3, Att()))
     t = env["trades"]["11"]
-    assert edits and edits[-1]["attachments"][0].filename == "new.png" and edits[-1]["embed"].image.url == "attachment://new.png"
+    assert edits and edits[-1]["attachments"][0].filename == "chart.png" and edits[-1]["embed"].image.url == "attachment://chart.png"
     assert t["edited"] and view.last == "Chart replaced on the card." and env["calls"]["thread"][-1] == "**Chart replaced**"
     # not an image -> refused, nothing edited
     class Bad(Att):
@@ -394,3 +444,54 @@ def test_cancel_entry_2_only_offered_on_open_dca(env):
     assert "e2x" not in [o.value for o in _select(view).options]
     e = env["desk"].bot and __import__("sigma.cards", fromlist=["x"]).build_embed(t)
     assert "E2 98 cancelled" in [f.value for f in e.fields if f.name == "ENTRY"][0]
+
+
+def test_entry_fill_in_error_offered_and_invalidate_hidden_once_filled(env):
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    vals = [o.value for o in _select(view).options]
+    assert "ci" in vals and "efx" not in vals             # pending: can be invalidated, nothing to clear
+    _click(view, "Entry filled")
+    vals = [o.value for o in _select(view).options]
+    assert "efx" in vals and "ci" not in vals             # filled: close it, don't invalidate it
+    _pick(view, "efx")
+    t = env["trades"]["11"]
+    assert not t["entry1_filled"] and env["calls"]["feed"][-1][0] == "Entry fill cleared"
+    assert "ci" in [o.value for o in _select(view).options]
+
+
+def test_levels_edit_prefills_the_posted_stop_not_the_trailed_one(env):
+    env["trades"]["11"].update({"entry1_filled": True, "initial_sl": "95", "sl": "99"})
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    it2 = _edit(view, "levels", FakeUser(uid=1))
+    modal = it2.response.modal
+    stop_input = next(i for i in modal.children if getattr(i, "label", "").startswith("Posted stop"))
+    assert stop_input.default == "95"
+
+
+
+def test_setup_error_keeps_the_draft_and_fix_popup_reposts(env):
+    """A five-minute form is never retyped: the error carries a Fix & post button, the popup is prefilled,
+    and the corrected draft posts with everything else untouched."""
+    import discord
+    from sigma import commands_setup as cs
+    from sigma.errors import UserError
+    posted = []
+
+    async def post(it, d):
+        if len(cs.actions.parse_targets(d["targets"], 4)) > 4 or "x" in d["targets"]:
+            raise UserError("Target `x` isn't a price")
+        posted.append(dict(d))
+    draft = {"pair": "fet", "zone": "1.2 - 1.0", "targets": "1.5 / x", "stop": None, "tp_split": None, "avg_entry": None,
+             "play_type": "SCALING", "allocation": "5", "horizon": None, "chart": "CHART", "notes": "thesis"}
+    it = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(cs._run_draft(it, draft, True, post))
+    assert posted == [] and "Fix & post" in it.followup.sent[-1] and it.followup.views[-1] is not None
+    view = it.followup.views[-1]
+    btn = next(i for i in view.children if isinstance(i, discord.ui.Button))
+    it2 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(btn.callback(it2))
+    modal = it2.response.modal
+    assert modal is not None and modal.inputs["targets"].default == "1.5 / x" and modal.inputs["zone"].default == "1.2 - 1.0"
+    it3 = _submit(it2, {"targets": "1.5 / 2", "zone": "1.2 - 1.0"})
+    assert len(posted) == 1 and posted[0]["targets"] == "1.5 / 2" and posted[0]["chart"] == "CHART" \
+        and posted[0]["notes"] == "thesis" and posted[0]["play_type"] == "SCALING"

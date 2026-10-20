@@ -47,9 +47,12 @@ class Form(discord.ui.Modal):
         super().__init__(title=title[:45], timeout=600)
         self.on_ok = on_ok
         self.inputs = {}
-        for key, label, default, required, ph in fields[:5]:
-            ti = discord.ui.TextInput(label=label[:45], default=(str(default)[:200] if default not in (None, "") else None),
-                                      required=required, placeholder=(ph or None)[:100] if ph else None, max_length=200)
+        for spec in fields[:5]:
+            key, label, default, required, ph = spec[:5]
+            max_len = spec[5] if len(spec) > 5 else 200
+            style = discord.TextStyle.paragraph if max_len > 200 else discord.TextStyle.short
+            ti = discord.ui.TextInput(label=label[:45], default=(str(default)[:max_len] if default not in (None, "") else None),
+                                      required=required, placeholder=(ph or None)[:100] if ph else None, max_length=max_len, style=style)
             self.add_item(ti)
             self.inputs[key] = ti
 
@@ -96,6 +99,7 @@ class Desk(discord.ui.View):
         self.spot = kind == store.SPOT
         self.last = ""
         self.pending = None          # (label, coroutine factory) - an instant action waiting for Confirm
+        self.editing = False         # Edit pressed - section picker shown in row 3
         self.rebuild()
 
     # ---- state
@@ -169,6 +173,11 @@ class Desk(discord.ui.View):
         if closed:
             self.add_item(self._more([("Reopen - the close was wrong", "reopen")]))
             return
+        if getattr(self, "editing", False):
+            sel = discord.ui.Select(placeholder="Edit what\u2026", row=3, min_values=1, max_values=1,
+                                    options=[discord.SelectOption(label=l, value=v) for l, v in (self.SPOT_SECTIONS if self.spot else self.FUT_SECTIONS)])
+            sel.callback = self.on_edit_pick
+            self.add_item(sel)
         if self.spot:
             self._btn("Buy", self.on_buy, discord.ButtonStyle.primary, row=0)
             self._btn("Zone filled", self.on_zone, discord.ButtonStyle.primary, row=0, disabled=bool(t.get("zone_filled")))
@@ -198,8 +207,12 @@ class Desk(discord.ui.View):
         opts = [("Invalidated - never triggered", "ci"), ("Undo last take profit", "ul"),
                 ("Fix a take profit (list + correct)", "fix"), (track, "track"),
                 ("Rebuild TP list from fills (repair)", "rtp")]
+        if filled and not [f for f in (t.get("fills") or []) if f.get("label", "").startswith("TP")]:
+            opts.insert(0, ("Entry fill recorded in error - back to pending", "efx"))
         if t.get("entry2") and not t.get("entry2_filled"):
             opts.insert(0, ("Cancel entry 2 - DCA leg pulled, entry 1 only", "e2x"))
+        if filled:
+            opts = [o for o in opts if o[1] != "ci"]          # a filled setup is closed, not invalidated
         self.add_item(self._more(opts))
 
     def _btn(self, label, cb, style, row=0, disabled=False):
@@ -398,67 +411,163 @@ class Desk(discord.ui.View):
             return await actions.replace_chart(kind, key, rec, data, attachment)
         await self._apply(interaction, run)
 
-    # ---- edit (both)
-    async def on_edit(self, interaction):
-        t = self.rec()
-        if not _is_admin(interaction) and not within_edit_window(t):
-            self.last = f"⚠ Edit window ({EDIT_WINDOW_MIN // 60}h) has passed - ask an admin, or log what happened with the buttons."
-            await interaction.response.defer(); await self._refresh(interaction); return
-        if self.spot:
-            tgt = " / ".join(str(t.get(k)) for k in ("t1", "t2", "t3") if t.get(k))
-            fields = [("entry", "Buy zone", t.get("dca_zone") or "", False, ""),
-                      ("stop", "Invalidation", t.get("invalidation") or "", False, ""),
-                      ("targets", "Targets (up to 3)", tgt, False, "e.g. 1.5 / 2 / 2.6"),
-                      ("avg_entry", "Average entry", t.get("avg_entry") or "", False, ""),
-                      ("risk", "Allocation %", t.get("allocation") or "", False, "")]
-            keys = ("t1", "t2", "t3"); mapk = ("tp1", "tp2", "tp3")
-        else:
-            tgt = " / ".join(str(t.get(k)) for k in ("tp1", "tp2", "tp3", "tp4") if t.get(k))
-            e_def = str(t.get("entry") or "") + (f" / {t['entry2']}" if t.get("entry2") else "")
-            fields = [("entry", "Entry (DCA: entry 1 / entry 2)", e_def, False, ""),
-                      ("stop", "Stop", ((t.get("sl_condition") + " ") if t.get("sl_condition") else "") + str(t.get("sl") or ""), False, ""),
-                      ("targets", "Targets (up to 4)", tgt, False, "e.g. 104000 / 108000"),
-                      ("risk_tf", "Risk % / timeframe", f"{t.get('risk') or 1} / {t.get('timeframe') or ''}".strip(" /"), False, "e.g. 1 / 4H"),
-                      ("context", "Context line", t.get("setup_detail") or "", False, "")]
-            keys = ("tp1", "tp2", "tp3", "tp4"); mapk = keys
-        before = {f[0]: f[2] for f in fields}
+    # ---- edit (both) - sectioned: every field the post command takes has an edit popup here
+    # (modals hold 5 inputs, so Edit first asks which section)
+    FUT_SECTIONS = [("Levels - entry, entry 2, split, stop", "levels"), ("Targets - prices, TP split", "targets"),
+                    ("Risk, timeframe, framework, context", "meta"), ("Pair, direction, entry type", "identity"),
+                    ("Reasoning - thread note", "notes")]
+    SPOT_SECTIONS = [("Zone, invalidation, average entry", "levels"), ("Targets - prices, TP split", "targets"),
+                     ("Plan - allocation, horizon, phase", "meta"), ("Pair", "identity"), ("Thesis - thread note", "notes")]
 
-        async def ok(i, v):
-            async def run(kind, key, rec, data):
+    async def on_edit(self, interaction):
+        """Show the section picker (row 3); the pick opens the right popup."""
+        self.editing = not getattr(self, "editing", False)
+        self.last = "Pick what to edit below." if self.editing else ""
+        if not interaction.response.is_done():
+            await interaction.response.defer()
+        await self._refresh(interaction)
+
+    def _edit_fields(self, t: dict, section: str):
+        """(fields for Form, mapper(values) -> svc.edit dict, window_exempt)"""
+        spot = self.spot
+        if section == "levels":
+            if spot:
+                fields = [("entry", "Buy zone", t.get("dca_zone") or "", False, "e.g. 65 - 52"),
+                          ("stop", "Invalidation", t.get("invalidation") or "", False, "e.g. weekly close below 48"),
+                          ("avg_entry", "Average entry (blank = clear it)", t.get("avg_entry") or "", False, ""),
+                          ("zone_filled", "Zone filled? (yes / no)", "yes" if t.get("zone_filled") else "no", False, "")]
+                def mp(v, b):
+                    f = {}
+                    if v["entry"] != b["entry"]: f["entry"] = v["entry"]
+                    if v["stop"] != b["stop"]: f["stop"] = v["stop"]
+                    if v["avg_entry"] != b["avg_entry"]: f["avg_entry"] = v["avg_entry"]
+                    zf = (v.get("zone_filled") or "").strip().lower()
+                    if zf and zf != b["zone_filled"]:
+                        if zf not in ("yes", "no", "y", "n"):
+                            raise UserError("Zone filled must be yes or no.")
+                        f["zone_filled"] = zf in ("yes", "y")
+                    return f
+                return fields, mp, False
+            fields = [("entry", "Entry (DCA: entry 1)", str(t.get("entry") or ""), False, ""),
+                      ("entry2", "Entry 2 (DCA leg; clear it = remove the leg)", str(t.get("entry2") or ""), False, "blank = no DCA leg"),
+                      ("entry_split", "DCA split e.g. 20/80 (blank = 50/50)", str(t.get("entry_split") or "").replace("%", "").replace(" ", ""), False, ""),
+                      ("stop", "Posted stop (R is measured from it)", ((t.get("sl_condition") + " ") if t.get("sl_condition") else "") + str(t.get("initial_sl") or t.get("sl") or ""), False, "")]
+            def mp(v, b):
                 f = {}
-                if v["entry"] != before["entry"]:
-                    if self.spot:
-                        f["entry"] = v["entry"]
-                    else:
-                        parts = [p.strip() for p in v["entry"].split("/")]
-                        f["entry"] = parts[0]
-                        if len(parts) > 1 and parts[1]:
-                            f["entry2"] = parts[1]
-                if v["stop"] != before["stop"]:
-                    f["stop"] = v["stop"]
-                if v["targets"] != before["targets"]:
+                if v["entry"] != b["entry"]: f["entry"] = v["entry"]
+                if v["entry2"] != b["entry2"]:
+                    f["entry2"] = v["entry2"]                 # blank = remove the leg (svc.edit refuses if it already filled)
+                if v["entry_split"] != b["entry_split"]: f["entry_split"] = v["entry_split"] or " "
+                if v["stop"] != b["stop"]: f["stop"] = v["stop"]
+                return f
+            return fields, mp, False
+        if section == "targets":
+            keys = ("t1", "t2", "t3", "t4") if spot else ("tp1", "tp2", "tp3", "tp4")
+            mapk = ("tp1", "tp2", "tp3", "tp4")
+            tgt = " / ".join(str(t.get(k)) for k in keys if t.get(k))
+            split = t.get("tp_split") or []
+            split_txt = "/".join(f"{float(x):g}" for x in split) if split else ""
+            fields = [("targets", f"Targets (up to {len(keys)})", tgt, False, "e.g. 104000 / 108000 / 112000"),
+                      ("tp_split", "Planned % per target (blank = none)", split_txt, False, "e.g. 40/30/30")]
+            def mp(v, b):
+                f = {}
+                norm = lambda x: [p for p in actions.parse_targets(x, len(keys))] if x.strip() else []
+                if norm(v["targets"]) != norm(b["targets"]):
                     tl = actions.parse_targets(v["targets"], len(keys))
                     for n, mk in enumerate(mapk):
                         f[mk] = tl[n] if n < len(tl) else ""
-                if self.spot:
-                    if v["avg_entry"] != before["avg_entry"]:
-                        f["avg_entry"] = v["avg_entry"]
-                    if v["risk"] != before["risk"]:
-                        f["risk"] = v["risk"]
-                else:
-                    if v["risk_tf"] != before["risk_tf"]:
-                        parts = [p.strip() for p in v["risk_tf"].split("/")]
-                        f["risk"] = parts[0] or "1"
-                        if len(parts) > 1:
-                            f["timeframe"] = parts[1]
-                    if v["context"] != before["context"]:
-                        f["context"] = v["context"]
+                if v["tp_split"] != b["tp_split"]:
+                    f["tp_split"] = v["tp_split"] or " "
+                return f
+            return fields, mp, False
+        if section == "meta":
+            if spot:
+                fields = [("risk", "Allocation %", t.get("allocation") or "", False, ""),
+                          ("horizon", "Horizon", t.get("horizon") or "", False, "e.g. 3-6 months"),
+                          ("status", "Phase", (t.get("status") or "").lower(), False, "watching / accumulating / holding / trimmed / distributing")]
+                def mp(v, b):
+                    f = {}
+                    if v["risk"] != b["risk"]: f["risk"] = v["risk"]
+                    if v["horizon"] != b["horizon"]: f["horizon"] = v["horizon"]
+                    if v["status"] != b["status"]:
+                        st = v["status"].strip().upper()
+                        if st not in SPOT_STATUSES:
+                            raise UserError("Phase must be one of: " + ", ".join(s.lower() for s in SPOT_STATUSES))
+                        f["status"] = st
+                    return f
+                return fields, mp, True
+            fw = " + ".join(t.get("frameworks") or ([t["framework"]] if t.get("framework") else []))
+            fields = [("risk", "Risk %", str(t.get("risk") or "1"), False, ""),
+                      ("timeframe", "Timeframe", t.get("timeframe") or "", False, "e.g. 4H"),
+                      ("framework", "Framework (two: A + B)", fw, False, ""),
+                      ("context", "Context line", t.get("setup_detail") or "", False, "")]
+            def mp(v, b):
+                from sigma.commands_setup import _framework_value, _frameworks_list
+                f = {}
+                if v["risk"] != b["risk"]: f["risk"] = v["risk"] or "1"
+                if v["timeframe"] != b["timeframe"]: f["timeframe"] = v["timeframe"]
+                if v["framework"] != b["framework"]:
+                    fws = _frameworks_list(_framework_value(v["framework"]) or "")
+                    f["framework"] = fws[0] if fws else ""
+                    f["framework2"] = fws[1] if len(fws) > 1 else None
+                if v["context"] != b["context"]: f["context"] = v["context"]
+                return f
+            return fields, mp, False
+        if section == "identity":
+            fields = [("pair", "Pair", t.get("pair") or "", False, "")]
+            if not spot:
+                fields += [("direction", "Direction (long / short)", (t.get("direction") or "").lower(), False, ""),
+                           ("entry_type", "Entry type (limit / market)", (t.get("entry_type") or "limit").lower(), False, "")]
+            def mp(v, b):
+                f = {}
+                if v["pair"].strip().upper() != b["pair"].upper(): f["pair"] = v["pair"].strip().upper()
+                if not spot:
+                    v = dict(v, direction=v["direction"].strip().lower(), entry_type=v["entry_type"].strip().lower())
+                    if v["direction"] != b["direction"]:
+                        d = v["direction"].strip().upper()
+                        if d not in ("LONG", "SHORT"):
+                            raise UserError("Direction must be long or short.")
+                        f["direction"] = d
+                    if v["entry_type"] != b["entry_type"]:
+                        et = v["entry_type"].strip().upper()
+                        if et not in ("LIMIT", "MARKET"):
+                            raise UserError("Entry type must be limit or market (DCA = give entry 2 in Levels).")
+                        f["entry_type"] = et
+                return f
+            return fields, mp, False
+        if section == "notes":
+            cur = (t.get("thesis") if spot else t.get("notes")) or ""
+            fields = [("notes", "Thesis" if spot else "Reasoning", cur, False, "posted in the thread, not on the card", 1900)]
+            def mp(v, b):
+                return {"notes": v["notes"]} if v["notes"] != b["notes"] else {}
+            return fields, mp, True
+        raise UserError("Unknown section.")
+
+    async def on_edit_pick(self, interaction):
+        section = (interaction.data.get("values") or [""])[0]
+        self.editing = False
+        t = self.rec()
+        try:
+            fields, mapper, exempt = self._edit_fields(t, section)
+        except UserError as e:
+            self.last = f"\u26a0 {e.message}"
+            await interaction.response.defer(); await self._refresh(interaction); return
+        if not exempt and not _is_admin(interaction) and not within_edit_window(t):
+            self.last = f"\u26a0 Edit window ({EDIT_WINDOW_MIN // 60}h) has passed for card fields - ask an admin, or log what happened with the buttons."
+            await interaction.response.defer(); await self._refresh(interaction); return
+        before = {f[0]: f[2] for f in fields}
+        title = next(l for l, v in (self.SPOT_SECTIONS if self.spot else self.FUT_SECTIONS) if v == section)
+
+        async def ok(i, v):
+            async def run(kind, key, rec, data):
+                f = mapper(v, before)
                 if not f:
                     raise UserError("Nothing changed.")
+                notes = f.get("notes")
                 changes = svc.edit(kind, rec, f)
-                return await actions.commit_edit(kind, key, rec, data, changes)
+                return await actions.commit_edit(kind, key, rec, data, changes, notes=notes)
             await self._apply(i, run)
-        await interaction.response.send_modal(self._form("Edit the card", fields, ok))
+        await interaction.response.send_modal(self._form(f"Edit - {title.split(' - ')[0]}", fields, ok))
 
     # ---- more
     async def on_more(self, interaction):
@@ -468,12 +577,13 @@ class Desk(discord.ui.View):
                 return await actions.reopen_trade(kind, key, rec, data)
             await self._ask(interaction, "Reopen", "reverses the close, deletes the results card and rebuilds the summary.",
                             lambda i: self._apply(i, run)); return
-        if val in ("ci", "ul", "rtp", "e2x"):
+        if val in ("ci", "ul", "rtp", "e2x", "efx"):
             what = {"ci": "closes the trade as never triggered / thesis gone - it goes to results as Invalidated.",
                     "ul": "removes the last recorded take profit.",
                     "rtp": "re-derives the TP ticks from the recorded fills (repair only).",
-                    "e2x": "removes the unfilled DCA leg - R, sizing and the card run from entry 1 only. The stop stays; trail it after if needed."}[val]
-            label = {"ci": "Invalidated", "ul": "Undo last take profit", "rtp": "Rebuild TP list", "e2x": "Cancel entry 2"}[val]
+                    "e2x": "removes the unfilled DCA leg - R, sizing and the card run from entry 1 only. The stop stays; trail it after if needed.",
+                    "efx": "clears the entry-filled flag(s) - the setup goes back to pending and the tracker watches the entry again."}[val]
+            label = {"ci": "Invalidated", "ul": "Undo last take profit", "rtp": "Rebuild TP list", "e2x": "Cancel entry 2", "efx": "Clear entry fill"}[val]
             await self._ask(interaction, label, what, lambda i, ev=val.upper(): self._event(i, ev)); return
         if val.startswith("st:"):
             async def run(kind, key, rec, data):

@@ -243,9 +243,13 @@ def next_target(t: dict, spot: bool = False):
 
 
 def fx(v) -> str:
-    """Card price format: fnum without a dead `.00` tail (100,000.00 -> 100,000)."""
+    """Card price format: fnum without a dead `.00` tail (100,000.00 -> 100,000; 1,000.50 -> 1,000.5; 0 -> 0)."""
+    if v is None:
+        return "-"
     out = fnum(v)
-    return out[:-3] if out.endswith(".00") else out
+    if "." in out and out.split(".")[0].replace(",", "").isdigit() and float(v) >= 1:
+        out = out.rstrip("0").rstrip(".")
+    return out or "0"
 
 
 HAIRLINE = "\u2500" * 26

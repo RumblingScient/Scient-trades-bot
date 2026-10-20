@@ -39,6 +39,17 @@ def parse_targets(text, limit: int) -> list:
     return [p.lstrip("$") for p in parts]
 
 
+async def chart_file(attachment) -> discord.File:
+    """Attachment -> File named chart.<ext>. A fixed ASCII name keeps the embed's attachment:// reference
+    matching whatever Discord stores (it rewrites spaces and odd characters on upload)."""
+    f = await attachment.to_file()
+    ext = (str(getattr(attachment, "filename", "") or "").rsplit(".", 1)[-1] or "png").lower()
+    if ext not in ("png", "jpg", "jpeg", "webp", "gif"):
+        ext = "png"
+    f.filename = f"chart.{ext}"
+    return f
+
+
 def card_view(kind: str, key) -> discord.ui.View:
     return SpotCardView(key) if kind == store.SPOT else TradeSizerView(key)
 
@@ -107,7 +118,7 @@ async def replace_chart(kind: str, key: str, rec: dict, data: dict, attachment) 
         msg = await channel.fetch_message(rec["message_id"])
     except Exception:
         raise UserError("Original card not found - it may have been deleted.")
-    f = await attachment.to_file()
+    f = await chart_file(attachment)
     rec["edited"] = True
     rec["edited_at"] = datetime.now(timezone.utc).isoformat()
     embed = (build_spot_embed if spot else build_embed)(rec)

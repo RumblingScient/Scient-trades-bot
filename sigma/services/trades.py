@@ -20,7 +20,7 @@ BE_R_BAND = 0.05      # |R| at or under this = breakeven
 BE_PCT_BAND = 0.5     # spot with no invalidation: |%| at or under this = breakeven
 
 FUT_TP_KEYS = ("tp1", "tp2", "tp3", "tp4")
-SPOT_TP_KEYS = ("t1", "t2", "t3")
+SPOT_TP_KEYS = ("t1", "t2", "t3", "t4")
 
 # (value, label) - the event vocabulary, one list per market. The Manage panel (sigma.desk) and the tracker
 # both go through apply_event(); the labels document what each code means.
@@ -28,6 +28,7 @@ FUT_EVENTS = [
     ("EF1",  "Entry filled (DCA: entry 1)"),
     ("EF2",  "Entry 2 filled - DCA leg, full position live"),
     ("E2X",  "Cancel entry 2 - DCA leg pulled, position is entry 1 only"),
+    ("EFX",  "Entry fill recorded in error - clear the fill flags (no take profits yet)"),
     ("TPN",  "Preset TP reached - next one, or all up to price"),
     ("PTP",  "Take profit at a price - needs price + pct"),
     ("BE",   "Stop to entry - risk-free, R:R stays on the original risk"),
@@ -169,16 +170,18 @@ def build_futures(*, analyst: dict, pair: str, direction: str, entry: str, stop:
     }
 
 
-def build_spot(*, analyst: dict, pair: str, zone: str, tp1: str, tp2=None, tp3=None, tp_split=None,
+def build_spot(*, analyst: dict, pair: str, zone: str, tp1: str, tp2=None, tp3=None, tp4=None, tp_split=None,
                stop=None, avg_entry=None, play_type=None, allocation=None, horizon=None, notes=None) -> dict:
-    """Validated spot record. play_type defaults: Scaling if avg_entry given, else Fresh."""
+    """Validated spot record. play_type defaults: Scaling if avg_entry given, else Fresh.
+    Nothing here blocks a post that can be read two ways - Fresh + avg_entry means Scaling, Scaling without an
+    avg_entry just has no buys recorded yet (log them from Manage)."""
     pt = (play_type or ("SCALING" if avg_entry else "FRESH")).upper()
-    n_t = sum(1 for x in (tp1, tp2, tp3) if x)
+    if pt == "FRESH" and avg_entry:
+        pt = "SCALING"
+    n_t = sum(1 for x in (tp1, tp2, tp3, tp4) if x)
     split_list, split_err = parse_spot_split(tp_split, n_t)
     if split_err:
         raise UserError(split_err)
-    if pt in ("SCALING", "FILLED") and not avg_entry:
-        raise UserError(f"avg_entry is required for a {pt.title()} play - that's the number members anchor to.")
     if spot_num(tp1) is None:
         raise UserError("tp1 must be a price.")
     return {
@@ -188,8 +191,8 @@ def build_spot(*, analyst: dict, pair: str, zone: str, tp1: str, tp2=None, tp3=N
         "analyst_color": analyst.get("color"),
         "pair": pair, "dca_zone": zone, "allocation": allocation,
         "avg_entry": (avg_entry if pt != "FRESH" else None), "avg_exit": None,
-        "t1": tp1, "t2": tp2, "t3": tp3, "tp_split": split_list,
-        "t1_hit": False, "t2_hit": False, "t3_hit": False,
+        "t1": tp1, "t2": tp2, "t3": tp3, "t4": tp4, "tp_split": split_list,
+        "t1_hit": False, "t2_hit": False, "t3_hit": False, "t4_hit": False,
         "invalidation": stop, "thesis": notes, "horizon": horizon,
         "buys": ([{"price": spot_num(avg_entry), "pct": None}] if pt != "FRESH" and spot_num(avg_entry) else []),
         "status": ("HOLDING" if pt == "FILLED" else "ACCUMULATING"),
@@ -263,6 +266,24 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
             reached = [k for k, tpx in pend if (px >= tpx if is_long else px <= tpx)]
             if not reached:
                 raise UserError(f"Price {fmt(px)} hasn't reached the next planned target ({fmt(pend[0][1])}) - use **Take profit at a price** for a discretionary exit.")
+            if len(reached) > 1 and pct is None:
+                # price ran through several planned targets - book each one at its own level and planned %,
+                # the last at the price given, so the card and the journal match what the plan said
+                last = None
+                for k in reached:
+                    if t.get("closed"):
+                        break
+                    at = px if k == reached[-1] else numf(t.get(k))
+                    last = apply_event(kind, t, k.upper(), price=at, pct=None, note=(note if k == reached[-1] else None))
+                names = ", ".join(k.upper() for k in reached)
+                if last.closed:
+                    last.desc = f"{names} reached @ {fmt(px)} - " + last.desc.split(" - ", 1)[-1]
+                else:
+                    last.desc = f"{names} reached @ {fmt(px)}"
+                    last.title = f"{reached[0].upper()}-{reached[-1].upper()} reached"
+                    tail = last.line.split("\n", 1)[1] if "\n" in last.line else ""
+                    last.line = last.desc + (f"\n{tail}" if tail else "")
+                return last
             ev = reached[-1].upper()
         else:
             ev = pend[0][0].upper()
@@ -370,6 +391,22 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
         d = "DCA entry filled - full position live"
         return Outcome(desc=d, title="Entry 2 filled", color=BLUE, line=d + ".")
 
+    if ev == "EFX":
+        if spot:
+            raise UserError("Spot buys are a list - remove one with Fix a fill.")
+        if [f for f in (t.get("fills") or []) if _is_tp_fill(f)]:
+            raise UserError("Take profits are recorded on this trade - undo those first (Undo last take profit).")
+        if not (t.get("entry1_filled") or t.get("entry2_filled")):
+            raise UserError("No entry fill is recorded.")
+        t["entry1_filled"] = False
+        t["entry2_filled"] = False
+        if t.get("be"):
+            t["be"] = False
+            t["sl"] = str(t.get("initial_sl") or t.get("sl"))
+            t["sl_condition"] = None
+        d = "Entry fill cleared - back to pending"
+        return Outcome(desc=d, title="Entry fill cleared", color=GREY, line=d + ".")
+
     if ev == "E2X":
         if spot:
             raise UserError("Spot has no Entry 2.")
@@ -452,6 +489,8 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
             t["close_note"] = note or "Zone never filled - play cancelled before entry"
             t["status"] = "INVALIDATED"
             return Outcome(desc="Invalidated", title="Spot Invalidated", color=DGREY, line="Thesis invalidated.", closed=True)
+        if t.get("entry1_filled") or t.get("entry2_filled") or (t.get("fills") or []):
+            raise UserError("This setup has fills - close it with **Close** (or Stopped out) so the result is graded, not invalidated.")
         t["closed"] = True
         t["result"] = "INVALID"
         t["closed_at"] = _now()
@@ -568,6 +607,7 @@ def edit(kind: str, t: dict, fields: dict) -> list:
     v = fields
     if v.get("pair") is not None:
         t["pair"] = v["pair"]; ch.append("pair")
+        t["watch_verified"] = False                            # tracker re-checks the price feed on the new symbol
     if spot:
         if v.get("entry") is not None:
             t["dca_zone"] = v["entry"]; ch.append("zone")
@@ -575,7 +615,7 @@ def edit(kind: str, t: dict, fields: dict) -> list:
             t["invalidation"] = v["stop"]; ch.append("invalidation")
         if v.get("risk") is not None:
             t["allocation"] = v["risk"]; ch.append("allocation")
-        for k, key in (("tp1", "t1"), ("tp2", "t2"), ("tp3", "t3")):
+        for k, key in (("tp1", "t1"), ("tp2", "t2"), ("tp3", "t3"), ("tp4", "t4")):
             if v.get(k) is not None:
                 t[key] = v[k]; ch.append(k.upper())
         if v.get("tp_split") is not None:
@@ -590,6 +630,10 @@ def edit(kind: str, t: dict, fields: dict) -> list:
                 t["tp_split"] = sl; ch.append("TP split")
         if v.get("avg_entry") is not None:
             t["avg_entry"] = v["avg_entry"]; ch.append("avg entry (manual)")
+        if v.get("horizon") is not None:
+            t["horizon"] = v["horizon"] or None; ch.append("horizon")
+        if v.get("zone_filled") is not None:
+            t["zone_filled"] = bool(v["zone_filled"]); ch.append("zone " + ("filled" if v["zone_filled"] else "still bidding"))
         if v.get("status") is not None:
             if v["status"] not in SPOT_STATUSES:
                 raise UserError("Unknown status.")
@@ -602,20 +646,19 @@ def edit(kind: str, t: dict, fields: dict) -> list:
         if v.get("entry") is not None:
             t["entry"] = v["entry"]; ch.append("entry")
         if v.get("entry2") is not None:
-            t["entry2"] = v["entry2"]; ch.append("entry 2")
+            e2 = str(v["entry2"]).strip()
+            if e2:
+                t["entry2"] = e2; t.pop("entry2_cancelled", None); ch.append("entry 2")
+            else:
+                if t.get("entry2_filled"):
+                    raise UserError("Entry 2 is recorded as filled - clear that first (More > Entry fill recorded in error).")
+                t["entry2"] = None; t["entry2_filled"] = False; t["entry_split"] = None; ch.append("entry 2 removed")
         if v.get("entry_split") is not None:
             raw = str(v["entry_split"]).strip()
             if not raw:
                 t["entry_split"] = None; ch.append("split removed")
             else:
                 t["entry_split"] = _entry_split_disp(raw); ch.append("entry split")
-        if v.get("tp_split") is not None:
-            raw = str(v["tp_split"]).strip()
-            if not raw:
-                t["tp_split"] = None; ch.append("TP split removed")
-            else:
-                n_tps = sum(1 for k in FUT_TP_KEYS if t.get(k))
-                t["tp_split"] = _tp_plan(raw, n_tps); ch.append("TP split")
         if v.get("stop") is not None:
             e_num, e_cond = parse_sl(v["stop"])
             if not e_num:
@@ -630,7 +673,9 @@ def edit(kind: str, t: dict, fields: dict) -> list:
             t["risk"] = v["risk"]; ch.append("risk")
         if v.get("entry_type") is not None:
             t["entry_type"] = v["entry_type"]
-            t["entry1_filled"] = v["entry_type"] == "MARKET"
+            if v["entry_type"] == "MARKET":
+                t["entry1_filled"] = True                      # market = filled at post
+            # switching to LIMIT never clears a fill that is already on record
             ch.append("entry type")
         if v.get("framework") is not None or v.get("framework2") is not None:
             fws = [f for f in (v.get("framework"), v.get("framework2")) if f]
@@ -640,12 +685,37 @@ def edit(kind: str, t: dict, fields: dict) -> list:
         for k in FUT_TP_KEYS:
             if v.get(k) is not None:
                 t[k] = v[k]; ch.append(k.upper())
+        # TP split is validated against the targets AFTER this edit, so both can change in one go
+        if v.get("tp_split") is not None:
+            raw = str(v["tp_split"]).strip()
+            if not raw:
+                t["tp_split"] = None; ch.append("TP split removed")
+            else:
+                n_tps = sum(1 for k in FUT_TP_KEYS if t.get(k))
+                t["tp_split"] = _tp_plan(raw, n_tps); ch.append("TP split")
         if v.get("timeframe") is not None:
             t["timeframe"] = v["timeframe"]; ch.append("timeframe")
         if v.get("context") is not None:
             t["setup_detail"] = v["context"]; ch.append("context")
         if v.get("notes") is not None:
             t["notes"] = v["notes"]; ch.append("notes")
+        # keep derived state in step with what just changed
+        if any(v.get(k) is not None for k in FUT_TP_KEYS) or v.get("direction") is not None:
+            n_tps = sum(1 for k in FUT_TP_KEYS if t.get(k))
+            if t.get("tp_split") and len(t["tp_split"]) > n_tps:
+                t["tp_split"] = t["tp_split"][:n_tps]; ch.append("TP split trimmed")
+            _sync_tp_flags(t, spot=False)
+        if any(v.get(k) is not None for k in ("entry", "entry2", "entry_split")) and t.get("be"):
+            e = entry_num(t)
+            if e is not None:
+                t["sl"] = _num_str(e)                              # stop sits at entry - it moves with the entry
+        if v.get("entry") is not None:
+            t["watch_verified"] = False                        # tracker re-checks the price feed scale
+    if spot and (any(v.get(k) is not None for k in ("tp1", "tp2", "tp3", "tp4"))):
+        n_t = sum(1 for k in SPOT_TP_KEYS if t.get(k))
+        if t.get("tp_split") and len(t["tp_split"]) > n_t:
+            t["tp_split"] = t["tp_split"][:n_t]; ch.append("TP split trimmed")
+        _sync_tp_flags(t, spot=True)
     if v.get("chart") is not None:
         ch.append("chart")
     if not ch:

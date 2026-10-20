@@ -108,7 +108,7 @@ def signed_r(t, price):
 
 def _tp_presets(t: dict, spot: bool = False):
     """[(idx, key, price, planned_pct|None)] from the card's preset targets."""
-    keys = ("t1", "t2", "t3") if spot else ("tp1", "tp2", "tp3", "tp4")
+    keys = ("t1", "t2", "t3", "t4") if spot else ("tp1", "tp2", "tp3", "tp4")
     plan = t.get("tp_split") or []
     out = []
     for i, k in enumerate(keys):
@@ -181,7 +181,7 @@ def fnum(x):
         return f"{x:,.2f}"
     if x >= 1:
         return f"{x:,.4f}".rstrip("0").rstrip(".")
-    return f"{x:.8f}".rstrip("0")
+    return f"{x:.8f}".rstrip("0").rstrip(".") or "0"
 
 def tf(t: dict) -> str:
     v = t.get("timeframe")
@@ -333,7 +333,7 @@ def spot_status_line(p: dict) -> str:
         rtxt = f" ({res})" if res else ""
         return {"WIN": f"CLOSED - WIN{rtxt}", "LOSS": f"CLOSED - LOSS{rtxt}", "BE": "CLOSED - BREAKEVEN", "INVALID": "INVALIDATED"}.get(p.get("result"), "CLOSED")
     s = p.get("status", "ACCUMULATING")
-    top = max((i for i, k in enumerate(("t1_hit", "t2_hit", "t3_hit"), 1) if p.get(k)), default=0)
+    top = max((i for i, k in enumerate(("t1_hit", "t2_hit", "t3_hit", "t4_hit"), 1) if p.get(k)), default=0)
     sold = sum(x["pct"] for x in (p.get("sells") or []))
     parts = [s]
     if top:

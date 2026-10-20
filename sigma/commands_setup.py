@@ -68,9 +68,9 @@ async def _post_card(interaction, rec: dict, channel_id: int, spot: bool, chart,
     embed = (build_spot_embed if spot else build_embed)(rec)
     files = []
     if chart:
-        f = await chart.to_file()
+        f = await actions.chart_file(chart)
         files.append(f)
-        embed.set_image(url=f"attachment://{chart.filename}")
+        embed.set_image(url=f"attachment://{f.filename}")
     ctx = _analyst_ctx(interaction.user)
     mention_ids = []
     if PING_ROLE_ID:
@@ -105,6 +105,49 @@ async def _run(interaction, coro):
         await coro
     except UserError as e:
         await _reply(interaction, e.message)
+
+
+# Fields a validation error can come from, shown in the Fix popup with what was typed (everything else -
+# pair, direction, chart, notes, framework... - is kept in the draft untouched).
+_FIX_FIELDS = {
+    False: [("entry", "Entry", "e.g. 100000"), ("stop", "Stop", "e.g. 97000 or 4h close below 97000"),
+            ("targets", "Targets (up to 4)", "e.g. 104000 / 108000"), ("entry2", "Entry 2 (DCA)", "blank = none"),
+            ("tp_split", "TP split", "e.g. 50/30/20")],
+    True: [("zone", "Buy zone", "e.g. 65 - 52"), ("stop", "Invalidation", "e.g. weekly close below 48"),
+           ("targets", "Targets (up to 4)", "e.g. 90 / 120 / 150"), ("avg_entry", "Average entry", "blank = none"),
+           ("tp_split", "TP split", "e.g. 30/30/40")],
+}
+
+
+class _FixView(discord.ui.View):
+    """One button under the error: opens the popup with the draft's numbers prefilled."""
+    def __init__(self, draft: dict, spot: bool, post):
+        super().__init__(timeout=900)
+        self.draft, self.spot, self.post = draft, spot, post
+        b = discord.ui.Button(label="Fix & post", style=discord.ButtonStyle.primary, emoji="\U0001f527")
+        b.callback = self.open
+        self.add_item(b)
+
+    async def open(self, interaction: discord.Interaction):
+        from sigma.desk import Form
+        fields = [(k, label, self.draft.get(k) or "", False, ph) for k, label, ph in _FIX_FIELDS[self.spot]]
+
+        async def on_ok(it, vals):
+            await it.response.defer(ephemeral=True, thinking=True)
+            for k, v in vals.items():
+                self.draft[k] = v or None
+            await _run_draft(it, self.draft, self.spot, self.post)
+        await interaction.response.send_modal(Form(f"Fix & post - {str(self.draft.get('pair') or '').upper()}", fields, on_ok))
+
+
+async def _run_draft(interaction, draft: dict, spot: bool, post):
+    """Post from a draft; on a validation error the draft is kept and the reply carries a Fix & post button,
+    so a five-minute form is never retyped over one wrong field."""
+    try:
+        await post(interaction, draft)
+    except UserError as e:
+        await interaction.followup.send(f"\u26a0 {e.message}\n-# Your draft is kept - press **Fix & post**, correct the field, done.",
+                                        view=_FixView(draft, spot, post), ephemeral=True)
 
 
 # ----------------------------------------------------------------------------- autocomplete
@@ -184,40 +227,46 @@ async def setup_futures(interaction: discord.Interaction, pair: str, direction: 
                         chart: discord.Attachment = None, notes: str = None):
     if not await _gate(interaction, "post setups"):
         return
+    draft = {"pair": pair, "direction": direction.value, "entry_type": entry_type.value, "entry": entry, "stop": stop,
+             "targets": targets, "entry2": entry2, "entry_split": entry_split, "tp_split": tp_split, "risk": risk,
+             "timeframe": timeframe, "framework": framework, "context": context, "chart": chart, "notes": notes}
+    await _run_draft(interaction, draft, False, _post_futures)
 
-    async def body():
-        if entry_type.value != "DCA" and entry2:
-            raise UserError("You gave **entry2** but the entry type isn't DCA - pick **DCA** as the entry type, or drop entry2.")
-        tps = actions.parse_targets(targets, 4)
-        if not tps:
-            raise UserError("Give at least one target.")
-        tps += [None] * (4 - len(tps))
-        rec = svc.build_futures(
-            analyst=_analyst_ctx(interaction.user), pair=pair, direction=direction.value, entry=entry, stop=stop,
-            tp1=tps[0], tp2=tps[1], tp3=tps[2], tp4=tps[3], tp_split=tp_split,
-            entry_type=entry_type.value, entry2=entry2, entry_split=entry_split,
-            risk=risk or "1", timeframe=timeframe,
-            frameworks=_frameworks_list(_framework_value(framework)), context=context, notes=notes)
-        msg, channel = await _post_card(interaction, rec, TRADES_CHANNEL_ID, False, chart,
-                                        f"{pair.upper()} {direction.value} - {interaction.user.display_name}", "Reasoning", notes)
-        try:
-            await msg.edit(view=actions.card_view(store.FUT, msg.id))
-            rec["card_view"] = 2
-        except Exception as ex:
-            print(f"[setup] card buttons attach failed: {ex}", flush=True)
-        data = store.load(store.FUT)
-        data[str(msg.id)] = rec
-        store.save(store.FUT, data)
-        await refresh_board()
-        await _reply(interaction, f"Setup posted in {channel.mention} ({msg.jump_url}) - press **Manage** on the card for everything after this.")
-    await _run(interaction, body())
+
+async def _post_futures(interaction, d: dict):
+    """Validate + post a futures setup from a draft dict (slash command or the Fix popup)."""
+    if d["entry_type"] != "DCA" and d.get("entry2"):
+        d["entry_type"] = "DCA"                                # entry2 given -> it's a DCA setup, no need to block on the label
+    tps = actions.parse_targets(d.get("targets"), 4)
+    if not tps:
+        raise UserError("Give at least one target.")
+    tps += [None] * (4 - len(tps))
+    rec = svc.build_futures(
+        analyst=_analyst_ctx(interaction.user), pair=d["pair"], direction=d["direction"], entry=d["entry"], stop=d["stop"],
+        tp1=tps[0], tp2=tps[1], tp3=tps[2], tp4=tps[3], tp_split=d.get("tp_split"),
+        entry_type=d["entry_type"], entry2=d.get("entry2"), entry_split=d.get("entry_split"),
+        risk=d.get("risk") or "1", timeframe=d.get("timeframe"),
+        frameworks=_frameworks_list(_framework_value(d.get("framework"))), context=d.get("context"), notes=d.get("notes"))
+    pair, notes, chart = d["pair"], d.get("notes"), d.get("chart")
+    msg, channel = await _post_card(interaction, rec, TRADES_CHANNEL_ID, False, chart,
+                                    f"{pair.upper()} {d['direction']} - {interaction.user.display_name}", "Reasoning", notes)
+    try:
+        await msg.edit(view=actions.card_view(store.FUT, msg.id))
+        rec["card_view"] = 2
+    except Exception as ex:
+        print(f"[setup] card buttons attach failed: {ex}", flush=True)
+    data = store.load(store.FUT)
+    data[str(msg.id)] = rec
+    store.save(store.FUT, data)
+    await refresh_board()
+    await _reply(interaction, f"Setup posted in {channel.mention} ({msg.jump_url}) - press **Manage** on the card for everything after this.")
 
 
 @setup.command(name="spot", description="Post a spot play - buy zone, targets, invalidation")
 @app_commands.describe(
     pair="Coin, e.g. SOL or AAVE - no /USDT needed",
     zone="Buy zone, top to bottom, e.g. 65 - 52",
-    targets="Take-profit prices, up to 3, e.g. 90 / 120 / 150",
+    targets="Take-profit prices, up to 4, e.g. 90 / 120 / 150",
     stop="Invalidation - level that kills the thesis, e.g. Weekly close below 48. R is measured from it",
     tp_split="Planned % to sell at each target, e.g. 30/30/40 - under 100 leaves a moonbag",
     avg_entry="Average entry so far - give it if you're already partly or fully in",
@@ -237,29 +286,34 @@ async def setup_spot(interaction: discord.Interaction, pair: str, zone: str, tar
                      allocation: str = None, horizon: str = None, chart: discord.Attachment = None, notes: str = None):
     if not await _gate(interaction, "post plays"):
         return
+    draft = {"pair": pair, "zone": zone, "targets": targets, "stop": stop, "tp_split": tp_split, "avg_entry": avg_entry,
+             "play_type": (play_type.value if play_type else None), "allocation": allocation, "horizon": horizon,
+             "chart": chart, "notes": notes}
+    await _run_draft(interaction, draft, True, _post_spot)
 
-    async def body():
-        tps = actions.parse_targets(targets, 3)
-        if not tps:
-            raise UserError("Give at least one target.")
-        tps += [None] * (3 - len(tps))
-        rec = svc.build_spot(analyst=_analyst_ctx(interaction.user), pair=pair, zone=zone, tp1=tps[0], tp2=tps[1], tp3=tps[2],
-                             tp_split=tp_split, stop=stop, avg_entry=avg_entry,
-                             play_type=(play_type.value if play_type else None), allocation=allocation,
-                             horizon=horizon, notes=notes)
-        msg, channel = await _post_card(interaction, rec, SPOT_CHANNEL_ID, True, chart,
-                                        f"{pair.upper()} SPOT - {interaction.user.display_name}", "Thesis", notes)
-        try:
-            await msg.edit(view=actions.card_view(store.SPOT, msg.id))
-            rec["card_view"] = 2
-        except Exception as ex:
-            print(f"[setup] card buttons attach failed: {ex}", flush=True)
-        data = store.load(store.SPOT)
-        data[str(msg.id)] = rec
-        store.save(store.SPOT, data)
-        await refresh_board()
-        await _reply(interaction, f"Spot play posted in {channel.mention} ({msg.jump_url}) - press **Manage** on the card for everything after this.")
-    await _run(interaction, body())
+
+async def _post_spot(interaction, d: dict):
+    """Validate + post a spot play from a draft dict (slash command or the Fix popup)."""
+    tps = actions.parse_targets(d.get("targets"), 4)
+    if not tps:
+        raise UserError("Give at least one target.")
+    tps += [None] * (4 - len(tps))
+    rec = svc.build_spot(analyst=_analyst_ctx(interaction.user), pair=d["pair"], zone=d["zone"], tp1=tps[0], tp2=tps[1],
+                         tp3=tps[2], tp4=tps[3], tp_split=d.get("tp_split"), stop=d.get("stop"), avg_entry=d.get("avg_entry"),
+                         play_type=d.get("play_type"), allocation=d.get("allocation"), horizon=d.get("horizon"), notes=d.get("notes"))
+    pair, notes, chart = d["pair"], d.get("notes"), d.get("chart")
+    msg, channel = await _post_card(interaction, rec, SPOT_CHANNEL_ID, True, chart,
+                                    f"{pair.upper()} SPOT - {interaction.user.display_name}", "Thesis", notes)
+    try:
+        await msg.edit(view=actions.card_view(store.SPOT, msg.id))
+        rec["card_view"] = 2
+    except Exception as ex:
+        print(f"[setup] card buttons attach failed: {ex}", flush=True)
+    data = store.load(store.SPOT)
+    data[str(msg.id)] = rec
+    store.save(store.SPOT, data)
+    await refresh_board()
+    await _reply(interaction, f"Spot play posted in {channel.mention} ({msg.jump_url}) - press **Manage** on the card for everything after this.")
 
 
 # ----------------------------------------------------------------------------- edit (rare fields)
@@ -281,6 +335,7 @@ async def setup_spot(interaction: discord.Interaction, pair: str, zone: str, tar
     framework="Framework - futures, pick from the list; two: A + B",
     context="Setup context line - futures",
     avg_entry="Spot: set the average entry by hand",
+    horizon="Spot: expected hold, e.g. 3-6 months",
     status="Spot: phase, if the auto status is wrong",
     chart="Replacement chart image",
     notes="Reasoning / thesis - posted in the thread",
@@ -295,7 +350,7 @@ async def setup_spot(interaction: discord.Interaction, pair: str, zone: str, tar
 async def setup_edit(interaction: discord.Interaction, trade: str, pair: str = None, direction: app_commands.Choice[str] = None,
                      entry_type: app_commands.Choice[str] = None, entry: str = None, entry2: str = None, entry_split: str = None,
                      stop: str = None, targets: str = None, tp_split: str = None, risk: str = None, timeframe: str = None,
-                     framework: str = None, context: str = None, avg_entry: str = None,
+                     framework: str = None, context: str = None, avg_entry: str = None, horizon: str = None,
                      status: app_commands.Choice[str] = None, chart: discord.Attachment = None, notes: str = None):
     if not await _gate(interaction):
         return
@@ -312,13 +367,15 @@ async def setup_edit(interaction: discord.Interaction, trade: str, pair: str = N
                   "tp_split": tp_split, "timeframe": timeframe,
                   "framework": (fws[0] if fws else ("" if fws == [] else None)),
                   "framework2": (fws[1] if fws and len(fws) > 1 else None), "context": context,
-                  "avg_entry": avg_entry, "status": status.value if status else None, "chart": chart, "notes": notes}
+                  "avg_entry": avg_entry, "horizon": horizon, "status": status.value if status else None, "chart": chart, "notes": notes}
         if targets is not None:
-            n = 3 if spot else 4
+            n = 4
             tl = actions.parse_targets(targets, n)
             for i in range(n):
                 fields[f"tp{i + 1}"] = tl[i] if i < len(tl) else ""
-        state_only = {k for k, v in fields.items() if v is not None} <= {"avg_entry", "status", "notes"}
+        if chart is not None and not (chart.content_type or "").startswith("image/"):
+            raise UserError("The chart must be an image (PNG / JPG).")
+        state_only = {k for k, v in fields.items() if v is not None} <= {"avg_entry", "status", "notes", "horizon"}
         if not _is_admin(interaction) and not state_only and not within_edit_window(rec):
             raise UserError(f"Edit window ({EDIT_WINDOW_MIN // 60}h) has passed. Log what happened from **Manage** on the card, or ask an admin.")
         changes = svc.edit(kind, rec, fields)
@@ -331,9 +388,9 @@ async def setup_edit(interaction: discord.Interaction, trade: str, pair: str = N
             raise UserError("Original message not found - it may have been deleted.")
         builder = build_spot_embed if spot else build_embed
         if chart is not None:
-            f = await chart.to_file()
+            f = await actions.chart_file(chart)
             embed = builder(rec)
-            embed.set_image(url=f"attachment://{chart.filename}")
+            embed.set_image(url=f"attachment://{f.filename}")
             await msg.edit(embed=embed, attachments=[f])
         elif msg.attachments:
             att = msg.attachments[0]

@@ -329,3 +329,101 @@ def test_cancel_entry_2_runs_everything_from_entry_1():
     svc.apply_event("fut", t2, "EF2")
     with pytest.raises(UserError, match="already filled"):
         svc.apply_event("fut", t2, "E2X")
+
+
+# ---------------------------------------------------------------- parity audit: edits keep derived state in step
+
+def test_edit_targets_resyncs_tp_flags_and_trims_split():
+    t = svc.build_futures(analyst=A, pair="BTC", direction="LONG", entry="100", stop="95", tp1="110", tp2="120", tp3="130",
+                          tp_split="50/30/20")
+    svc.apply_event("fut", t, "EF1")
+    svc.apply_event("fut", t, "TPN", price="110")
+    assert t["tp1_hit"]
+    svc.edit("fut", t, {"tp1": "112", "tp2": "120"})
+    assert t["tp1_hit"] and not t["tp2_hit"]             # flags re-derived from the recorded fills
+    t2 = svc.build_futures(analyst=A, pair="BTC", direction="LONG", entry="100", stop="95", tp1="110", tp2="120", tp3="130",
+                           tp_split="50/30/20")
+    t2["tp3"] = None                                      # targets shrank by hand -> split follows on next TP edit
+    svc.edit("fut", t2, {"tp2": "121"})
+    assert t2["tp_split"] == [50.0, 30.0]
+
+
+def test_edit_entry_type_never_clears_a_recorded_fill():
+    t = svc.build_futures(analyst=A, pair="BTC", direction="LONG", entry="100", stop="95", tp1="110", entry_type="MARKET")
+    assert t["entry1_filled"]
+    svc.edit("fut", t, {"entry_type": "LIMIT"})
+    assert t["entry1_filled"]                             # the fill is history, the label is just a label
+    t = svc.build_futures(analyst=A, pair="BTC", direction="LONG", entry="100", stop="95", tp1="110")
+    svc.edit("fut", t, {"entry_type": "MARKET"})
+    assert t["entry1_filled"]
+
+
+def test_edit_entry_blank_entry2_removes_the_leg_and_be_follows_entry():
+    t = svc.build_futures(analyst=A, pair="BTC", direction="LONG", entry="100", stop="95", tp1="110", entry2="98")
+    svc.edit("fut", t, {"entry2": "  "})
+    assert t["entry2"] is None and t["entry_split"] is None
+    svc.apply_event("fut", t, "EF1")
+    svc.apply_event("fut", t, "BE")
+    assert t["sl"] == "100"
+    svc.edit("fut", t, {"entry": "101"})
+    assert t["sl"] == "101" and t["initial_sl"] == "95"   # stop at entry moves with the corrected entry; R stays
+    # a filled leg can't be blanked away
+    t2 = svc.build_futures(analyst=A, pair="BTC", direction="LONG", entry="100", stop="95", tp1="110", entry2="98")
+    svc.apply_event("fut", t2, "EF2")
+    with pytest.raises(UserError, match="recorded as filled"):
+        svc.edit("fut", t2, {"entry2": ""})
+
+
+def test_entry_fill_recorded_in_error_and_filled_setup_cannot_be_invalidated():
+    t = svc.build_futures(analyst=A, pair="BTC", direction="LONG", entry="100", stop="95", tp1="110")
+    with pytest.raises(UserError, match="No entry fill"):
+        svc.apply_event("fut", t, "EFX")
+    svc.apply_event("fut", t, "EF1")
+    svc.apply_event("fut", t, "BE")
+    with pytest.raises(UserError, match="has fills"):
+        svc.apply_event("fut", t, "CI")
+    out = svc.apply_event("fut", t, "EFX")
+    assert out.title == "Entry fill cleared" and not t["entry1_filled"] and not t["be"] and t["sl"] == "95"
+    svc.apply_event("fut", t, "CI")                        # pending again -> invalidation allowed
+    assert t["result"] == "INVALID"
+    t2 = svc.build_futures(analyst=A, pair="BTC", direction="LONG", entry="100", stop="95", tp1="110")
+    svc.apply_event("fut", t2, "EF1"); svc.apply_event("fut", t2, "TPN", price="110", pct=50)
+    with pytest.raises(UserError, match="undo those first"):
+        svc.apply_event("fut", t2, "EFX")
+
+
+def test_build_spot_never_blocks_on_play_type_and_zone_filled_is_editable():
+    p = svc.build_spot(analyst=A, pair="FET", zone="1.2 - 1.0", tp1="1.5", avg_entry="1.1", play_type="FRESH")
+    assert p["avg_entry"] == "1.1" and p["status"] == "ACCUMULATING" and p["buys"]      # Fresh + avg = Scaling
+    p = svc.build_spot(analyst=A, pair="FET", zone="1.2 - 1.0", tp1="1.5", play_type="SCALING")
+    assert p["avg_entry"] is None and p["buys"] == [] and p["status"] == "ACCUMULATING"  # no buys logged yet
+    p = svc.build_spot(analyst=A, pair="FET", zone="1.2 - 1.0", tp1="1.5", tp2="2", tp3="2.5", tp4="3", tp_split="25/25/25/25")
+    assert p["t4"] == "3" and p["tp_split"] == [25.0, 25.0, 25.0, 25.0]
+    svc.apply_event("spot", p, "BUY", price="1.1", pct=100)
+    svc.apply_event("spot", p, "TPN", price="3")            # price past T4 -> all four taken per plan
+    assert p["t4_hit"] and p["closed"]
+    p = spot()
+    svc.edit("spot", p, {"zone_filled": True})
+    assert p["zone_filled"] is True
+    p["pair"] = "FET"; p["watch_verified"] = True
+    svc.edit("spot", p, {"pair": "RNDR"})
+    assert p["watch_verified"] is False
+
+
+def test_fx_price_format_edges():
+    from sigma.cards import fx
+    assert fx(100000) == "100,000" and fx(1000.5) == "1,000.5" and fx(0) == "0" and fx(0.000123) != "0."
+    assert fx(None) == "-" and fx(97000.25) == "97,000.25"
+
+
+def test_tpn_past_several_targets_books_each_one_per_plan():
+    t = svc.build_futures(analyst=A, pair="BTC", direction="LONG", entry="100", stop="95", tp1="110", tp2="120", tp3="130",
+                          tp_split="50/30/20")
+    svc.apply_event("fut", t, "EF1")
+    out = svc.apply_event("fut", t, "TPN", price="121")
+    assert [(f["price"], f["pct"]) for f in t["fills"]] == [(110.0, 50.0), (121.0, 30.0)]
+    assert out.title == "TP1-TP2 reached" and "80% closed" in out.line and t["tp2_hit"] and not t["tp3_hit"]
+    p = svc.build_spot(analyst=A, pair="FET", zone="1.2 - 1.0", tp1="1.5", tp2="2", tp3="2.5", tp_split="40/30/30")
+    svc.apply_event("spot", p, "BUY", price="1.1", pct=100)
+    out = svc.apply_event("spot", p, "TPN", price="2.7")
+    assert out.closed and p["result"] == "WIN" and [s["price"] for s in p["sells"]] == [1.5, 2.0, 2.7]
