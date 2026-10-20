@@ -393,4 +393,4 @@ def test_cancel_entry_2_only_offered_on_open_dca(env):
     assert t["entry2"] is None and t["entry2_cancelled"] == "98" and env["calls"]["feed"][-1][0] == "Entry 2 cancelled"
     assert "e2x" not in [o.value for o in _select(view).options]
     e = env["desk"].bot and __import__("sigma.cards", fromlist=["x"]).build_embed(t)
-    assert "E2 98 cancelled" in [f.value for f in e.fields if f.name == "Entry"][0]
+    assert "E2 98 cancelled" in [f.value for f in e.fields if f.name == "ENTRY"][0]

@@ -232,7 +232,8 @@ def next_target(t: dict, spot: bool = False):
         if t.get(f"{k}_hit"):
             continue
         if spot:
-            extra = spot_pct_text(t, px).strip()
+            rr = spot_signed_r(t, px)
+            extra = f"{rr:+.1f}R" if rr is not None else spot_pct_text(t, px).strip()
         else:
             r = signed_r(t, px)
             extra = f"{r:+.1f}R" if r is not None else ""
@@ -241,8 +242,59 @@ def next_target(t: dict, spot: bool = False):
     return None
 
 
+def fx(v) -> str:
+    """Card price format: fnum without a dead `.00` tail (100,000.00 -> 100,000)."""
+    out = fnum(v)
+    return out[:-3] if out.endswith(".00") else out
+
+
+HAIRLINE = "\u2500" * 26
+_TICK, _RING = "\u2713", "\u25cb"
+
+
+def targets_block(t: dict, spot: bool = False) -> str:
+    """One line per target: `✓  104,000  +1.3R  40%` taken, `○  108,000  +2.7R  30%` pending; closed + missed = `· not reached`."""
+    taken = _tp_taken(t, spot)
+    presets = _tp_presets(t, spot)
+    pxf = (lambda v: f"{v:g}") if spot else fnum
+    closed = bool(t.get("closed"))
+    rows = []
+    for f in taken:
+        px = f["price"]
+        if spot:
+            rr = spot_signed_r(t, px)
+            extra = f"{rr:+.1f}R" if rr is not None else spot_pct_text(t, px).strip()
+        else:
+            r = signed_r(t, px)
+            extra = f"{r:+.1f}R" if r is not None else ""
+        rows.append(f"{_TICK} \u00a0{pxf(px)} \u00a0{extra} \u00a0{f['pct']:g}%")
+    for _i, k, px, planned in presets:
+        if t.get(f"{k}_hit"):
+            continue
+        if spot:
+            extra = spot_pct_text(t, px).strip()
+            rr = spot_signed_r(t, px)
+            if rr is not None:
+                extra = f"{rr:+.1f}R"
+        else:
+            r = signed_r(t, px)
+            extra = f"{r:+.1f}R" if r is not None else ""
+        ptxt = f" \u00a0{planned:g}%" if planned is not None else ""
+        rows.append(f"{_RING} \u00a0{pxf(px)} \u00a0{extra}{ptxt}" + (" \u00b7 not reached" if closed else ""))
+    return "\n".join(rows)
+
+
+def _status_line(t: dict) -> str:
+    """`● **TP1 hit** · 40% closed · stop at entry` - first phrase bold."""
+    txt = full_status(t)
+    parts = txt.split(" \u00b7 ", 1)
+    head = parts[0]
+    rest = (" \u00b7 " + parts[1]) if len(parts) > 1 else ""
+    return f"\u25cf **{head[:1].upper() + head[1:]}**{rest}"
+
+
 def build_embed(t: dict, image_url: str = None) -> discord.Embed:
-    """Dashboard card: chips + progress on top, Entry | Stop | Next, targets on one line, setup."""
+    """Quiet ticket: status + bar, hairline, ENTRY | STOP, TARGETS, NEXT | RISK, hairline, SETUP."""
     is_long = t["direction"] == "LONG"
     closed = t.get("closed")
     result = t.get("result")
@@ -252,95 +304,91 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     title = f"{prefix}{arrow} {t['pair'].upper()}" + (f" \u00b7 {tftxt}" if tftxt else "")
     embed = discord.Embed(title=title[:256], color=card_color(t))
 
-    rr = display_rr(t)
-    chips = []
-    if closed:
-        r = t.get("result_r")
-        chips.append(f"result {r:+.2f}R" if isinstance(r, (int, float)) else {"INVALID": "invalidated"}.get(result, "closed"))
-    chips += [f"R:R {rr}" if rr else None, f"risk {fmt_risk(t.get('risk')) or '1%'}"]
-    if not closed:
-        br = banked_r(t)
-        if br is not None and abs(br) > 0.005:
-            chips.append(f"{br:+.1f}R banked")
-        st = stop_state(t)
-        if st:
-            chips.append("stop " + (st.split(" - ")[0] if st.startswith("at entry") else st.replace("trailed, ", "")))
-        if not any_entry_filled(t):
-            chips.append("waiting for fill" if t.get("entry_type") != "MARKET" else "market")
-        elif t.get("entry2") and not t.get("entry2_filled"):
-            chips.append("entry 1 filled \u00b7 DCA pending")
-    desc = _chips(chips)
+    # status + progress
+    lines = [_status_line(t)]
     closed_pct = fills_pct(t)
-    n_tp = len(_tp_presets(t))
-    hit = next((n for n in (4, 3, 2, 1) if t.get(f"tp{n}_hit")), 0)
-    if closed or closed_pct > 0:
-        bar = progress_bar(100 if closed else closed_pct)
-        tail = "position closed" if closed else f"{closed_pct:g}% closed"
-        if hit and n_tp:
-            tail += f" \u00b7 TP{hit} of {n_tp}"
-        desc += f"\n{bar} {tail}"
-    elif any_entry_filled(t) and n_tp:
-        desc += f"\n{progress_bar(0)} live \u00b7 0 of {n_tp} targets"
-    embed.description = desc
+    br = banked_r(t)
+    if closed:
+        ax = t.get("avg_exit")
+        tail = f"avg exit {fx(ax)}" if ax is not None and result != "INVALID" else ""
+        if result != "INVALID":
+            lines.append(f"{progress_bar(100)} \u00a0{tail}".rstrip())
+    elif closed_pct > 0:
+        tail = f"{100 - closed_pct:g}% running"
+        if br is not None and abs(br) > 0.005:
+            tail += f" \u00b7 {br:+.1f}R banked"
+        lines.append(f"{progress_bar(closed_pct)} \u00a0{tail}")
+    lines.append(HAIRLINE)
+    embed.description = "\n".join(lines)
 
-    # Entry | Stop | Next
-    type_label = "market" if t.get("entry_type") == "MARKET" else "limit"
+    # ENTRY | STOP
     e1 = first_num(t.get("entry"))
     e2 = first_num(t.get("entry2")) if t.get("entry2") else None
     if e2 is not None:
-        m1 = " \u2713" if t.get("entry1_filled") and not closed else ""
-        m2 = " \u2713" if t.get("entry2_filled") and not closed else ""
-        entry_val = f"{fnum(e1)}{m1} / {fnum(e2)}{m2}"
+        m1 = f" {_TICK}" if t.get("entry1_filled") else ""
+        m2 = f" {_TICK}" if t.get("entry2_filled") else ""
+        entry_val = f"**{fx(e1)}**{m1} / **{fx(e2)}**{m2}"
         split = t.get("entry_split")
         sub = f"DCA{(' ' + split) if split else ''}"
         if t.get("entry1_filled") and t.get("entry2_filled"):
             avg_e = entry_num(t)
             if avg_e:
-                sub += f" \u00b7 avg {fnum(avg_e)}"
+                sub += f" \u00b7 avg {fx(avg_e)}"
         entry_val += f"\n{sub}"
     else:
-        entry_val = fnum(e1) if e1 is not None else str(t.get("entry"))
-        entry_val += f"\n{type_label} \u00b7 {'filled' if t.get('entry1_filled') else 'pending'}" if not closed else f"\n{type_label}"
+        entry_val = f"**{fx(e1)}**" if e1 is not None else f"**{t.get('entry')}**"
+        state = "market" if (t.get("entry_type") == "MARKET" and not closed) else ("filled" if t.get("entry1_filled") else "pending")
+        if closed:
+            state = "filled" if any_entry_filled(t) else "never filled"
         if t.get("entry2_cancelled"):
-            entry_val += f" \u00b7 E2 {t['entry2_cancelled']} cancelled"
-    embed.add_field(name="Entry", value=entry_val, inline=True)
+            state += f" \u00b7 E2 {t['entry2_cancelled']} cancelled"
+        entry_val += f"\n{state}"
+    embed.add_field(name="ENTRY", value=entry_val, inline=True)
 
-    sl_shown = fnum(sl_num(t)) if sl_num(t) is not None else str(t.get("sl"))
-    sl_val = f"{(t.get('sl_condition') + ' ') if t.get('sl_condition') else ''}{sl_shown}"
+    sl_shown = fx(sl_num(t)) if sl_num(t) is not None else str(t.get("sl"))
+    cond = (t.get("sl_condition") + " ") if t.get("sl_condition") else ""
+    sl_val = f"**{cond}{sl_shown}**"
     if t.get("sl_hit"):
-        sl_val += " (hit)"
-    if stop_trailed(t):
+        sl_val += " \u00b7 hit"
+    elif stop_trailed(t) and not closed:
         st = stop_state(t)
-        sub = ("at entry" if (st.startswith("at entry") or t.get("be")) else "trailed") if not closed else "final"
-        sl_val += f"\n{sub} \u00b7 posted {fnum(initial_sl_num(t))}"
+        sl_val += " \u00b7 " + ("at entry" if (t.get("be") or st.startswith("at entry")) else st.replace("trailed, ", "").replace(" locked", " locked"))
+    if stop_trailed(t):
+        sl_val += f"\nfrom {fx(initial_sl_num(t))}"
     else:
         rpu = risk_per_unit(t)
-        sl_val += f"\n1R = {fnum(rpu)}" if rpu else "\nposted"
-    embed.add_field(name="Stop", value=sl_val, inline=True)
+        sl_val += f"\n1R {fx(rpu)}" if rpu else "\nposted"
+    embed.add_field(name="STOP", value=sl_val, inline=True)
 
+    tb = targets_block(t)
+    if tb:
+        embed.add_field(name="TARGETS", value=tb[:1020], inline=False)
+
+    rr = display_rr(t)
     if closed:
         ax = t.get("avg_exit")
-        nxt_name, nxt_val = "Exit", (f"{fnum(ax)}\navg exit" if ax is not None else "-")
+        embed.add_field(name="EXIT", value=(f"**{fx(ax)}** avg" if ax is not None else "-"), inline=True)
+        r = t.get("result_r")
+        risk_val = f"{fmt_risk(t.get('risk')) or '1%'}" + (f" \u00b7 R:R {rr}" if rr else "") + (f" \u00b7 result {r:+.2f}R" if isinstance(r, (int, float)) else "")
     else:
         nt = next_target(t)
-        nxt_name = "Next"
-        nxt_val = f"{fnum(nt[1])}\n{nt[0]}" if nt else "-\nall targets hit"
-    embed.add_field(name=nxt_name, value=nxt_val, inline=True)
-
-    tl = targets_inline(t)
-    if tl:
-        embed.add_field(name="Targets", value=tl[:1020], inline=False)
+        embed.add_field(name="NEXT", value=(f"**{nt[0].split(' \u00b7 ')[0]} \u00b7 {fx(nt[1])}" + (f" \u00b7 {nt[0].split(' \u00b7 ')[1]}" if len(nt[0].split(' \u00b7 ')) > 1 else "") + "**") if nt else "all targets hit", inline=True)
+        rpu = risk_per_unit(t)
+        risk_val = f"{fmt_risk(t.get('risk')) or '1%'}" + (f" \u00b7 R:R {rr}" if rr else "") + (f" \u00b7 1R {fx(rpu)}" if rpu and stop_trailed(t) else "")
+    embed.add_field(name="RISK", value=risk_val, inline=True)
 
     fw = fmt_frameworks(t)
-    if t.get("setup_detail"):
-        fw = f"{fw} \u2014 {t['setup_detail']}" if fw and fw != "-" else t["setup_detail"]
-    if fw and fw != "-":
-        embed.add_field(name="Setup", value=fw[:1020], inline=False)
+    detail = t.get("setup_detail")
+    setup = " \u00b7 ".join(x for x in ((fw if fw and fw != "-" else ""), detail or "") if x)
+    if setup or (closed and t.get("close_note")):
+        embed.add_field(name="\u200b", value=HAIRLINE, inline=False)
+    if setup:
+        embed.add_field(name="SETUP", value=setup[:1020], inline=False)
     if closed and t.get("close_note"):
-        embed.add_field(name="Note", value=t["close_note"][:1020], inline=False)
+        embed.add_field(name="NOTE", value=t["close_note"][:1020], inline=False)
 
     embed.set_author(name=t["analyst_name"], icon_url=t.get("analyst_avatar") or None)
-    embed.set_footer(text=footer_with_edit(t, "Journal entry, not financial advice \u00b7 risk % = portfolio risked"))
+    embed.set_footer(text=footer_with_edit(t, "Journal entry, not financial advice"))
     if image_url:
         embed.set_image(url=image_url)
     return embed
@@ -353,52 +401,45 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
     title = f"{prefix}\u25c6 SPOT {p['pair'].upper()}"
     embed = discord.Embed(title=title[:256], color=card_color(p, spot=True))
 
-    chips = []
     if closed:
         _rr = spot_result_r(p)
-        chips.append(f"result {p['result_pct']}" if p.get("result_pct") else {"INVALID": "invalidated"}.get(result, "closed"))
-        if _rr is not None:
-            chips.append(f"{_rr:+.2f}R")
+        head = {"INVALID": "Invalidated"}.get(result, f"Closed {p.get('result_pct') or ''}".strip())
+        status = f"\u25cf **{head}**" + (f" \u00b7 {_rr:+.2f}R" if _rr is not None else "")
     else:
-        chips.append((p.get("status") or "accumulating").lower())
-    if p.get("allocation"):
-        chips.append(f"alloc {fmt_risk(p['allocation'])}")
-    if p.get("horizon"):
-        chips.append(f"horizon {p['horizon']}")
-    desc = _chips(chips)
+        parts = spot_status_line(p).split(" - ")
+        status = f"\u25cf **{parts[0].capitalize()}**" + ("".join(f" \u00b7 {x.lower()}" for x in parts[1:]))
+    lines = [status]
     sold = _closed_pct(p, True)
-    n_t = len(_tp_presets(p, spot=True))
-    top = max((i for i, k in enumerate(("t1_hit", "t2_hit", "t3_hit"), 1) if p.get(k)), default=0)
-    if closed or sold > 0:
-        bar = progress_bar(100 if closed else sold)
-        tail = "bag sold" if closed else f"{sold:g}% sold"
-        if top and n_t:
-            tail += f" \u00b7 target {top} of {n_t}"
-        desc += f"\n{bar} {tail}"
-    elif (p.get("zone_filled") or (p.get("buys") or [])) and n_t:
-        desc += f"\n{progress_bar(0)} holding \u00b7 0 of {n_t} targets"
-    embed.description = desc
+    if closed and result != "INVALID":
+        lines.append(f"{progress_bar(100)} \u00a0avg exit {p['avg_exit']}" if p.get("avg_exit") else progress_bar(100))
+    elif sold > 0:
+        lines.append(f"{progress_bar(sold)} \u00a0{100 - sold:g}% still held")
+    lines.append(HAIRLINE)
+    embed.description = "\n".join(lines)
 
-    zone_val = str(p.get("dca_zone") or "-")
+    zone_val = f"**{p.get('dca_zone') or '-'}**"
     if p.get("avg_entry"):
-        zone_val += f"\navg {p['avg_entry']}"
+        zone_val += f"\navg {p['avg_entry']}" + ("" if (p.get("zone_filled") or closed) else " \u00b7 bidding")
     elif not closed and not p.get("zone_filled"):
         proj = spot_zone_projection(p)
         zone_val += f"\nif it fills \u2248 {proj:g}" if proj else "\nbidding"
-    elif not closed:
+    else:
         zone_val += "\nfilled"
-    embed.add_field(name="Zone", value=zone_val, inline=True)
-    embed.add_field(name="Invalidation", value=str(p.get("invalidation") or "-"), inline=True)
+    embed.add_field(name="ZONE", value=zone_val, inline=True)
+    embed.add_field(name="INVALIDATION", value=f"**{p.get('invalidation') or '-'}**", inline=True)
+    tb = targets_block(p, spot=True)
+    if tb:
+        embed.add_field(name="TARGETS", value=tb[:1020], inline=False)
     if closed:
-        embed.add_field(name="Exit", value=(f"{p['avg_exit']}\navg exit" if p.get("avg_exit") else "-"), inline=True)
+        embed.add_field(name="EXIT", value=(f"**{p['avg_exit']}** avg" if p.get("avg_exit") else "-"), inline=True)
     else:
         nt = next_target(p, spot=True)
-        embed.add_field(name="Next", value=(f"{nt[1]:g}\n{nt[0].replace('TP', 'T')}" if nt else "-\nall targets hit"), inline=True)
-    tl = targets_inline(p, spot=True)
-    if tl:
-        embed.add_field(name="Targets", value=tl[:1020], inline=False)
+        embed.add_field(name="NEXT", value=(f"**{nt[0].split(' \u00b7 ')[0].replace('TP', 'T')} \u00b7 {nt[1]:g}" + (f" \u00b7 {nt[0].split(' \u00b7 ')[1]}" if len(nt[0].split(' \u00b7 ')) > 1 else "") + "**") if nt else "all targets hit", inline=True)
+    alloc = " \u00b7 ".join(x for x in ((f"alloc {fmt_risk(p['allocation'])}" if p.get("allocation") else ""), (p.get("horizon") or "")) if x)
+    embed.add_field(name="PLAN", value=alloc or "-", inline=True)
     if closed and p.get("close_note"):
-        embed.add_field(name="Note", value=p["close_note"][:1020], inline=False)
+        embed.add_field(name="\u200b", value=HAIRLINE, inline=False)
+        embed.add_field(name="NOTE", value=p["close_note"][:1020], inline=False)
 
     embed.set_author(name=p["analyst_name"], icon_url=p.get("analyst_avatar") or None)
     embed.set_footer(text=footer_with_edit(p, "Spot journal entry, not financial advice"))
