@@ -195,9 +195,12 @@ class Desk(discord.ui.View):
         self._btn("Edit", self.on_edit, discord.ButtonStyle.secondary, row=1)
         self._btn("Replace chart", self.on_chart, discord.ButtonStyle.secondary, row=1)
         track = "Tracking: turn ON (tracker re-armed)" if t.get("watch_disabled") else "Tracking: turn OFF (manual updates)"
-        self.add_item(self._more([("Invalidated - never triggered", "ci"), ("Undo last take profit", "ul"),
-                                  ("Fix a take profit (list + correct)", "fix"), (track, "track"),
-                                  ("Rebuild TP list from fills (repair)", "rtp")]))
+        opts = [("Invalidated - never triggered", "ci"), ("Undo last take profit", "ul"),
+                ("Fix a take profit (list + correct)", "fix"), (track, "track"),
+                ("Rebuild TP list from fills (repair)", "rtp")]
+        if t.get("entry2") and not t.get("entry2_filled"):
+            opts.insert(0, ("Cancel entry 2 - DCA leg pulled, entry 1 only", "e2x"))
+        self.add_item(self._more(opts))
 
     def _btn(self, label, cb, style, row=0, disabled=False):
         b = discord.ui.Button(label=label, style=style, row=row, disabled=disabled)
@@ -465,11 +468,12 @@ class Desk(discord.ui.View):
                 return await actions.reopen_trade(kind, key, rec, data)
             await self._ask(interaction, "Reopen", "reverses the close, deletes the results card and rebuilds the summary.",
                             lambda i: self._apply(i, run)); return
-        if val in ("ci", "ul", "rtp"):
+        if val in ("ci", "ul", "rtp", "e2x"):
             what = {"ci": "closes the trade as never triggered / thesis gone - it goes to results as Invalidated.",
                     "ul": "removes the last recorded take profit.",
-                    "rtp": "re-derives the TP ticks from the recorded fills (repair only)."}[val]
-            label = {"ci": "Invalidated", "ul": "Undo last take profit", "rtp": "Rebuild TP list"}[val]
+                    "rtp": "re-derives the TP ticks from the recorded fills (repair only).",
+                    "e2x": "removes the unfilled DCA leg - R, sizing and the card run from entry 1 only. The stop stays; trail it after if needed."}[val]
+            label = {"ci": "Invalidated", "ul": "Undo last take profit", "rtp": "Rebuild TP list", "e2x": "Cancel entry 2"}[val]
             await self._ask(interaction, label, what, lambda i, ev=val.upper(): self._event(i, ev)); return
         if val.startswith("st:"):
             async def run(kind, key, rec, data):

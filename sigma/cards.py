@@ -301,6 +301,8 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
     else:
         entry_val = fnum(e1) if e1 is not None else str(t.get("entry"))
         entry_val += f"\n{type_label} \u00b7 {'filled' if t.get('entry1_filled') else 'pending'}" if not closed else f"\n{type_label}"
+        if t.get("entry2_cancelled"):
+            entry_val += f" \u00b7 E2 {t['entry2_cancelled']} cancelled"
     embed.add_field(name="Entry", value=entry_val, inline=True)
 
     sl_shown = fnum(sl_num(t)) if sl_num(t) is not None else str(t.get("sl"))
