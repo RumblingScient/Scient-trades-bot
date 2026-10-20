@@ -307,3 +307,25 @@ def test_edit_still_works_after_stop_moved_and_legacy_be_migrates():
     assert not svc.migrate_legacy_be(old)
     out = svc.apply_event("fut", old, "SL")
     assert old["result"] == "BE"
+
+
+def test_cancel_entry_2_runs_everything_from_entry_1():
+    from sigma.calculations import entry_num, signed_r
+    t = svc.build_futures(analyst=A, pair="SOL", direction="LONG", entry="150", stop="138", tp1="165", entry_type="DCA",
+                          entry2="144", entry_split="40/60")
+    with pytest.raises(UserError):                       # unknown on spot / nothing to cancel on a plain limit
+        svc.apply_event("fut", svc.build_futures(analyst=A, pair="X", direction="LONG", entry="1", stop="0.9", tp1="2"), "E2X")
+    svc.apply_event("fut", t, "EF1")
+    assert entry_num(t) == 150.0                         # only leg 1 filled -> entry 1
+    out = svc.apply_event("fut", t, "E2X")
+    assert t["entry2"] is None and t["entry2_cancelled"] == "144" and t["entry_split"] is None and not t["entry2_filled"]
+    assert out.title == "Entry 2 cancelled" and entry_num(t) == 150.0 and signed_r(t, 165) == pytest.approx(1.25)
+    with pytest.raises(UserError, match="no DCA entry"):
+        svc.apply_event("fut", t, "EF2")
+    svc.apply_event("fut", t, "SLU", price="147")        # stop moved up afterwards, R still from the posted stop
+    assert t["sl"] == "147" and signed_r(t, 165) == pytest.approx(1.25)
+    # a filled leg can't be cancelled
+    t2 = svc.build_futures(analyst=A, pair="SOL", direction="LONG", entry="150", stop="138", tp1="165", entry_type="DCA", entry2="144")
+    svc.apply_event("fut", t2, "EF2")
+    with pytest.raises(UserError, match="already filled"):
+        svc.apply_event("fut", t2, "E2X")

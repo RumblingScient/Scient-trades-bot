@@ -27,6 +27,7 @@ SPOT_TP_KEYS = ("t1", "t2", "t3")
 FUT_EVENTS = [
     ("EF1",  "Entry filled (DCA: entry 1)"),
     ("EF2",  "Entry 2 filled - DCA leg, full position live"),
+    ("E2X",  "Cancel entry 2 - DCA leg pulled, position is entry 1 only"),
     ("TPN",  "Preset TP reached - next one, or all up to price"),
     ("PTP",  "Take profit at a price - needs price + pct"),
     ("BE",   "Stop to entry - risk-free, R:R stays on the original risk"),
@@ -368,6 +369,22 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
         t["entry1_filled"] = True
         d = "DCA entry filled - full position live"
         return Outcome(desc=d, title="Entry 2 filled", color=BLUE, line=d + ".")
+
+    if ev == "E2X":
+        if spot:
+            raise UserError("Spot has no Entry 2.")
+        if not t.get("entry2"):
+            raise UserError("This trade has no DCA entry to cancel.")
+        if t.get("entry2_filled"):
+            raise UserError("Entry 2 already filled - it can't be cancelled. Use Edit if the fill was recorded by mistake.")
+        t["entry2_cancelled"] = str(t["entry2"])
+        t["entry2"] = None
+        t["entry2_filled"] = False
+        t["entry_split"] = None
+        t["entry_type"] = t.get("entry_type") or "LIMIT"
+        d = f"Entry 2 cancelled ({t['entry2_cancelled']}) - position is entry 1 only"
+        return Outcome(desc=d, title="Entry 2 cancelled", color=GREY,
+                       line=d + ".\nR and sizing now run from entry 1 alone; the stop stays where it is - trail it if needed.")
 
     if ev == "BE":
         if spot:

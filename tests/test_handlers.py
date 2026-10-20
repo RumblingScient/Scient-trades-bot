@@ -382,3 +382,15 @@ def test_replace_chart_from_panel(env, monkeypatch):
         content_type = "application/pdf"
     asyncio.run(it2.response.modal.on_ok(FakeInteraction(FakeUser(uid=1)), Bad()))
     assert view.last.startswith("\u26a0 That isn't an image") and len(edits) == 1
+
+
+def test_cancel_entry_2_only_offered_on_open_dca(env):
+    env["trades"]["11"].update({"entry2": "98", "entry_type": "LIMIT", "entry1_filled": True})
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    assert [o.value for o in _select(view).options][0] == "e2x"
+    _pick(view, "e2x")
+    t = env["trades"]["11"]
+    assert t["entry2"] is None and t["entry2_cancelled"] == "98" and env["calls"]["feed"][-1][0] == "Entry 2 cancelled"
+    assert "e2x" not in [o.value for o in _select(view).options]
+    e = env["desk"].bot and __import__("sigma.cards", fromlist=["x"]).build_embed(t)
+    assert "E2 98 cancelled" in [f.value for f in e.fields if f.name == "Entry"][0]
