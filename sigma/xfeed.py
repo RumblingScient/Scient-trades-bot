@@ -18,6 +18,38 @@ from sigma.calculations import fix_x_link
 from sigma.members import is_analyst
 
 
+_POSTED: set = set()          # ids posted by this process - a second line of defence if the seen-file can't be saved
+_HISTORY_SCAN = 60            # how many recent feed messages to check before posting
+
+
+async def _already_in_channel(channel, tid: str) -> bool:
+    """True if a recent message in the feed channel already carries this tweet id (survives any state loss)."""
+    try:
+        async for m in channel.history(limit=_HISTORY_SCAN):
+            if m.author == bot.user and f"/status/{tid}" in (m.content or ""):
+                return True
+    except Exception as e:
+        print(f"[x_poll] history check failed: {e}")
+    return False
+
+
+def _remember(seen: dict, ids: list) -> bool:
+    """Persist seen ids, newest last, and shout if the save is refused (that is how the same tweet repeats)."""
+    seen["ids"] = ids[-500:]
+    seen["initialized"] = True
+    try:
+        save_xseen(seen)
+        return True
+    except Exception as e:
+        print(f"[x_poll] seen-file save FAILED - {e}", flush=True)
+        try:
+            from sigma.ops import ops_alert
+            asyncio.create_task(ops_alert(f"X feed: can't save x_posted.json ({e}). Posting is guarded by channel history until this is fixed.", key="xseen-save"))
+        except Exception:
+            pass
+        return False
+
+
 @tasks.loop(minutes=X_POLL_MINUTES)
 async def x_poll_loop():
     if not (X_AUTO_ENABLED and TWITTERAPIS_KEY and X_FEED_CHANNEL_ID and X_AUTO_USERNAME):
@@ -43,20 +75,26 @@ async def x_poll_loop():
     if not tweets:
         return
     seen = load_xseen()
-    seen_ids = set(seen.get("ids", []))
+    ids = [str(x) for x in (seen.get("ids") or [])]
+    seen_ids = set(ids) | _POSTED
     first_run = not seen.get("initialized", False)
-    new_tweets = [tw for tw in tweets if str(tw.get("id")) not in seen_ids]
-    new_tweets.reverse()
     if first_run:
-        for tw in tweets:
-            seen_ids.add(str(tw.get("id")))
-        seen["ids"] = list(seen_ids)[-500:]
-        seen["initialized"] = True
-        save_xseen(seen)
+        ids += [str(tw.get("id")) for tw in tweets if str(tw.get("id")) not in seen_ids]
+        _POSTED.update(ids)
+        _remember(seen, ids)
         print(f"[x_poll] first run - seeded {len(tweets)} tweets, none posted")
         return
+    new_tweets = [tw for tw in tweets if str(tw.get("id")) not in seen_ids]
+    new_tweets.reverse()
+    posted = 0
     for tw in new_tweets:
         tid = str(tw.get("id"))
+        if not tid or tid == "None":
+            continue
+        if await _already_in_channel(channel, tid):
+            ids.append(tid); _POSTED.add(tid)
+            print(f"[x_poll] {tid} already in channel - marked seen, not reposted")
+            continue
         username = (tw.get("author") or {}).get("username", X_AUTO_USERNAME)
         link = f"https://x.com/{username}/status/{tid}"
         fixed = fix_x_link(link)
@@ -68,14 +106,13 @@ async def x_poll_loop():
         parts.append(fixed)
         try:
             await channel.send(content="\n".join(parts), allowed_mentions=allowed)
-            seen_ids.add(tid)
+            ids.append(tid); _POSTED.add(tid); posted += 1
         except Exception as e:
             print(f"[x_poll] post error: {e}")
-    seen["ids"] = list(seen_ids)[-500:]
-    seen["initialized"] = True
-    save_xseen(seen)
     if new_tweets:
-        print(f"[x_poll] posted {len(new_tweets)} new tweet(s)")
+        _remember(seen, ids)
+    if posted:
+        print(f"[x_poll] posted {posted} new tweet(s)")
 
 @x_poll_loop.before_loop
 async def before_x_poll():
