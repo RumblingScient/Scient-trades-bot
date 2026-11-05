@@ -495,3 +495,43 @@ def test_setup_error_keeps_the_draft_and_fix_popup_reposts(env):
     it3 = _submit(it2, {"targets": "1.5 / 2", "zone": "1.2 - 1.0"})
     assert len(posted) == 1 and posted[0]["targets"] == "1.5 / 2" and posted[0]["chart"] == "CHART" \
         and posted[0]["notes"] == "thesis" and posted[0]["play_type"] == "SCALING"
+
+
+def test_setup_quick_posts_without_targets_and_infers_direction(env, monkeypatch):
+    """pair + entry + stop + risk -> card up in seconds; direction from the numbers; card says targets are pending."""
+    from sigma import commands_setup as cs
+    from sigma.cards import build_embed
+    posted = {}
+
+    async def _post_card(interaction, rec, cid, spot, chart, title, label, notes):
+        posted["rec"] = rec
+        class M:  # minimal message
+            id = 777; jump_url = "url"
+            async def edit(self, **k): pass
+        class C:
+            mention = "#trades"
+        return M(), C()
+    monkeypatch.setattr(cs, "_post_card", _post_card)
+    async def _rb(): pass
+    monkeypatch.setattr(cs, "refresh_board", _rb)
+    monkeypatch.setattr(cs.store, "load", lambda kind: {})
+    monkeypatch.setattr(cs.store, "save", lambda kind, d: None)
+    replies = []
+    async def _reply(it, msg): replies.append(msg)
+    monkeypatch.setattr(cs, "_reply", _reply)
+    draft = {"pair": "sol", "direction": "SHORT", "entry_type": "LIMIT", "entry": "182.5", "stop": "188", "targets": None,
+             "entry2": None, "entry_split": None, "tp_split": None, "risk": "0.5", "timeframe": None, "framework": None,
+             "context": None, "chart": None, "notes": None, "quick": True}
+    it = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(cs._run_draft(it, draft, False, cs._post_futures))
+    rec = posted["rec"]
+    assert rec["direction"] == "SHORT" and rec["risk"] == "0.5" and not any(rec.get(k) for k in ("tp1", "tp2", "tp3", "tp4"))
+    assert "No targets on it yet" in replies[-1]
+    e = build_embed(rec)
+    nxt = next(f for f in e.fields if f.name == "NEXT")
+    assert nxt.value == "targets to be added"
+    # the full command still insists on a target
+    draft2 = dict(draft, quick=False)
+    it2 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(cs._run_draft(it2, draft2, False, cs._post_futures))
+    assert "at least one target" in it2.followup.sent[-1]

@@ -36,7 +36,9 @@ async def ops_alert(text: str, key: str = None, cooldown: int = 600):
     _ops_recent[key] = now
     log.warning(f"[ops] {text}")
     try:
-        ch = bot.get_channel(OPS_CHANNEL_ID) if OPS_CHANNEL_ID else None
+        from sigma.config import MOD_LOG_CHANNEL_ID
+        cid = OPS_CHANNEL_ID or MOD_LOG_CHANNEL_ID          # no ops channel configured -> the mod-log hears it
+        ch = bot.get_channel(cid) if cid else None
         if ch:
             await ch.send(f"\u26a0 **ops** \u00b7 {text[:1800]}")
     except Exception:

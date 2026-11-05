@@ -589,7 +589,7 @@ def test_stable_amounts_round_first_then_cents(bot_mod):
     assert pay.fmt_amt(100.0, "USDC") == "100.00 USDC" and pay.fmt_amt(100.01, "USDT") == "100.01 USDT" and pay.fmt_amt(0.82611, "SOL") == "0.82611 SOL"
 
 
-def test_match_is_per_token_and_stables_have_no_fee_slack(bot_mod):
+def test_match_is_per_token_and_stables_allow_exchange_fee_slack(bot_mod):
     pay = __import__("sigma.payments", fromlist=["x"])
     now = datetime.now(timezone.utc)
     sess = {"u": {"amount": 100.0, "token": "USDC", "created": now.isoformat(), "paid": False},
@@ -598,7 +598,8 @@ def test_match_is_per_token_and_stables_have_no_fee_slack(bot_mod):
     assert pay.match_session(sess, 100.0, now, token="USDC") == ("u", "exact")
     assert pay.match_session(sess, 100.0, now, token="USDT") == ("t", "exact")
     assert pay.match_session(sess, 100.0, now, token="SOL") == ("s", "exact")
-    assert pay.match_session(sess, 99.99, now, token="USDC") == (None, "")        # no fee slack on stables
+    assert pay.match_session(sess, 99.0, now, token="USDC") == ("u", "fee")       # exchange withdrawal fee taken out of the amount
+    assert pay.match_session(sess, 97.0, now, token="USDC") == (None, "")         # short by more than the slack -> not a fee case
     assert pay.match_session({"s": sess["s"]}, 99.99, now, token="SOL") == ("s", "fee")
     legacy = {"old": {"amount": 1.5, "created": now.isoformat(), "paid": False}}  # pre-upgrade session has no token key
     assert pay.match_session(legacy, 1.5, now, token="SOL") == ("old", "exact")
@@ -617,10 +618,11 @@ def test_usdc_payment_end_to_end(bot_mod, monkeypatch):
     monkeypatch.setattr(pay, "fetch_tx", _tx_fetch)
     found = asyncio.run(pay._watch_once())
     assert found == 3
-    assert sorted(acts) == [(7, "1month", "sigU"), (8, "1month", "sigS")]
-    assert state["sessions"]["u"]["paid"] and state["sessions"]["u"]["received"] == 100.0
-    assert len(state["unmatched"]) == 1 and state["unmatched"][0]["token"] == "USDT"   # nobody quoted USDT -> alert, not a grant
-    assert "100.00 USDT" in alerts[0]
+    # SOL is the only offered token. The USDC transfer (oldest, processed first) is worth exactly one open SOL quote
+    # -> activated by value with an alert; the SOL transfer then finds that quote already paid -> unmatched; USDT -> unmatched.
+    assert acts == [(8, "1month", "sigU")]
+    assert state["sessions"]["s"]["paid"] and state["sessions"]["s"]["match"] == "value"
+    assert "we only offer SOL" in alerts[0] and [u["token"] for u in state["unmatched"]] == ["SOL", "USDT"]
 
 
 def test_quote_flow_with_token(bot_mod, plans_store, monkeypatch):
@@ -636,21 +638,20 @@ def test_quote_flow_with_token(bot_mod, plans_store, monkeypatch):
     monkeypatch.setattr(pay, "log_quote", _lq)
     import types
     u = types.SimpleNamespace(id=5, __str__=lambda s: "u5")
-    emb, view = asyncio.run(pay.new_quote(u, "3months", "USDT"))
-    s = next(iter(state["sessions"].values()))
-    assert s["token"] == "USDT" and s["amount"] == 270.0 and "270.00 USDT" in emb.description and "Solana network (SPL)" in emb.description
-    assert "Not Ethereum, not BSC, not Tron" in emb.description
+    with pytest.raises(UserError, match="SOL only"):
+        asyncio.run(pay.new_quote(u, "3months", "USDT"))         # stables are no longer offered
     with pytest.raises(UserError):
         asyncio.run(pay.new_quote(u, "3months", "DOGE"))
+    assert state["sessions"] == {}
     tp = pay.TokenPick("3months")
-    assert [o.value for o in tp.children[0].options] == ["SOL", "USDC", "USDT"] and tp.children[0].custom_id == "sigma:pay:token:3months"
+    assert [o.value for o in tp.children[0].options] == ["SOL"] and tp.children[0].custom_id == "sigma:pay:token:3months"
 
 
 def test_token_picker_is_plain(bot_mod):
     """Plain labels only - a non-emoji character in a SelectOption makes Discord reject the whole message."""
     pay = __import__("sigma.payments", fromlist=["x"])
     opts = pay.TokenPick("1month").children[0].options
-    assert [o.label for o in opts] == ["SOL", "USDC", "USDT"]
+    assert [o.label for o in opts] == ["SOL"]
     assert all(o.emoji is None and not o.description for o in opts)
 
 
@@ -658,3 +659,40 @@ def test_views_surface_errors(bot_mod):
     pay = __import__("sigma.payments", fromlist=["x"])
     for cls in (pay.PaymentPanel, pay.QuoteView, pay.TokenPick, pay.MembersCSVView):
         assert issubclass(cls, pay.SafeView)
+
+
+def test_rounded_amount_matches_by_value_only_when_one_quote_fits(bot_mod, monkeypatch):
+    """Sender rounded the quoted 0.82611 SOL to 0.83 -> the unique tail is gone -> match on USD value, one candidate only."""
+    pay = __import__("sigma.payments", fromlist=["x"])
+    sessions = {"b": _sess(2, 0.82611, 100, plan="1month")}
+    state, acts, alerts = _env(pay, monkeypatch, sessions)
+    async def _sigs(limit=25): return ["sigR"]
+    async def _tx(sig): return globals()["_tx"](0.83)
+    monkeypatch.setattr(pay, "recent_signatures", _sigs)
+    monkeypatch.setattr(pay, "fetch_tx", _tx)
+    asyncio.run(pay._watch_once())
+    assert acts == [(2, "1month", "sigR")] and state["sessions"]["b"]["match"] == "value"
+    # two $100 quotes open -> ambiguous -> unmatched, and the alert names both so the admin can resolve it
+    sessions = {"b": _sess(2, 0.82611, 100, plan="1month"), "c": _sess(3, 0.82744, 100, plan="1month")}
+    state, acts, alerts = _env(pay, monkeypatch, sessions)
+    monkeypatch.setattr(pay, "recent_signatures", _sigs)
+    monkeypatch.setattr(pay, "fetch_tx", _tx)
+    asyncio.run(pay._watch_once())
+    assert acts == [] and len(state["unmatched"]) == 1 and "<@2>" in alerts[0] and "<@3>" in alerts[0]
+
+
+def test_null_tx_from_rpc_is_retried_not_dropped(bot_mod, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    sessions = {"b": _sess(2, 0.82611, 100, plan="1month")}
+    state, acts, alerts = _env(pay, monkeypatch, sessions)
+    calls = {"n": 0}
+    async def _sigs(limit=25): return ["sigN"]
+    async def _tx(sig):
+        calls["n"] += 1
+        return None if calls["n"] < 3 else globals()["_tx"](0.82611)     # RPC serves null twice, then the real tx
+    monkeypatch.setattr(pay, "recent_signatures", _sigs)
+    monkeypatch.setattr(pay, "fetch_tx", _tx)
+    asyncio.run(pay._watch_once()); asyncio.run(pay._watch_once())
+    assert acts == [] and "sigN" not in state.get("seen", []) and state["retry"]["sigN"] == 2
+    asyncio.run(pay._watch_once())
+    assert acts == [(2, "1month", "sigN")] and "sigN" in state["seen"] and "sigN" not in state["retry"]

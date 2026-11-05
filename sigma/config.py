@@ -72,10 +72,11 @@ PAY_MIN_SOL = 0.005           # ignore dust below this (no alert, just a log lin
 PAY_VALUE_FLOOR = 0.95        # received SOL must still be worth >= 95% of the quoted USD at the time it lands
 PAY_POLL_SEC = 30
 # tokens accepted on Solana. SOL = native; the stables are SPL mints (mainnet). Amounts for stables are USD + unique cents.
+# accept: offered on the panel. Non-accepted mints are still watched so a stray USDC/USDT transfer raises an alert.
 PAY_TOKENS = {
-    "SOL":  {"mint": None, "decimals": 9, "stable": False, "tol": 0.000005, "slack": 0.02,  "min": 0.005, "emoji": "\U0001F7E3", "emote": "tok_sol"},
-    "USDC": {"mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "decimals": 6, "stable": True, "tol": 0.0005, "slack": 0.0, "min": 0.5, "emoji": "\U0001F4B5", "emote": "tok_usdc"},
-    "USDT": {"mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "decimals": 6, "stable": True, "tol": 0.0005, "slack": 0.0, "min": 0.5, "emoji": "\U0001F4B5", "emote": "tok_usdt"},
+    "SOL":  {"mint": None, "accept": True, "decimals": 9, "stable": False, "tol": 0.000005, "slack": 0.02,  "min": 0.005, "emoji": "\U0001F7E3", "emote": "tok_sol"},
+    "USDC": {"mint": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", "accept": False, "decimals": 6, "stable": True, "tol": 0.0005, "slack": 2.0, "min": 0.5, "emoji": "\U0001F4B5", "emote": "tok_usdc"},
+    "USDT": {"mint": "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", "accept": False, "decimals": 6, "stable": True, "tol": 0.0005, "slack": 2.0, "min": 0.5, "emoji": "\U0001F4B5", "emote": "tok_usdt"},
 }
 
 FREE_ALERT_LIMIT = 5      # max active alerts for non-pro members
@@ -308,3 +309,5 @@ SIGMA_ASH = "#8593A6"; SIGMA_GREEN = "#16C784"; SIGMA_RED = "#EA3943"
 SIGMA_EMBED_CYAN = discord.Color.from_str(SIGMA_CYAN)
 
 RESULTS_FILE = _ROOT.joinpath("results_board.json")
+
+ACCEPTED_TOKENS = [k for k, v in PAY_TOKENS.items() if v.get("accept", True)]

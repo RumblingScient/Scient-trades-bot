@@ -14,7 +14,10 @@ def _group(tree, name):
 
 def test_setup_group(tree):
     g, subs = _group(tree, "setup")
-    assert set(subs) == {"futures", "spot", "edit", "xpost", "referrals"}, "everything after posting lives on the card's Manage button"
+    assert set(subs) == {"futures", "quick", "spot", "edit", "xpost", "referrals"}, "everything after posting lives on the card's Manage button"
+    q = [p.name for p in subs["quick"].parameters]
+    assert q[:3] == ["pair", "entry", "stop"] and all(p.required for p in subs["quick"].parameters[:3])
+    assert set(q[3:]) == {"risk", "entry_type", "chart", "notes"} and not any(p.required for p in subs["quick"].parameters[3:])
     fut = [p.name for p in subs["futures"].parameters]
     assert fut[:6] == ["pair", "direction", "entry_type", "entry", "stop", "targets"], "new-setup flow: ticker, side, entry type, entry, stop, targets"
     assert all(p.required for p in subs["futures"].parameters[:6]) and not subs["futures"].parameters[6].required

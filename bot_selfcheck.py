@@ -29,7 +29,7 @@ for must in ("open", "recent", "stats", "results", "help", "setup", "admin"):
 def _group(nm):
     g = next((c for c in cmds if c.name == nm), None)
     return {s.name for s in getattr(g, "commands", []) or []}
-check("/setup subcommands", _group("setup") == {"futures","spot","edit","xpost","referrals"}, str(sorted(_group("setup"))))
+check("/setup subcommands", _group("setup") == {"futures","quick","spot","edit","xpost","referrals"}, str(sorted(_group("setup"))))
 check("/admin subcommands", _group("admin") >= {"health","terminal_check","board","results","override","recap","tg","panel","desk","import"}, str(sorted(_group("admin"))))
 _adm = next((c for c in cmds if c.name == "admin"), None)
 check("/admin hidden from members", _adm is not None and _adm.default_permissions is not None and _adm.default_permissions.administrator)

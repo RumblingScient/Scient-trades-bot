@@ -376,7 +376,8 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
         risk_val = f"{fmt_risk(t.get('risk')) or '1%'}" + (f" \u00b7 R:R {rr}" if rr else "") + (f" \u00b7 result {r:+.2f}R" if isinstance(r, (int, float)) else "")
     else:
         nt = next_target(t)
-        embed.add_field(name="NEXT", value=(f"**{nt[0].split(' \u00b7 ')[0]} \u00b7 {fx(nt[1])}" + (f" \u00b7 {nt[0].split(' \u00b7 ')[1]}" if len(nt[0].split(' \u00b7 ')) > 1 else "") + "**") if nt else "all targets hit", inline=True)
+        has_tps = any(t.get(k) for k in ("tp1", "tp2", "tp3", "tp4"))
+        embed.add_field(name="NEXT", value=(f"**{nt[0].split(' \u00b7 ')[0]} \u00b7 {fx(nt[1])}" + (f" \u00b7 {nt[0].split(' \u00b7 ')[1]}" if len(nt[0].split(' \u00b7 ')) > 1 else "") + "**") if nt else ("all targets hit" if has_tps else "targets to be added"), inline=True)
         rpu = risk_per_unit(t)
         risk_val = f"{fmt_risk(t.get('risk')) or '1%'}" + (f" \u00b7 R:R {rr}" if rr else "") + (f" \u00b7 1R {fx(rpu)}" if rpu and stop_trailed(t) else "")
     embed.add_field(name="RISK", value=risk_val, inline=True)

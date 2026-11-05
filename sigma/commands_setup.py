@@ -233,12 +233,43 @@ async def setup_futures(interaction: discord.Interaction, pair: str, direction: 
     await _run_draft(interaction, draft, False, _post_futures)
 
 
+@setup.command(name="quick", description="Post a futures setup fast - pair, entry, stop, risk. Targets and the rest from Manage > Edit")
+@app_commands.describe(
+    pair="Pair, e.g. BTC",
+    entry="Entry price",
+    stop="Stop price (or a condition, e.g. 4h close below 63000)",
+    risk="Account risk %, just the number - blank = 1",
+    entry_type="Limit (default) or Market - filled now",
+    chart="Chart image",
+    notes="Optional reasoning - posted in the thread",
+)
+@app_commands.choices(entry_type=[app_commands.Choice(name="Limit", value="LIMIT"), app_commands.Choice(name="Market - filled now", value="MARKET")])
+async def setup_quick(interaction: discord.Interaction, pair: str, entry: str, stop: str, risk: str = None,
+                      entry_type: app_commands.Choice[str] = None, chart: discord.Attachment = None, notes: str = None):
+    """Direction comes from the numbers: stop below entry = long, above = short. No targets yet - the card says so."""
+    if not await _gate(interaction, "post setups"):
+        return
+    from sigma.calculations import first_num
+    from sigma.services.trades import parse_sl
+    e, s = first_num(entry), parse_sl(stop)[0]
+    if e is None or s is None:
+        await _reply(interaction, "Entry and stop both need a price - e.g. `entry: 64200` `stop: 62800`.")
+        return
+    if float(s) == float(e):
+        await _reply(interaction, "Stop and entry are the same price.")
+        return
+    draft = {"pair": pair, "direction": "LONG" if float(s) < float(e) else "SHORT", "entry_type": (entry_type.value if entry_type else "LIMIT"),
+             "entry": entry, "stop": stop, "targets": None, "entry2": None, "entry_split": None, "tp_split": None, "risk": risk,
+             "timeframe": None, "framework": None, "context": None, "chart": chart, "notes": notes, "quick": True}
+    await _run_draft(interaction, draft, False, _post_futures)
+
+
 async def _post_futures(interaction, d: dict):
-    """Validate + post a futures setup from a draft dict (slash command or the Fix popup)."""
+    """Validate + post a futures setup from a draft dict (slash command, /setup quick or the Fix popup)."""
     if d["entry_type"] != "DCA" and d.get("entry2"):
         d["entry_type"] = "DCA"                                # entry2 given -> it's a DCA setup, no need to block on the label
     tps = actions.parse_targets(d.get("targets"), 4)
-    if not tps:
+    if not tps and not d.get("quick"):
         raise UserError("Give at least one target.")
     tps += [None] * (4 - len(tps))
     rec = svc.build_futures(
@@ -259,7 +290,8 @@ async def _post_futures(interaction, d: dict):
     data[str(msg.id)] = rec
     store.save(store.FUT, data)
     await refresh_board()
-    await _reply(interaction, f"Setup posted in {channel.mention} ({msg.jump_url}) - press **Manage** on the card for everything after this.")
+    await _reply(interaction, f"Setup posted in {channel.mention} ({msg.jump_url}) - press **Manage** on the card for everything after this."
+                 + ("\nNo targets on it yet - **Manage > Edit > Targets** when you have them." if d.get("quick") and not tps[0] else ""))
 
 
 @setup.command(name="spot", description="Post a spot play - buy zone, targets, invalidation")

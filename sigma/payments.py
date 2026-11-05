@@ -149,6 +149,15 @@ def match_session(sessions: dict, amount: float, now=None, token: str = "SOL") -
     return None, ""
 
 
+def match_by_value(sessions: dict, worth_usd: float, token: str, now=None, band: float = 0.06) -> str | None:
+    """Last resort when the amount tail was lost (sender rounded it, exchange took a fee): exactly ONE live quote
+    in this token whose USD price is within `band` of what landed. Two candidates = ambiguous = None."""
+    now = now or _now()
+    cands = [sid for sid, s, _ in _live(sessions, now)
+             if s.get("token", "SOL") == token and abs(float(s["usd"]) - worth_usd) <= float(s["usd"]) * band]
+    return cands[0] if len(cands) == 1 else None
+
+
 def session_open(s: dict, now=None) -> bool:
     try:
         return (now or _now()) - datetime.fromisoformat(s["created"]) <= timedelta(minutes=PAY_SESSION_MIN)
@@ -195,9 +204,51 @@ async def _rpc(method: str, params: list):
             return j.get("result")
 
 
+_TOKEN_ACCOUNTS: dict = {}       # mint -> [token account address]; refreshed every ~10 min
+_TOKEN_ACCOUNTS_AT: float = 0.0
+
+
+async def token_accounts() -> list:
+    """Every token account the wallet owns for an accepted stablecoin mint. SPL transfers reference the
+    token account, not the owner, so getSignaturesForAddress(wallet) alone never sees a USDC / USDT payment
+    sent from an exchange (wallet apps that add an idempotent ATA-create do reference the owner - exchanges don't)."""
+    global _TOKEN_ACCOUNTS_AT
+    import time as _t
+    if _t.time() - _TOKEN_ACCOUNTS_AT < 600 and _TOKEN_ACCOUNTS:
+        return [a for lst in _TOKEN_ACCOUNTS.values() for a in lst]
+    out = {}
+    for tk, cfg in PAY_TOKENS.items():
+        if not cfg["mint"]:
+            continue
+        try:
+            res = await _rpc("getTokenAccountsByOwner", [SOL_WALLET, {"mint": cfg["mint"]}, {"encoding": "jsonParsed"}]) or {}
+            out[cfg["mint"]] = [v["pubkey"] for v in (res.get("value") or [])]
+        except Exception as e:
+            print(f"[pay] token account lookup failed for {tk}: {e}", flush=True)
+            if cfg["mint"] in _TOKEN_ACCOUNTS:
+                out[cfg["mint"]] = _TOKEN_ACCOUNTS[cfg["mint"]]
+    if out:
+        _TOKEN_ACCOUNTS.clear(); _TOKEN_ACCOUNTS.update(out); _TOKEN_ACCOUNTS_AT = _t.time()
+    return [a for lst in out.values() for a in lst]
+
+
 async def recent_signatures(limit: int = 25) -> list:
-    res = await _rpc("getSignaturesForAddress", [SOL_WALLET, {"limit": limit}]) or []
-    return [x["signature"] for x in res if not x.get("err")]
+    """Newest-first signatures touching the wallet OR any of its stablecoin token accounts (deduped, order kept)."""
+    addrs = [SOL_WALLET] + [a for a in await token_accounts() if a != SOL_WALLET]
+    seen, out = set(), []
+    for addr in addrs:
+        try:
+            res = await _rpc("getSignaturesForAddress", [addr, {"limit": limit}]) or []
+        except Exception as e:
+            if addr == SOL_WALLET:
+                raise
+            print(f"[pay] signatures for token account {addr[:8]} failed: {e}", flush=True)
+            continue
+        for x in res:
+            sig = x["signature"]
+            if not x.get("err") and sig not in seen:
+                seen.add(sig); out.append(sig)
+    return out
 
 
 async def fetch_tx(sig: str) -> dict | None:
@@ -289,7 +340,7 @@ def panel_embed() -> discord.Embed:
     lines = [f"{plan_emote(k)} {plansvc.describe(p, subsvc.seats_left(subs, k))}" for k, p in plansvc.all(enabled_only=True).items()]
     e.description = (f"Unlocks {role} - live setups, terminal, results board, journals.\n\n"
                      + "\n".join(lines)
-                     + "\n\nPick a plan, pay in SOL, USDC or USDT on Solana, send the exact amount. Access switches on by itself."
+                     + "\n\nPick a plan, pay in **SOL** (Solana network), send the exact amount. Access switches on by itself."
                      + ("\nPromo code? Tap **Promo code** on your quote." if plansvc.promos() else ""))
     try:
         if bot.user and bot.user.display_avatar:
@@ -352,13 +403,22 @@ class PlanSelect(discord.ui.Select):
             await interaction.followup.send("That plan isn't open right now.", ephemeral=True)
             return
         eff, _ = plansvc.effective_price(p)
+        from sigma.config import ACCEPTED_TOKENS
+        if len(ACCEPTED_TOKENS) == 1:
+            try:
+                emb, view = await new_quote(interaction.user, plan, ACCEPTED_TOKENS[0])
+                await interaction.followup.send(embed=emb, view=view, ephemeral=True)
+            except UserError as e:
+                await interaction.followup.send(e.message, ephemeral=True)
+            return
         await interaction.followup.send(f"**{p['short']}** · ${eff:,.0f} · Solana", view=TokenPick(plan), ephemeral=True)
 
 
 class TokenSelect(discord.ui.Select):
     def __init__(self, plan: str):
         self.plan = plan
-        opts = [discord.SelectOption(label=tk, value=tk) for tk in PAY_TOKENS]      # plain on purpose - no icons, no blurbs
+        from sigma.config import ACCEPTED_TOKENS
+        opts = [discord.SelectOption(label=tk, value=tk) for tk in ACCEPTED_TOKENS]  # plain on purpose - no icons, no blurbs
         super().__init__(placeholder="Pay with", options=opts, custom_id=f"sigma:pay:token:{plan}", min_values=1, max_values=1)
 
     async def callback(self, interaction: discord.Interaction):
@@ -458,8 +518,8 @@ async def apply_promo(user, sid: str, code: str):
 async def new_quote(user: discord.abc.User, plan: str, token: str = "SOL"):
     if not SOL_WALLET:
         raise UserError("Payments aren't configured yet - ping an admin.")
-    if token not in PAY_TOKENS:
-        raise UserError("Unknown token.")
+    if token not in PAY_TOKENS or not PAY_TOKENS[token].get("accept", True):
+        raise UserError("We take payment in SOL only - pick a plan again.")
     p = plansvc.all(enabled_only=True).get(plan)
     if not p:
         raise UserError("That plan isn't open right now.")
@@ -563,10 +623,18 @@ async def _watch_once_inner() -> int:
         except Exception as e:
             print(f"[pay] tx fetch error {sig[:12]}: {e}", flush=True)
             continue
+        if not tx:
+            # public RPCs sometimes answer null for a fresh signature - try again next pass, give up after a while
+            tries = st.setdefault("retry", {})
+            tries[sig] = tries.get(sig, 0) + 1
+            if tries[sig] >= 20:
+                tries.pop(sig, None); seen.add(sig); st["seen"] = list(seen)
+                await ops_alert(f"payment watcher: transaction {sig} never loaded from the RPC after 20 tries - check it on solscan: https://solscan.io/tx/{sig}", key=f"pay:null:{sig[:12]}")
+            save_payments(st)
+            continue
+        st.get("retry", {}).pop(sig, None)
         seen.add(sig)
         st["seen"] = list(seen)
-        if not tx:
-            continue
         for token, amt in received_all(tx, SOL_WALLET):
             if amt < PAY_TOKENS[token]["min"]:
                 print(f"[pay] dust ignored {amt:.6f} {token} {sig[:12]}", flush=True)
@@ -581,18 +649,35 @@ async def _watch_once_inner() -> int:
 async def _settle_transfer(st: dict, sig: str, token: str, amt: float):
     """One incoming transfer -> match a quote, value-gate it, activate. Mutates st (caller saves)."""
     shown = fmt_amt(amt, token)
-    sid, how = match_session(st.get("sessions", {}), amt, token=token)
+    accepted = PAY_TOKENS.get(token, {}).get("accept", True)
+    sid, how = match_session(st.get("sessions", {}), amt, token=token) if accepted else (None, "")
+    px_now = await sol_price() if token == "SOL" else None
+    if sid is None and not accepted:
+        # we only sell in SOL, but the money is here: if exactly one open quote is worth this much, honour it
+        sid = match_by_value(st.get("sessions", {}), amt, "SOL")
+        how = "value" if sid else ""
+        if sid:
+            await ops_alert(f"{shown} received (we only offer SOL) - matched by value to <@{st['sessions'][sid]['user_id']}> "
+                            f"{st['sessions'][sid]['plan']} and activated. https://solscan.io/tx/{sig}", key=f"pay:stable:{sig[:12]}")
+    if sid is None:
+        # the unique tail is gone (rounded amount / exchange fee) - fall back to value, if it points at exactly one quote
+        worth_guess = amt * px_now if (token == "SOL" and px_now) else (amt if token != "SOL" else None)
+        if worth_guess is not None:
+            sid = match_by_value(st.get("sessions", {}), worth_guess, token)
+            how = "value" if sid else ""
     if sid is None:
         st.setdefault("unmatched", []).append({"sig": sig, "amount": amt, "token": token, "at": _now().isoformat()})
         st["unmatched"] = st["unmatched"][-50:]
         save_payments(st)
-        await ops_alert(f"unmatched payment: {shown} - https://solscan.io/tx/{sig} - resolve with /admin grant (tx in note)",
+        open_q = [f"<@{x['user_id']}> {x['plan']} ${x['usd']:,.0f}" for _sid, x, _c in _live(st.get("sessions", {}), _now())]
+        await ops_alert(f"unmatched payment: {shown} - https://solscan.io/tx/{sig}\n"
+                        f"Open quotes right now: {', '.join(open_q) or 'none'}\n"
+                        f"Grant from /admin desk (member -> plan -> Grant, put the tx in the note).",
                         key=f"pay:unmatched:{sig[:12]}")
         return
     s = st["sessions"][sid]
-    # value gate: a late or fee-short payment must still be worth >= PAY_VALUE_FLOOR of the quoted USD *now*
+    # value gate: a late, fee-short or value-matched payment must still be worth >= PAY_VALUE_FLOOR of the quoted USD *now*
     if token == "SOL":
-        px_now = await sol_price()
         worth = amt * px_now if px_now else amt * float(s.get("sol_price") or 0)
     else:
         worth = amt
@@ -601,7 +686,13 @@ async def _settle_transfer(st: dict, sig: str, token: str, amt: float):
         st.setdefault("unmatched", []).append({"sig": sig, "amount": amt, "token": token, "at": _now().isoformat(), "session": sid, "worth_usd": round(worth, 2)})
         save_payments(st)
         await ops_alert(f"UNDERPAID: <@{s['user_id']}> sent {shown} (~${worth:,.0f}) for {s['plan']} quoted ${s['usd']:,.0f} - "
-                        f"https://solscan.io/tx/{sig} - not activated; /admin grant if you accept it", key=f"pay:under:{sig[:12]}")
+                        f"https://solscan.io/tx/{sig} - not activated; grant from /admin desk if you accept it", key=f"pay:under:{sig[:12]}")
+        try:
+            u = bot.get_user(int(s["user_id"])) or await bot.fetch_user(int(s["user_id"]))
+            await u.send(f"We saw your transfer of {shown} (~${worth:,.0f}), but the {s['plan']} plan was quoted at ${s['usd']:,.0f}. "
+                         "An admin has been notified and will sort it out with you - no need to send again.")
+        except Exception:
+            pass
         return
     s.update({"paid": True, "tx": sig, "paid_at": _now().isoformat(), "received": amt, "match": how})
     save_payments(st)
