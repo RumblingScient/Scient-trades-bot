@@ -22,8 +22,8 @@ HDR = {"Authorization": f"Bot {DISCORD_TOKEN}", "User-Agent": "SigmaLinkCheck/1.
 
 def _pair_from_title(title: str) -> str:
     # card titles look like "▲ LONG BTC · 4H" / "[WIN] ▼ SHORT ETH" / "● SPOT FET"
-    m = re.search(r"(?:LONG|SHORT|SPOT)\s+([A-Z0-9]+)", title or "")
-    return m.group(1) if m else ""
+    m = re.search(r"(?:LONG|SHORT|SPOT)\s+([A-Z0-9/]+)", title or "")
+    return m.group(1).split("/")[0] if m else ""
 
 
 async def fetch(session, cid, mid):
@@ -81,15 +81,19 @@ async def main():
             for m in feed:
                 e = (m.get("embeds") or [{}])[0]
                 desc = e.get("description", "") or ""
-                fp = re.search(r"\*\*([A-Z0-9]+)", desc)
+                fp = re.search(r"\*\*([A-Z0-9/]+)", desc)
                 link = re.search(r"channels/(\d+)/(\d+)/(\d+)", desc)
                 if not (fp and link):
                     continue
+                await asyncio.sleep(1.2)                       # stay under Discord's per-route limit
                 card, st = await fetch(s, link.group(2), link.group(3))
-                ctitle = (card.get("embeds") or [{}])[0].get("title", "") if card else f"HTTP {st}"
-                ok = fp.group(1) == _pair_from_title(ctitle)
-                print(f"  {'ok  ' if ok else 'BAD '} feed {fp.group(1):8} -> {ctitle!r}  ({m.get('timestamp','')[:16]})")
-                await asyncio.sleep(0.3)
+                ce = (card.get("embeds") or [{}])[0] if card else {}
+                ctitle = ce.get("title", "") if card else f"HTTP {st}"
+                entry = next((f.get("value", "").split("\n")[0] for f in ce.get("fields", []) if f.get("name") in ("ENTRY", "ZONE")), "")
+                cdate = (card or {}).get("timestamp", "")[:10]
+                ok = fp.group(1).split("/")[0] == _pair_from_title(ctitle)
+                print(f"  {'ok  ' if ok else 'BAD '} {m.get('timestamp','')[:16]}  feed: {e.get('title','')!r:32} {fp.group(1):10} "
+                      f"->  card: {ctitle!r:28} entry {entry!r:18} posted {cdate}  msg {link.group(3)}")
 
 
 asyncio.run(main())

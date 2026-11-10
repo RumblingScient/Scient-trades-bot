@@ -511,3 +511,10 @@ def test_tpn_past_several_targets_books_each_one_per_plan():
     svc.apply_event("spot", p, "BUY", price="1.1", pct=100)
     out = svc.apply_event("spot", p, "TPN", price="2.7")
     assert out.closed and p["result"] == "WIN" and [s["price"] for s in p["sells"]] == [1.5, 2.0, 2.7]
+
+
+def test_jump_url_prefers_the_thread():
+    from sigma.cards import jump_url
+    t = {"channel_id": 1, "message_id": 2, "thread_id": 3}
+    assert jump_url(t).endswith("/3") and "/1/2" not in jump_url(t)
+    assert jump_url({"channel_id": 1, "message_id": 2, "thread_id": None}).endswith("/1/2")

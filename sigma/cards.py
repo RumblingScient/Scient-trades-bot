@@ -172,6 +172,10 @@ def short_status(t: dict) -> str:
     return base
 
 def jump_url(t: dict) -> str:
+    """Link to the trade's thread when it has one: a thread opens with the card pinned at the top. A plain message
+    link in an image-heavy channel scrolls to the card, then the charts load and the view shifts onto a neighbour."""
+    if t.get("thread_id"):
+        return f"https://discord.com/channels/{GUILD_ID}/{t['thread_id']}"
     return f"https://discord.com/channels/{GUILD_ID}/{t['channel_id']}/{t['message_id']}"
 
 def within_edit_window(t: dict) -> bool:
