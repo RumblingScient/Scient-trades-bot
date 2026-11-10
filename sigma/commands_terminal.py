@@ -365,39 +365,101 @@ async def vol(interaction: discord.Interaction, coin: str):
     embed.set_footer(text="Sigma Trading - Binance")
     await interaction.followup.send(embed=embed)
 
-def make_cvd_image(symbol: str, tf_label: str, dates: list, closes: list, cvd_spot: list, cvd_perp: list) -> io.BytesIO:
+def _cvd_usd(x: float) -> str:
+    sign = "+" if x >= 0 else "-"
+    ax_abs = abs(x)
+    if ax_abs >= 1e9:
+        return f"{sign}${ax_abs/1e9:.2f}B"
+    if ax_abs >= 1e6:
+        return f"{sign}${ax_abs/1e6:.1f}M"
+    if ax_abs >= 1e3:
+        return f"{sign}${ax_abs/1e3:.0f}K"
+    return f"{sign}${ax_abs:.0f}"
+
+def make_cvd_image(symbol: str, tf_label: str, klines: list, cvd_spot: list, cvd_perp: list = None) -> io.BytesIO:
+    """Candlestick price panel with Spot CVD and Perp CVD underneath, each on its own scale.
+
+    klines are Binance-style spot candles (oldest first); cvd_spot / cvd_perp are
+    cumulative USD delta series of the same length. cvd_perp may be None (no perp market).
+    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 7), sharex=True,
-                                   gridspec_kw={"height_ratios": [2, 1.4], "hspace": 0.06},
-                                   facecolor=SG_OBS)
-    for ax in (ax1, ax2):
+    import matplotlib.ticker as mticker
+    n = len(klines)
+    xs = list(range(n))
+    times = [datetime.fromtimestamp(int(k[0]) / 1000, tz=timezone.utc) for k in klines]
+    opens = [float(k[1]) for k in klines]
+    highs = [float(k[2]) for k in klines]
+    lows = [float(k[3]) for k in klines]
+    closes = [float(k[4]) for k in klines]
+    # rebase both series to zero at the left edge so the panels read as "net flow over this window"
+    panels = [("SPOT CVD", [v - cvd_spot[0] for v in cvd_spot], SG_AMBER)]
+    if cvd_perp:
+        panels.append(("PERP CVD", [v - cvd_perp[0] for v in cvd_perp], SG_CYAN))
+    ratios = [3.2] + [1.25] * len(panels)
+    fig, axes = plt.subplots(len(ratios), 1, figsize=(13, 8.2 if len(panels) == 2 else 6.8), sharex=True,
+                             gridspec_kw={"height_ratios": ratios, "hspace": 0.05},
+                             facecolor=SG_OBS)
+    ax_px = axes[0]
+    for ax in axes:
         ax.set_facecolor(SG_OBS)
-        ax.grid(color=SG_SLATE, linewidth=0.5)
+        ax.grid(color=SG_SLATE, linewidth=0.5, alpha=0.45)
         for sp in ax.spines.values():
             sp.set_color(SG_SLATE)
         ax.tick_params(colors=SG_ASH, labelsize=8)
         ax.yaxis.tick_right()
-    ax1.plot(dates, closes, color=SG_PAPER, linewidth=1.4)
-    ax1.set_title(f"{symbol}  {tf_label}  |  Price vs CVD", color=SG_PAPER, fontsize=12, loc="left", pad=10)
-    ax2.plot(dates, cvd_spot, color="#E8590C", linewidth=1.6, label="Spot CVD")
-    ax2.plot(dates, cvd_perp, color=SG_CYAN, linewidth=1.6, label="Perp CVD")
-    ax2.axhline(0, color=SG_ASH, linewidth=0.6, linestyle="--", alpha=0.5)
-    leg = ax2.legend(facecolor=SG_OBS, edgecolor=SG_SLATE, labelcolor=SG_PAPER, fontsize=9, loc="upper left")
+    # candles
+    up_x = [i for i in xs if closes[i] >= opens[i]]
+    dn_x = [i for i in xs if closes[i] < opens[i]]
+    span = (max(highs) - min(lows)) or 1.0
+    min_body = span * 0.0012   # keep doji candles visible
+    for idx, color in ((up_x, SG_LONG), (dn_x, SG_SHORT)):
+        if not idx:
+            continue
+        ax_px.vlines(idx, [lows[i] for i in idx], [highs[i] for i in idx], color=color, linewidth=0.8, zorder=2)
+        bottoms = [min(opens[i], closes[i]) for i in idx]
+        heights = [max(abs(closes[i] - opens[i]), min_body) for i in idx]
+        ax_px.bar(idx, heights, bottom=bottoms, width=0.68, color=color, edgecolor=color, linewidth=0, zorder=3)
+    last = closes[-1]
+    price_txt = f"{last:,.2f}" if last >= 1000 else f"{last:,.4f}".rstrip("0").rstrip(".")
+    ax_px.axhline(last, color=SG_ASH, linewidth=0.8, linestyle="--", alpha=0.6, zorder=1)
+    ax_px.annotate(
+        price_txt, xy=(1.0, last), xycoords=("axes fraction", "data"),
+        xytext=(4, 0), textcoords="offset points", ha="left", va="center",
+        color=SG_OBS, fontsize=9, fontweight="bold", clip_on=False, annotation_clip=False, zorder=10,
+        bbox=dict(boxstyle="round,pad=0.25", facecolor=SG_LONG if closes[-1] >= opens[-1] else SG_SHORT, edgecolor="none"),
+    )
+    ax_px.set_title(f"{symbol}  {tf_label}  |  Price vs CVD  |  {price_txt}", color=SG_PAPER, fontsize=13, loc="left", pad=12)
+    # CVD panels
     def _fmt_usd(x, _):
         ax_abs = abs(x)
         if ax_abs >= 1e9: return f"{x/1e9:.1f}B"
         if ax_abs >= 1e6: return f"{x/1e6:.0f}M"
         if ax_abs >= 1e3: return f"{x/1e3:.0f}K"
         return f"{x:.0f}"
-    import matplotlib.ticker as mticker
-    ax2.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_usd))
+    for ax, (label, series, color) in zip(axes[1:], panels):
+        ax.plot(xs, series, color=color, linewidth=1.6, zorder=3)
+        ax.fill_between(xs, series, 0, color=color, alpha=0.14, linewidth=0, zorder=2)
+        ax.axhline(0, color=SG_ASH, linewidth=0.6, linestyle="--", alpha=0.5, zorder=1)
+        ax.yaxis.set_major_formatter(mticker.FuncFormatter(_fmt_usd))
+        ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=4))
+        ax.text(0.008, 0.9, f"{label}  {_cvd_usd(series[-1])}", transform=ax.transAxes, ha="left", va="top",
+                color=color, fontsize=9.5, fontweight="bold", zorder=5,
+                bbox=dict(boxstyle="round,pad=0.25", facecolor=SG_OBS, edgecolor="none", alpha=0.75))
+    # time axis (UTC), on the bottom panel only
+    fmt = "%d %b" if tf_label == "4H" else "%d %b %H:%M"
+    def _fmt_time(x, _):
+        i = int(round(x))
+        return times[i].strftime(fmt) if 0 <= i < n else ""
+    axes[-1].xaxis.set_major_locator(mticker.MaxNLocator(nbins=8, integer=True))
+    axes[-1].xaxis.set_major_formatter(mticker.FuncFormatter(_fmt_time))
+    axes[-1].set_xlim(-1, n + max(2, int(n * 0.03)))
+    axes[-1].set_xlabel("UTC", color=SG_ASH, fontsize=8, loc="right")
     try:
-        sigma_logo_ax(ax1)
+        sigma_logo_ax(ax_px, zoom=0.055, pos=(1.0, 1.1))   # sits in the title row, clear of the candles
     except Exception:
         pass
-    plt.tight_layout()
     buf = io.BytesIO()
     fig.savefig(buf, dpi=120, facecolor=SG_OBS, bbox_inches="tight")
     plt.close(fig)
@@ -423,9 +485,19 @@ def _cvd_series(klines: list):
         out.append(run)
     return out
 
+def _cvd_align(spot: list, perp: list):
+    """Keep only candles whose open time exists on both venues, so the two CVD lines share one time axis."""
+    if not perp:
+        return spot, []
+    perp_by_t = {int(k[0]): k for k in perp}
+    both = [(k, perp_by_t[int(k[0])]) for k in spot if int(k[0]) in perp_by_t]
+    if len(both) < 30:
+        return spot, []   # perp history too short to compare - show spot only
+    return [a for a, _ in both], [b for _, b in both]
+
 CVD_INTERVALS = {"15m": "15m", "1H": "1h", "4H": "4h"}
 
-@bot.tree.command(name="cvd", description="Spot vs Perp CVD with OI and funding - who is driving the move?")
+@bot.tree.command(name="cvd", description="Spot vs Perp CVD chart with OI and funding - who is driving the move?")
 @app_commands.describe(coin="Coin symbol, e.g. BTC", timeframe="Candle timeframe")
 @app_commands.choices(timeframe=[app_commands.Choice(name=k, value=k) for k in CVD_INTERVALS])
 async def cvd_cmd(interaction: discord.Interaction, coin: str, timeframe: app_commands.Choice[str] = None):
@@ -434,25 +506,25 @@ async def cvd_cmd(interaction: discord.Interaction, coin: str, timeframe: app_co
     interval = CVD_INTERVALS[tfv]
     symbol = re.sub(r"[^A-Za-z0-9]", "", coin).upper()
     pair = symbol if symbol.endswith("USDT") else f"{symbol}USDT"
-    spot = await _fetch_cvd_klines("https://api.binance.com/api/v3/klines", pair, interval, 200)
-    perp = await _fetch_cvd_klines("https://fapi.binance.com/fapi/v1/klines", pair, interval, 200)
+    spot, perp = await asyncio.gather(
+        _fetch_cvd_klines("https://api.binance.com/api/v3/klines", pair, interval, 200),
+        _fetch_cvd_klines("https://fapi.binance.com/fapi/v1/klines", pair, interval, 200),
+    )
     if not spot or not isinstance(spot, list) or len(spot) < 30:
         await interaction.followup.send(f"CVD needs Binance taker data and **{symbol}** isn't on Binance spot - try a major pair.")
         return
     if not perp or not isinstance(perp, list):
         perp = []
-    n = min(len(spot), len(perp)) if perp else len(spot)
-    spot = spot[-n:]
-    perp = perp[-n:] if perp else []
+    spot, perp = _cvd_align(spot, perp)
+    n = len(spot)
     cvd_spot = _cvd_series(spot)
-    cvd_perp = _cvd_series(perp) if perp else [0.0] * n
-    from datetime import datetime as _dt
-    dates = [_dt.fromtimestamp(int(k[0]) / 1000) for k in spot]
+    cvd_perp = _cvd_series(perp) if perp else None
     closes = [float(k[4]) for k in spot]
     try:
-        buf = await asyncio.to_thread(make_cvd_image, f"{symbol}/USDT", tfv, dates, closes, cvd_spot, cvd_perp)
+        buf = await asyncio.to_thread(make_cvd_image, f"{symbol}/USDT", tfv, spot, cvd_spot, cvd_perp)
     except Exception as e:
-        await interaction.followup.send(f"CVD rendering failed: {e}")
+        _note_error("cvd:render", e)
+        await interaction.followup.send(f"CVD chart rendering failed: {e}")
         return
     # context numbers
     fd = await md_funding(pair)
@@ -462,10 +534,8 @@ async def cvd_cmd(interaction: discord.Interaction, coin: str, timeframe: app_co
     premium_pct = None
     if cb_px and closes[-1] > 0:
         premium_pct = (cb_px - closes[-1]) / closes[-1] * 100
-    def _musd(x):
-        return f"{'+' if x >= 0 else '-'}${abs(x)/1e6:.1f}M" if abs(x) < 1e9 else f"{'+' if x >= 0 else '-'}${abs(x)/1e9:.2f}B"
     d_spot = cvd_spot[-1] - cvd_spot[0]
-    d_perp = (cvd_perp[-1] - cvd_perp[0]) if perp else 0.0
+    d_perp = (cvd_perp[-1] - cvd_perp[0]) if cvd_perp else 0.0
     px_chg = (closes[-1] - closes[0]) / closes[0] * 100
     # simple auto-read
     if px_chg > 0.5 and d_spot > 0 and d_spot >= d_perp:
@@ -478,7 +548,9 @@ async def cvd_cmd(interaction: discord.Interaction, coin: str, timeframe: app_co
         read = "Price down into positive delta - buyers absorbing, possible accumulation."
     else:
         read = "No strong divergence between price and flows right now."
-    lines = [f"**{symbol} ({n} x {tfv}):** price {px_chg:+.2f}% | Spot CVD {_musd(d_spot)} | Perp CVD {_musd(d_perp)}"]
+    head = f"**{symbol} ({n} x {tfv}):** price {px_chg:+.2f}% | Spot CVD {_cvd_usd(d_spot)}"
+    head += f" | Perp CVD {_cvd_usd(d_perp)}" if cvd_perp else " | Perp CVD n/a"
+    lines = [head]
     ctx = []
     if od and od.get("oi_then"):
         oi_chg = (od["oi"] - od["oi_then"]) / od["oi_then"] * 100
