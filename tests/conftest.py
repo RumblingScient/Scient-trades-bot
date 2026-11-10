@@ -13,3 +13,15 @@ commands.Bot.run = lambda self, *a, **k: None
 @pytest.fixture(scope="session")
 def bot_mod():
     return importlib.import_module("scient_trades_bot")
+
+
+@pytest.fixture(autouse=True)
+def _isolated_plans(tmp_path, monkeypatch):
+    """Tests must see the seed plans, never the live plans.json on a deployed box (real prices, edited plan list)."""
+    from sigma.services import plans as plansvc
+    import json
+    p = tmp_path / "plans.json"
+    state = {"plans": {}, "promos": {}}
+    monkeypatch.setattr(plansvc, "_load", lambda: json.loads(p.read_text()) if p.exists() else dict(state))
+    monkeypatch.setattr(plansvc, "_save", lambda d: p.write_text(json.dumps(d)))
+    yield
