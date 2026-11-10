@@ -1,4 +1,8 @@
 """Entrypoint: python bot.py  (loads every sigma module so commands/loops/events register, then runs)."""
+import sys
+if sys.version_info < (3, 12):
+    # PEP 701 f-strings (nested quotes) are used throughout - an older interpreter dies with a cryptic SyntaxError
+    raise SystemExit(f"SigmaBot needs Python 3.12 or newer, this is {sys.version.split()[0]} - run it with python3.12.")
 import sigma.logging_setup  # noqa: F401
 import sigma.config  # noqa: F401
 import sigma.core  # noqa: F401

@@ -12,7 +12,17 @@ import functools as _functools
 from sigma.logging_setup import print
 from sigma.config import ALUMNI_ROLE_ID, ANALYSTS, ANALYST_CHOICES, ANALYST_ROLE_NAME, GOLD, GREY, GUILD_ID, NAVY, RED, NEWS_PING_ROLE_ID, PING_ROLE_ID, PRO_ROLE_IDS, SUB_REMINDER_DAYS, SUB_ROLE_ID, X_PING_ROLE_ID
 from sigma.core import bot
-from sigma.storage import load_subs, save_subs
+from sigma.ops import ops_alert
+from sigma.storage import load_subs, save_subs, PAY_LOCK, SUBS_LOCK
+
+
+def csv_safe(v):
+    """Neutralise spreadsheet formula injection: a cell that starts with = + - @ tab or CR is executed by Excel /
+    Sheets when the file is opened. Member names and trade notes are user-supplied, so every text cell goes through this."""
+    if v is None or isinstance(v, (int, float, bool)):
+        return v
+    s = str(v)
+    return "'" + s if s[:1] in ("=", "+", "-", "@", "\t", "\r") else s
 
 
 def member_is_pro(member) -> bool:
@@ -21,10 +31,20 @@ def member_is_pro(member) -> bool:
     except Exception:
         return False
 
+def has_analyst_role(member) -> bool:
+    """Role id when configured (SIGMA_ANALYST_ROLE_ID) - a mod with Manage Roles can create a second role *named*
+    Analyst, so the name is only the fallback for servers that haven't set the id."""
+    from sigma.config import ANALYST_ROLE_ID
+    roles = getattr(member, "roles", None) or []
+    if ANALYST_ROLE_ID:
+        return any(getattr(r, "id", None) == ANALYST_ROLE_ID for r in roles)
+    return any(getattr(r, "name", "") == ANALYST_ROLE_NAME for r in roles)
+
+
 def is_analyst(interaction: discord.Interaction) -> bool:
-    if interaction.user.guild_permissions.administrator:
+    if getattr(interaction.user, "guild_permissions", None) and interaction.user.guild_permissions.administrator:
         return True
-    return any(r.name == ANALYST_ROLE_NAME for r in interaction.user.roles)
+    return has_analyst_role(interaction.user)
 
 def resolve_analyst(user):
     uid = user.id
@@ -201,7 +221,8 @@ async def on_member_join(member: discord.Member):
     try:
         from sigma.services import subs as subsvc
         s = load_subs().get(str(member.id))
-        if s and (subsvc.days_left(s) or -1) >= 0:
+        dl = subsvc.days_left(s) if s else None
+        if dl is not None and dl >= 0:          # 0 days left is still active - `or -1` used to drop that case
             await _sub_grant_role(member.guild, member.id)
             print(f"[subs] rejoin - Pro restored for {member} ({member.id})")
     except Exception as e:
@@ -282,21 +303,38 @@ async def plan_ac(interaction: discord.Interaction, current: str):
             if cur in p["label"].lower() or cur in k][:25]
 
 async def _sub_grant_role(guild: discord.Guild, uid: int) -> bool:
+    """True only when the member holds the Pro role afterwards. A missing role / member or a Discord error is False
+    AND an ops alert - a paid member without the role is the one failure that must never be silent."""
+    why = ""
     try:
         member = guild.get_member(uid) or await guild.fetch_member(uid)
-        role = guild.get_role(SUB_ROLE_ID)
-        if member and role and role not in member.roles:
-            await member.add_roles(role, reason="Subscription granted")
-        return True
+        role = guild.get_role(SUB_ROLE_ID) if guild else None
+        if role is None:
+            why = f"Pro role {SUB_ROLE_ID} not found in the server"
+        elif member is None:
+            why = "member is not in the server"
+        else:
+            if role not in member.roles:
+                await member.add_roles(role, reason="Subscription granted")
+            return True
     except Exception as e:
-        print(f"[subs] grant role error {uid}: {e}", flush=True)
-        return False
+        why = f"{type(e).__name__}: {e}"
+    print(f"[subs] grant role error {uid}: {why}", flush=True)
+    await ops_alert(f"Pro role NOT granted to <@{uid}> - {why}. Add it by hand or fix the role and re-grant from /admin desk.", key=f"role:{uid}")
+    return False
 
 async def _sub_remove_role(guild: discord.Guild, uid: int) -> bool:
+    """True when the member no longer holds the Pro role (or left the server). False = still has it, try again."""
     try:
-        member = guild.get_member(uid) or await guild.fetch_member(uid)
-        role = guild.get_role(SUB_ROLE_ID)
-        if member and role and role in member.roles:
+        role = guild.get_role(SUB_ROLE_ID) if guild else None
+        if role is None:
+            print(f"[subs] remove role error {uid}: Pro role {SUB_ROLE_ID} not found", flush=True)
+            return False
+        try:
+            member = guild.get_member(uid) or await guild.fetch_member(uid)
+        except discord.NotFound:
+            return True                          # left the server - nothing to remove
+        if member and role in member.roles:
             await member.remove_roles(role, reason="Subscription expired/revoked")
         return True
     except Exception as e:
@@ -336,14 +374,15 @@ async def revoke_cmd(interaction: discord.Interaction, member: discord.Member):
     from sigma.services import subs as subsvc
     from sigma.errors import UserError
     from sigma.payments import mod_log
-    subs = load_subs()
-    try:
-        rec = subsvc.revoke(subs, member.id)
-    except UserError as e:
-        await interaction.followup.send(e.message, ephemeral=True)
-        return
-    save_subs(subs)
-    _archive_lapsed(str(member.id), rec, "revoked")
+    async with SUBS_LOCK:
+        subs = load_subs()
+        try:
+            rec = subsvc.revoke(subs, member.id)
+        except UserError as e:
+            await interaction.followup.send(e.message, ephemeral=True)
+            return
+        save_subs(subs)
+    await _archive_lapsed(str(member.id), rec, "revoked")
     await _sub_remove_role(interaction.guild, member.id)
     await mod_log(f"**Revoked** {_plan_label(rec.get('plan'))} from {member.display_name} (`{member.id}`) by {interaction.user.display_name}", color=RED)
     await interaction.followup.send(f"Subscription revoked for **{member.display_name}** - role removed, logged in mod-log.", ephemeral=True)
@@ -396,72 +435,116 @@ async def mysub_cmd(interaction: discord.Interaction):
     except Exception:
         await interaction.followup.send("Couldn't read your subscription record - ping an admin.", ephemeral=True)
 
-def _archive_lapsed(uid: str, rec: dict, why: str):
+async def _archive_lapsed(uid: str, rec: dict, why: str):
     """Keep expired / revoked records (for revenue + churn) in payments.json - subs.json only holds active ones."""
     from sigma.storage import load_payments, save_payments
-    st = load_payments()
-    rec = dict(rec); rec.update({"uid": uid, "lapsed_at": datetime.now(timezone.utc).isoformat(), "why": why})
-    st.setdefault("lapsed", []).append(rec)
-    st["lapsed"] = st["lapsed"][-500:]
-    save_payments(st)
+    async with PAY_LOCK:
+        st = load_payments()
+        rec = dict(rec); rec.update({"uid": uid, "lapsed_at": datetime.now(timezone.utc).isoformat(), "why": why})
+        st.setdefault("lapsed", []).append(rec)
+        st["lapsed"] = st["lapsed"][-500:]
+        save_payments(st)
+
+
+async def _expire_one(guild, uid: str, s: dict, now) -> bool:
+    """Role off -> record out (saved) -> archive -> DM + mod-log. The DM comes last so a crash mid-way can't repeat it
+    daily; a failed role removal keeps the record (flagged) so the next run tries again."""
+    from sigma.services import subs as subsvc
+    from sigma.payments import mod_log
+    if not await _sub_remove_role(guild, int(uid)):
+        async with SUBS_LOCK:
+            subs = load_subs()
+            if uid in subs:
+                subs[uid]["expire_failed_at"] = now.isoformat()
+                save_subs(subs)
+        await ops_alert(f"Expiry: couldn't remove the Pro role from <@{uid}> ({s.get('name')}) - record kept, retrying tomorrow. "
+                        "Check the bot's Manage Roles permission / role order.", key=f"expire:{uid}")
+        return False
+    if ALUMNI_ROLE_ID:
+        try:
+            m = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
+            role = guild.get_role(ALUMNI_ROLE_ID)
+            if m and role and role not in m.roles:
+                await m.add_roles(role, reason="Subscription lapsed")
+        except Exception:
+            pass
+    async with SUBS_LOCK:
+        subs = load_subs()
+        rec = subs.pop(uid, None)
+        save_subs(subs)
+    await _archive_lapsed(uid, rec or s, "expired")
+    try:
+        user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
+        await user.send(
+            "Your **Sigma Pro** access has ended. It's been great having you in the full lounge - "
+            "renew any time from the payment channel in the server to jump back in. \U0001F91D"
+        )
+    except Exception:
+        pass
+    await mod_log(f"**Expired** {_plan_label(s.get('plan'))} - {s.get('name')} (`{uid}`)" + (" · Alumni role set" if ALUMNI_ROLE_ID else ""), color=GREY)
+    print(f"[subs] expired + removed: {s.get('name')} ({uid})", flush=True)
+    return True
+
+
+async def _remind_one(uid: str, s: dict, th: int, dl: int, now):
+    """Mark + save before the DM: a crash between the two must not re-send, a failed DM just costs one reminder."""
+    from sigma.services import subs as subsvc
+    async with SUBS_LOCK:
+        subs = load_subs()
+        rec = subs.get(uid)
+        if not rec:
+            return
+        subsvc.mark_reminded(rec, th, SUB_REMINDER_DAYS)
+        save_subs(subs)
+    try:
+        exp = subsvc.expiry(s)
+        user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
+        await user.send(
+            f"Heads up - your **Sigma Pro** expires in **{max(dl, 0)} day(s)** "
+            f"({exp.strftime('%d %b %Y')}). Renew from the payment channel in the server to keep uninterrupted access. \U0001F514"
+        )
+    except Exception:
+        pass
+    print(f"[subs] reminder ({th}d) sent: {s.get('name')} ({uid})", flush=True)
+
+
+async def subs_check_once(now=None) -> dict:
+    """One expiry / reminder sweep. Each member is its own unit of work: one bad record or one Discord error
+    is logged and skipped, never aborts the run for everyone after it."""
+    from sigma.services import subs as subsvc
+    out = {"expired": 0, "reminded": 0, "failed": 0}
+    subs = load_subs()
+    if not subs:
+        return out
+    guild = bot.get_guild(GUILD_ID)
+    if guild is None:
+        return out
+    now = now or datetime.now(timezone.utc)
+    for uid, s in list(subs.items()):
+        try:
+            dl = subsvc.days_left(s, now)
+            if dl is None:
+                continue
+            if dl < 0:
+                if await _expire_one(guild, uid, s, now):
+                    out["expired"] += 1
+                else:
+                    out["failed"] += 1
+                continue
+            th = subsvc.due_reminder(s, SUB_REMINDER_DAYS, now)
+            if th is not None:
+                await _remind_one(uid, s, th, dl, now)
+                out["reminded"] += 1
+        except Exception as e:
+            out["failed"] += 1
+            print(f"[subs] check error for {uid}: {e!r}", flush=True)
+            await ops_alert(f"subs check failed for <@{uid}>: `{type(e).__name__}: {str(e)[:160]}`", key=f"subs:{uid}")
+    return out
 
 
 @tasks.loop(time=dt_time(hour=4, minute=30, tzinfo=timezone.utc))  # 10:00 AM IST daily
 async def subs_check_loop():
-    from sigma.services import subs as subsvc
-    from sigma.payments import mod_log
-    subs = load_subs()
-    if not subs:
-        return
-    guild = bot.get_guild(GUILD_ID)
-    if guild is None:
-        return
-    now = datetime.now(timezone.utc)
-    changed = False
-    for uid, s in list(subs.items()):
-        dl = subsvc.days_left(s, now)
-        if dl is None:
-            continue
-        if dl < 0:
-            await _sub_remove_role(guild, int(uid))
-            if ALUMNI_ROLE_ID:
-                try:
-                    m = guild.get_member(int(uid)) or await guild.fetch_member(int(uid))
-                    role = guild.get_role(ALUMNI_ROLE_ID)
-                    if m and role and role not in m.roles:
-                        await m.add_roles(role, reason="Subscription lapsed")
-                except Exception:
-                    pass
-            try:
-                user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
-                await user.send(
-                    "Your **Sigma Pro** access has ended. It's been great having you in the full lounge - "
-                    "renew any time from the payment channel in the server to jump back in. \U0001F91D"
-                )
-            except Exception:
-                pass
-            subs.pop(uid, None)
-            changed = True
-            _archive_lapsed(uid, s, "expired")
-            await mod_log(f"**Expired** {_plan_label(s.get('plan'))} - {s.get('name')} (`{uid}`)" + (" · Alumni role set" if ALUMNI_ROLE_ID else ""), color=GREY)
-            print(f"[subs] expired + removed: {s.get('name')} ({uid})", flush=True)
-            continue
-        th = subsvc.due_reminder(s, SUB_REMINDER_DAYS, now)
-        if th is not None:
-            try:
-                exp = datetime.fromisoformat(s["expires"])
-                user = bot.get_user(int(uid)) or await bot.fetch_user(int(uid))
-                await user.send(
-                    f"Heads up - your **Sigma Pro** expires in **{max(dl, 0)} day(s)** "
-                    f"({exp.strftime('%d %b %Y')}). Renew from the payment channel in the server to keep uninterrupted access. \U0001F514"
-                )
-            except Exception:
-                pass
-            subsvc.mark_reminded(s, th, SUB_REMINDER_DAYS)
-            changed = True
-            print(f"[subs] reminder ({th}d) sent: {s.get('name')} ({uid})", flush=True)
-    if changed:
-        save_subs(subs)
+    await subs_check_once()
 
 @subs_check_loop.before_loop
 async def before_subs_check():

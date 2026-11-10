@@ -16,10 +16,11 @@ from sigma.logging_setup import print
 from sigma.config import ANALYST_ROLE_NAME, GOLD, NAVY, RED, SUB_ROLE_ID
 from sigma.core import bot
 from sigma.errors import UserError
-from sigma.storage import load_subs, save_subs, load_payments, save_payments
+from sigma.storage import load_subs, save_subs, load_payments, save_payments, PAY_LOCK, SUBS_LOCK
 from sigma.services import plans as plansvc
 from sigma.services import subs as subsvc
 from sigma.desk import Form
+from sigma.ops import ops_alert
 
 PANEL_TIMEOUT = 14 * 60
 TABS = [("overview", "Overview"), ("members", "Members"), ("revenue", "Revenue"), ("payments", "Payments"), ("unrecorded", "Unrecorded")]
@@ -43,7 +44,8 @@ def unrecorded_members(guild) -> list:
     for m in (role.members if role else []):
         if getattr(m, "bot", False) or str(m.id) in subs:
             continue
-        staff = any(getattr(r, "name", "") == ANALYST_ROLE_NAME for r in m.roles) or bool(getattr(getattr(m, "guild_permissions", None), "administrator", False))
+        from sigma.members import has_analyst_role
+        staff = has_analyst_role(m) or bool(getattr(getattr(m, "guild_permissions", None), "administrator", False))
         out.append((m, staff))
     return out
 
@@ -51,6 +53,17 @@ def unrecorded_members(guild) -> list:
 def _plan_short(key):
     p = plansvc.all().get(key) or {}
     return p.get("short") or key or "?"
+
+
+def _int_or_none(text, what: str):
+    """Free-text popup field -> int, blank -> None. A typo must come back as a Last line, not a ValueError in the log."""
+    s = (text or "").strip()
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        raise UserError(f"{what} must be a whole number, got `{s[:20]}`.")
 
 
 # ----------------------------------------------------------------------------- embeds
@@ -288,6 +301,7 @@ class AdminDesk(discord.ui.View):
         except Exception as ex:
             print(f"[admin-desk] action error: {ex!r}", flush=True)
             self.last = "⚠ Something broke - check the logs."
+            await ops_alert(f"admin desk action failed: `{type(ex).__name__}: {str(ex)[:160]}`", key=f"desk:{type(ex).__name__}")
         await self._show(interaction)
 
     async def _ask(self, interaction, label, what, run):
@@ -388,10 +402,11 @@ class AdminDesk(discord.ui.View):
         async def ok(i, v):
             async def run():
                 from sigma.members import _archive_lapsed, _sub_remove_role
-                subs = load_subs()
-                rec = subsvc.revoke(subs, uid)
-                save_subs(subs)
-                _archive_lapsed(str(uid), rec, "revoked" + (f" - {v['note']}" if v["note"] else ""))
+                async with SUBS_LOCK:
+                    subs = load_subs()
+                    rec = subsvc.revoke(subs, uid)
+                    save_subs(subs)
+                await _archive_lapsed(str(uid), rec, "revoked" + (f" - {v['note']}" if v["note"] else ""))
                 await _sub_remove_role(self.guild, uid)
                 await self._log(f"**Revoked** {_plan_short(rec.get('plan'))} from <@{uid}> (`{uid}`) by {who}" + (f" · {v['note']}" if v["note"] else ""), color=RED)
                 return f"Revoked <@{uid}> - role removed, record archived."
@@ -406,12 +421,13 @@ class AdminDesk(discord.ui.View):
 
         async def ok(i, v):
             async def run():
-                subs = load_subs()
-                r = subs.get(str(uid))
-                if not r:
-                    raise UserError("No subscription on record.")
-                r["note"] = v["note"][:120]
-                save_subs(subs)
+                async with SUBS_LOCK:
+                    subs = load_subs()
+                    r = subs.get(str(uid))
+                    if not r:
+                        raise UserError("No subscription on record.")
+                    r["note"] = v["note"][:120]
+                    save_subs(subs)
                 return "Note saved."
             await self._apply(i, run)
         await interaction.response.send_modal(Form("Member note", [("note", "Note", rec.get("note") or "", False, "")], ok))
@@ -426,8 +442,8 @@ class AdminDesk(discord.ui.View):
             async def run():
                 from sigma.payments import refresh_panel
                 pp, ch = plansvc.edit(key, name=(v["name"] or None), price=(v["price"] or None), days=(v["days"] or None),
-                                      seats=(int(v["seats"]) if v["seats"].strip() else None),
-                                      order=(int(v["position"]) if v["position"].strip() else None))
+                                      seats=_int_or_none(v["seats"], "Seats"),
+                                      order=_int_or_none(v["position"], "Position"))
                 if not ch:
                     raise UserError("Nothing changed.")
                 await refresh_panel()
@@ -508,7 +524,7 @@ class AdminDesk(discord.ui.View):
         async def ok(i, v):
             async def run():
                 from sigma.payments import refresh_panel
-                p = plansvc.add(v["key"], v["name"], v["price"], v["days"], (int(v["seats"]) if v["seats"].strip() else None))
+                p = plansvc.add(v["key"], v["name"], v["price"], v["days"], _int_or_none(v["seats"], "Seats"))
                 self.plan_key = v["key"]
                 await refresh_panel()
                 msg = f"Added **{p['short']}** - ${p['price']:,.0f}, {'lifetime' if p['days'] >= plansvc.LIFETIME_DAYS else str(p['days']) + ' days'}."
@@ -653,18 +669,27 @@ class AdminDesk(discord.ui.View):
         who = interaction.user.display_name
 
         async def ok(i, v):
+            oid = v["owner"].strip().replace("<@", "").replace(">", "")
+            if not oid.isdigit():
+                self.last = "⚠ Owner must be a Discord user id (shown in the payouts card)."
+                await self._show(i); return
+            owed = (plansvc.referral_summary(load_payments(), int(oid)).get(int(oid)) or {}).get("owed", 0.0)
+            if owed <= 0:
+                self.last = "⚠ Nothing owed to that member."
+                await self._show(i); return
+            m = self.guild.get_member(int(oid)) if self.guild else None
+            nm = m.display_name if m else oid
+
             async def run():
-                oid = v["owner"].strip().replace("<@", "").replace(">", "")
-                if not oid.isdigit():
-                    raise UserError("Owner must be a Discord user id (shown in the payouts card).")
-                st = load_payments()
-                total = plansvc.settle(st, int(oid), v["note"] or "")
-                save_payments(st)
-                m = self.guild.get_member(int(oid)) if self.guild else None
-                nm = m.display_name if m else oid
+                async with PAY_LOCK:
+                    st = load_payments()
+                    total = plansvc.settle(st, int(oid), v["note"] or "")
+                    save_payments(st)
                 await self._log(f"**Payout settled** ${total:,.2f} -> {nm} (`{oid}`) by {who}" + (f" · {v['note']}" if v["note"] else ""), color=GOLD)
                 return f"Settled **${total:,.2f}** for {nm}."
-            await self._apply(i, run)
+            # settling is irreversible (every owed row is stamped) - the admin sees the total before it happens
+            await self._ask(i, f"Settle ${owed:,.2f} for {nm}", "marks everything this owner is owed as paid out - make the transfer first.",
+                            lambda ii: self._apply(ii, run))
         await interaction.response.send_modal(Form("Settle a referral payout", [
             ("owner", "Owner user id (from the card)", "", True, ""),
             ("note", "Payout reference (optional)", "", False, "e.g. the SOL tx"),
@@ -679,6 +704,10 @@ class AdminDesk(discord.ui.View):
     async def on_error(self, interaction: discord.Interaction, error: Exception, item):
         print(f"[admin-desk] view error: {error!r}", flush=True)
         self.last = "⚠ Something broke on that click."
+        try:
+            await ops_alert(f"admin desk error in {type(item).__name__}: `{type(error).__name__}: {str(error)[:160]}`", key=f"desk:{type(error).__name__}")
+        except Exception:
+            pass
         try:
             await self._show(interaction)
         except Exception:

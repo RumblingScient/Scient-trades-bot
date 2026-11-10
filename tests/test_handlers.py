@@ -149,6 +149,7 @@ def test_futures_buttons_follow_state(env):
     labels = [b.label for b in view.children if hasattr(b, "label")]
     assert labels == ["Entry filled", "TP hit", "Stop to entry", "Trail stop", "Stopped out", "Close", "Edit", "Replace chart"]
     assert _button(view, "TP hit").disabled and _button(view, "Stop to entry").disabled and not _button(view, "Entry filled").disabled
+    assert _button(view, "Trail stop").disabled          # pending setup: a stop change is an Edit of the posted stop, not a trail
     it2 = FakeInteraction(FakeUser(uid=1))
     asyncio.run(_button(view, "Entry filled").callback(it2))
     t = env["trades"]["11"]
@@ -159,16 +160,18 @@ def test_futures_buttons_follow_state(env):
     it2 = _click(view, "Entry filled")
     assert t["entry1_filled"] and it2.edits and env["calls"]["feed"][-1][0] == "Entry filled"
     assert _button(view, "Entry filled").disabled and not _button(view, "TP hit").disabled    # panel re-rendered
+    assert not _button(view, "Trail stop").disabled
 
 
 def test_futures_tp_be_trail_close_flow(env):
     it, view = _panel(env, "fut", "11", FakeUser(uid=1))
     _click(view, "Entry filled")
-    # TP hit popup is pre-filled with the next preset + planned %
+    # TP hit popup is pre-filled with the next preset; the planned % is a placeholder (blank = per plan), not a value
     it2 = FakeInteraction(FakeUser(uid=1))
     asyncio.run(_button(view, "TP hit").callback(it2))
     m = it2.response.modal
-    assert m.inputs["price"].default == "110" and m.inputs["pct"].default == "50"
+    assert m.inputs["price"].default == "110" and m.inputs["pct"].default is None and "50" in m.inputs["pct"].placeholder
+    assert not m.inputs["pct"].required
     _submit(it2, {"price": "110", "pct": "", "note": "clean"})
     t = env["trades"]["11"]
     assert t["tp1_hit"] and t["fills"][0] == {"price": 110.0, "pct": 50.0, "label": "TP1"}
@@ -535,3 +538,83 @@ def test_setup_quick_posts_without_targets_and_infers_direction(env, monkeypatch
     it2 = FakeInteraction(FakeUser(uid=1))
     asyncio.run(cs._run_draft(it2, draft2, False, cs._post_futures))
     assert "at least one target" in it2.followup.sent[-1]
+
+
+def test_tp_hit_past_two_targets_books_both_per_plan_when_pct_untouched(env):
+    """The pct field is a placeholder: left alone it submits blank, so a run-through price books every target at its plan."""
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    _click(view, "Entry filled")
+    it2 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "TP hit").callback(it2))
+    m = it2.response.modal
+    _submit(it2, {"price": "121", "pct": m.inputs["pct"].value or "", "note": ""})     # untouched field -> ""
+    t = env["trades"]["11"]
+    assert [(f["price"], f["pct"]) for f in t["fills"]] == [(110.0, 50.0), (121.0, 50.0)]
+    assert t["closed"] and t["result"] == "WIN"                                         # 100% taken -> auto-closed
+    assert env["calls"]["feed"][-1][0].startswith("Closed - Win") and env["calls"]["results"] == 1
+
+
+def test_desk_defaults_for_a_tiny_price_coin_parse_back_exactly(env):
+    from sigma.calculations import parse_num
+    env["trades"]["11"].update({"entry": "0.00001234", "sl": "0.00001100", "initial_sl": "0.00001100", "tp1": "0.00001500", "tp2": "0.00002",
+                                "entry1_filled": True})
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    it2 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "TP hit").callback(it2))
+    d = it2.response.modal.inputs["price"].default
+    assert "e" not in d and parse_num(d) == pytest.approx(0.000015)
+    it3 = FakeInteraction(FakeUser(uid=1))
+    asyncio.run(_button(view, "Stopped out").callback(it3))
+    d = it3.response.modal.inputs["price"].default
+    assert d == "0.000011" and parse_num(d) == pytest.approx(0.000011)
+    _click(view, "Stop to entry")
+    t = env["trades"]["11"]
+    assert t["sl"] == "0.00001234" and t["be"]
+    asyncio.run(_button(view, "Stopped out").callback(it3))
+    assert it3.response.modal.inputs["price"].default == "0.00001234"
+
+
+def test_panel_shows_why_tracking_is_off(env):
+    env["trades"]["11"].update({"watch_disabled": True, "watch_reason": "symbol not on Binance futures"})
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    assert "Auto-tracking: off - symbol not on Binance futures" in view.embed().description
+    _pick(view, "track")                                          # turning it back on clears the reason
+    t = env["trades"]["11"]
+    assert not t["watch_disabled"] and "watch_reason" not in t and "Auto-tracking" not in view.embed().description
+
+
+def test_chart_file_rejects_non_images_and_oversized_uploads(env):
+    import io, discord
+    from sigma.actions import chart_file
+    from sigma.errors import UserError
+
+    class Att:
+        filename = "c.png"; content_type = "image/png"; size = 1024
+        async def to_file(self): return discord.File(io.BytesIO(b"x"), filename=self.filename)
+    assert asyncio.run(chart_file(Att())).filename == "chart.png"
+    class Pdf(Att):
+        content_type = "application/pdf"
+    with pytest.raises(UserError, match="must be an image"):
+        asyncio.run(chart_file(Pdf()))
+    class NoType(Att):
+        content_type = None
+    with pytest.raises(UserError, match="must be an image"):
+        asyncio.run(chart_file(NoType()))
+    class Big(Att):
+        size = 9 * 1024 * 1024
+    with pytest.raises(UserError, match="under 8 MB"):
+        asyncio.run(chart_file(Big()))
+
+
+def test_post_save_failures_are_reported_not_hidden(env, monkeypatch):
+    """A Discord hiccup after the save must not read as 'nothing was changed' - the record is on disk."""
+    import sigma.actions as ac
+    async def boom(*a, **k): raise RuntimeError("discord down")
+    monkeypatch.setattr(ac, "post_update_feed", boom)
+    monkeypatch.setattr(ac, "refresh_board", boom)
+    it, view = _panel(env, "fut", "11", FakeUser(uid=1))
+    _click(view, "Entry filled")
+    t = env["trades"]["11"]
+    assert t["entry1_filled"] and view.last.startswith("Updated: Entry filled")
+    assert "Saved, but the board, feed update failed" in view.last
+    assert env["calls"]["thread"][-1] == "**Entry filled**"       # the steps after the failed one still ran

@@ -14,7 +14,7 @@ from sigma.config import DGREY, GREEN, GREY, INVALIDATIONS_CHANNEL_ID, IST, RED,
 from sigma.core import bot
 from sigma.ops import HEARTBEAT
 from sigma.storage import _results_lock, load_results, load_spot, load_trades, save_results, save_spot, save_trades
-from sigma.calculations import _last_complete_month_range, _rec_r, _res_ts, fnum, spot_result_r, tf
+from sigma.calculations import _last_complete_month_range, _rec_r, _res_ts, fnum, spot_num, spot_result_r, tf
 from sigma.cards import _ac_label, entry_display, refresh_and_edit
 from sigma.boards import _fit_lines
 
@@ -102,7 +102,8 @@ def build_result_entry_embed(kind: str, t: dict) -> discord.Embed:
         embed.add_field(name="Entry", value=entry_display(t, marks=False) or "-", inline=True)
         embed.add_field(name="Invalidation", value=str(t.get("initial_sl") or t.get("sl") or "-"), inline=True)
         if t.get("avg_exit") is not None:
-            embed.add_field(name="Avg exit", value=fnum(t["avg_exit"]), inline=True)
+            ax = spot_num(t.get("avg_exit"))          # stored as a float, but an override or an old record may hold a string
+            embed.add_field(name="Avg exit", value=(fnum(ax) if ax is not None else str(t["avg_exit"])[:1000]), inline=True)
     else:
         embed.add_field(name="DCA zone", value=str(t.get("dca_zone") or "-"), inline=True)
         if t.get("avg_entry"):
@@ -434,29 +435,31 @@ async def results_override_cmd(interaction: discord.Interaction, trade: str,
             ephemeral=True)
         return
     await interaction.response.defer(ephemeral=True)
+    from sigma.tracker import STATE_LOCK          # inside the function: tracker imports cards/boards like this module does
 
     kind, _, mid = trade.partition(":")
     spot = kind == "s"
-    data = load_spot() if spot else load_trades()
-    t = data.get(mid)
-    if not t or not t.get("closed"):
-        await interaction.followup.send("Closed trade not found - pick it from the autocomplete.", ephemeral=True)
-        return
+    async with STATE_LOCK:                        # same read-modify-write rule as every other trades/spot save
+        data = load_spot() if spot else load_trades()
+        t = data.get(mid)
+        if not t or not t.get("closed"):
+            await interaction.followup.send("Closed trade not found - pick it from the autocomplete.", ephemeral=True)
+            return
 
-    prev = {f: t.get(f) for f in ("result", "result_r", "avg_exit", "result_pct")}
-    if result is not None:
-        t["result"] = result
-    if result_r is not None:
-        t["result_r"] = round(result_r, 2)
-    if avg_exit is not None:
-        t["avg_exit"] = avg_exit
-    if result_pct is not None and spot:
-        t["result_pct"] = result_pct
-    t["override"] = {"by": interaction.user.display_name,
-                     "at": datetime.now(timezone.utc).isoformat(),
-                     "prev": prev, "note": note}
-    data[mid] = t
-    (save_spot if spot else save_trades)(data)
+        prev = {f: t.get(f) for f in ("result", "result_r", "avg_exit", "result_pct")}
+        if result is not None:
+            t["result"] = result
+        if result_r is not None:
+            t["result_r"] = round(result_r, 2)
+        if avg_exit is not None:
+            t["avg_exit"] = avg_exit
+        if result_pct is not None and spot:
+            t["result_pct"] = result_pct
+        t["override"] = {"by": interaction.user.display_name,
+                         "at": datetime.now(timezone.utc).isoformat(),
+                         "prev": prev, "note": note}
+        data[mid] = t
+        (save_spot if spot else save_trades)(data)
 
     # original trade card in the trades channel
     orig = "ok"

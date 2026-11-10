@@ -12,7 +12,7 @@ from sigma.config import BLUE, DGREY, GREEN, GREY, RED, SPOT_STATUSES
 from sigma.errors import UserError
 from sigma.calculations import (
     _is_tp_fill, _sync_tp_flags, entry_num, fills_pct, finalize_close, first_num, fnum, initial_sl_num,
-    parse_num, parse_sl, parse_spot_split, sl_num, spot_num, spot_ref_entry, spot_signed_r,
+    num_str, parse_num, parse_sl, parse_spot_split, sl_num, spot_num, spot_ref_entry, spot_signed_r,
     spot_weighted_entry, spot_zone_projection, stop_locked_r, stop_trailed,
 )
 
@@ -52,7 +52,7 @@ EVENTS = FUT_EVENTS + [e for e in SPOT_EVENTS if e[0] not in {v for v, _ in FUT_
 
 
 def _num_str(x: float) -> str:
-    return f"{x:.10g}"
+    return num_str(x)       # fixed-point: ":g" turns 0.00001234 into "1.234e-05", which the parsers then misread
 
 
 def _remember_initial_stop(t: dict):
@@ -347,12 +347,12 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
             t["status"] = "HOLDING"
         how = ""
         if px is not None:
-            t["avg_entry"] = f"{px:g}"
+            t["avg_entry"] = num_str(px)
             how = f" - avg entry {px:g}"
         elif not spot_num(t.get("avg_entry")):
             proj = spot_zone_projection(t)
             if proj:
-                t["avg_entry"] = f"{proj:g}"
+                t["avg_entry"] = num_str(proj)
                 how = f" - avg entry ≈ {proj:g} (zone midpoint, set the real one with price)"
         return Outcome(desc=f"zone filled - position built{how}", title="Zone filled", color=BLUE,
                        line=f"DCA zone fully filled - now holding{how}.")
@@ -364,10 +364,14 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
             raise UserError("**price is required** - what price did you buy at? (pct = % of the planned bag, optional)")
         if pct is not None and not (0 < pct <= 100):
             raise UserError("pct here = % of the planned bag this buy was - between 0 and 100.")
+        if pct is not None:
+            bought = sum(b.get("pct") or 0 for b in (t.get("buys") or []))
+            if bought + pct > 100.01:
+                raise UserError(f"That would make {bought + pct:g}% of the bag bought - only {100 - bought:g}% is left. Fix an earlier buy first if one is wrong.")
         t.setdefault("buys", []).append({"price": px, "pct": pct})
         auto = spot_weighted_entry(t)
         if auto:
-            t["avg_entry"] = f"{auto:g}"
+            t["avg_entry"] = num_str(auto)
         if t.get("status") in (None, "WATCHING"):
             t["status"] = "ACCUMULATING"
         ptxt = f" ({pct:g}% of the bag)" if pct else ""
@@ -377,6 +381,8 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
     if ev == "EF1":
         if spot:
             raise UserError("Spot has no entry flags - use **Buy filled** (with price) or **Zone filled**.")
+        if t.get("entry1_filled"):
+            raise UserError("Entry already recorded as filled.")
         t["entry1_filled"] = True
         d = "Entry 1 filled" if t.get("entry2") else "Entry filled"
         return Outcome(desc=d, title=d, color=BLUE, line=d + ".")
@@ -386,6 +392,8 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
             raise UserError("Spot has no Entry 2 - log each buy with **Buy filled** + price.")
         if not t.get("entry2"):
             raise UserError("This trade has no DCA entry (entry2) - use Entry filled.")
+        if t.get("entry2_filled"):
+            raise UserError("Entry already recorded as filled.")
         t["entry2_filled"] = True
         t["entry1_filled"] = True
         d = "DCA entry filled - full position live"
@@ -502,11 +510,12 @@ def apply_event(kind: str, t: dict, event: str, price=None, pct=None, note=None)
 
 
 def _after_tp(kind, t, out: Outcome, note):
-    """Shared tail for TP events: position-left line, and spot auto-close at 100% sold."""
+    """Shared tail for TP events: position-left line, and auto-close once 100% is taken (both markets) -
+    nothing is left to stop out, so the result is graded from the fills right away."""
     spot = kind == "spot"
     done = sum(s["pct"] for s in (t.get("sells") or [])) if spot else fills_pct(t)
-    if spot and done >= 99.99 and not t.get("closed"):
-        res = close(kind, t, None, note or "Bag fully sold - closed automatically")
+    if done >= 99.99 and not t.get("closed"):
+        res = close(kind, t, None, note or ("Bag fully sold - closed automatically" if spot else "Position fully closed at targets - closed automatically"))
         res.desc = out.desc + " - " + res.desc
         return res
     out.line = out.desc + (f"\n{done:g}% closed, {100 - done:g}% running" if 0 < done < 100 else "")
@@ -575,7 +584,7 @@ def close(kind: str, t: dict, price=None, note=None) -> Outcome:
     pc = ((avg_exit - ref) / ref * 100) if (ref and ref > 0) else None
     r = spot_signed_r(t, avg_exit)
     t["closed"] = True
-    t["avg_exit"] = f"{avg_exit:g}"
+    t["avg_exit"] = num_str(avg_exit)
     t["result_pct"] = f"{pc:+.1f}%" if pc is not None else None
     t["result_r"] = round(r, 2) if r is not None else None
     if r is not None:
@@ -663,12 +672,17 @@ def edit(kind: str, t: dict, fields: dict) -> list:
             e_num, e_cond = parse_sl(v["stop"])
             if not e_num:
                 raise UserError("Couldn't find a price in the stop.")
+            migrate_legacy_be(t)
             # edit = the posted stop was wrong, so the original risk changes too (a trail goes through Trail stop on the panel)
-            t["sl"] = e_num
-            t["initial_sl"] = e_num
-            t["sl_condition"] = e_cond
-            t["be"] = False
-            ch.append("stop")
+            if t.get("be") or stop_trailed(t):
+                # the live stop was moved on purpose (entry / trailed) - only the posted stop, i.e. what 1R is, is corrected
+                t["initial_sl"] = e_num
+                ch.append("posted stop (live stop unchanged)")
+            else:
+                t["sl"] = e_num
+                t["initial_sl"] = e_num
+                t["sl_condition"] = e_cond
+                ch.append("stop")
         if v.get("risk") is not None:
             t["risk"] = v["risk"]; ch.append("risk")
         if v.get("entry_type") is not None:
@@ -818,6 +832,7 @@ def fix_fill(kind: str, t: dict, action: str, item: int = None, price=None, pct=
 def set_tracking(t: dict, on: bool) -> str:
     if on:
         t["watch_disabled"] = False
+        t.pop("watch_reason", None)
         t["watch_verified"] = False
         t["watch_ms"] = int(datetime.now(timezone.utc).timestamp() * 1000)
         return "ON - tracker re-armed, feed re-verified"

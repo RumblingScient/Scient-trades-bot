@@ -257,11 +257,14 @@ def promo_remove(code: str) -> dict:
     return rec
 
 
-def promo_check(code: str, plan_key: str, now=None) -> dict:
-    """Valid promo for this plan right now, else UserError with the reason."""
+def promo_check(code: str, plan_key: str, now=None, user_id=None) -> dict:
+    """Valid promo for this plan right now, else UserError with the reason. user_id: who is applying it -
+    a referral owner can't earn a share (or a discount) on their own purchase."""
     rec = _state()["promos"].get(str(code).strip().upper())
     if not rec:
         raise UserError("That code doesn't exist.")
+    if user_id is not None and rec.get("owner_id") is not None and int(rec["owner_id"]) == int(user_id):
+        raise UserError("That's your own referral code - it can't be used on your own plan.")
     if rec.get("until"):
         try:
             if datetime.fromisoformat(rec["until"]) < (now or _now()):

@@ -23,7 +23,7 @@ from sigma.calculations import fix_x_link
 from sigma.members import analyst_color_hex, is_analyst, resolve_analyst
 from sigma.cards import _ac_label, _ac_sortkey, build_embed, build_spot_embed, jump_url, within_edit_window
 from sigma.boards import refresh_board
-from sigma.tracker import _with_state_lock
+from sigma.tracker import STATE_LOCK, _with_state_lock
 from sigma.services import store
 from sigma.services import trades as svc
 from sigma import actions
@@ -81,12 +81,13 @@ async def _post_card(interaction, rec: dict, channel_id: int, spot: bool, chart,
     allowed = discord.AllowedMentions.none()
     if mention_ids:
         content = " ".join(f"<@&{r}>" for r in mention_ids) + (" New spot play" if spot else " New setup")
-        allowed = discord.AllowedMentions(roles=True)
+        # only the configured ping roles - never a stray @everyone / @here from text the analyst typed
+        allowed = discord.AllowedMentions(roles=[discord.Object(id=r) for r in mention_ids], everyone=False, users=False)
     msg = await channel.send(content=content, embed=embed, files=files, allowed_mentions=allowed)
     rec["message_id"] = msg.id
     rec["channel_id"] = channel.id
     try:
-        thread = await msg.create_thread(name=thread_label)
+        thread = await msg.create_thread(name=thread_label[:100])      # Discord caps thread names at 100
         rec["thread_id"] = thread.id
         if body:
             try:
@@ -286,9 +287,10 @@ async def _post_futures(interaction, d: dict):
         rec["card_view"] = 2
     except Exception as ex:
         print(f"[setup] card buttons attach failed: {ex}", flush=True)
-    data = store.load(store.FUT)
-    data[str(msg.id)] = rec
-    store.save(store.FUT, data)
+    async with STATE_LOCK:                                     # the tracker holds a loaded dict across awaits - never save around it
+        data = store.load(store.FUT)
+        data[str(msg.id)] = rec
+        store.save(store.FUT, data)
     await refresh_board()
     await _reply(interaction, f"Setup posted in {channel.mention} ({msg.jump_url}) - press **Manage** on the card for everything after this."
                  + ("\nNo targets on it yet - **Manage > Edit > Targets** when you have them." if d.get("quick") and not tps[0] else ""))
@@ -341,9 +343,10 @@ async def _post_spot(interaction, d: dict):
         rec["card_view"] = 2
     except Exception as ex:
         print(f"[setup] card buttons attach failed: {ex}", flush=True)
-    data = store.load(store.SPOT)
-    data[str(msg.id)] = rec
-    store.save(store.SPOT, data)
+    async with STATE_LOCK:
+        data = store.load(store.SPOT)
+        data[str(msg.id)] = rec
+        store.save(store.SPOT, data)
     await refresh_board()
     await _reply(interaction, f"Spot play posted in {channel.mention} ({msg.jump_url}) - press **Manage** on the card for everything after this.")
 
@@ -462,9 +465,10 @@ async def setup_xpost(interaction: discord.Interaction, link: str, comment: str 
         allowed = discord.AllowedMentions.none()
         if X_PING_ROLE_ID:
             parts.append(f"<@&{X_PING_ROLE_ID}>")
-            allowed = discord.AllowedMentions(roles=True)
+            # just the X ping role - a comment containing @everyone must not ping
+            allowed = discord.AllowedMentions(roles=[discord.Object(id=X_PING_ROLE_ID)], everyone=False, users=False)
         if comment:
-            parts.append(comment)
+            parts.append(comment[:1900])
         parts.append(fixed)
         msg = await channel.send(content="\n".join(parts), allowed_mentions=allowed)
         await _reply(interaction, f"Posted to {channel.mention} ({msg.jump_url})")

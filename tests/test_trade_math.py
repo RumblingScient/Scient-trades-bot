@@ -51,3 +51,14 @@ def test_parse_sl_soft_condition(bot_mod):
 def test_fills_pct_and_remaining(bot_mod):
     t = T(fills=[{"price": 1, "pct": 25}, {"price": 1, "pct": 30}])
     assert bot_mod.fills_pct(t) == pytest.approx(55)
+
+def test_tiny_price_text_round_trip(bot_mod):
+    """str() of a tiny float is scientific notation; the record must never hold it, and the parsers must read it."""
+    assert bot_mod.parse_num(str(0.00001234)) == pytest.approx(0.00001234)
+    assert bot_mod.first_num("1.5e-05 (4h)") == pytest.approx(0.000015)
+    s = bot_mod.num_str(0.00001234)
+    assert s == "0.00001234" and bot_mod.first_num(s) == pytest.approx(0.00001234)
+
+def test_entry_text_with_a_note_is_not_a_range(bot_mod):
+    assert bot_mod.entry_num(T(entry="63000 4h")) == 63000.0
+    assert bot_mod.entry_num(T(entry="63000 - 62000")) == 62500.0

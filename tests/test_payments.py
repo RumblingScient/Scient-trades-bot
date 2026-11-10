@@ -56,9 +56,10 @@ def test_prune_keeps_paid_and_recent(bot_mod):
     st = {"sessions": {"new": {"created": now.isoformat(), "paid": False},
                        "stale": {"created": (now - timedelta(hours=48)).isoformat(), "paid": False},
                        "paidold": {"created": (now - timedelta(days=9)).isoformat(), "paid": True}},
-          "seen": list(range(800))}
+          "seen": list(range(6000))}
     bot_mod.prune(st, now)
-    assert set(st["sessions"]) == {"new", "paidold"} and len(st["seen"]) == 500
+    assert set(st["sessions"]) == {"new", "paidold"} and len(st["seen"]) == 5000
+    assert st["seen"][0] == 1000 and st["seen"][-1] == 5999          # oldest evicted first, order kept
 
 
 # ---------------------------------------------------------------- subs service
@@ -438,9 +439,9 @@ def test_pentest_bad_rpc_payloads_do_not_crash_or_activate(bot_mod, monkeypatch)
     monkeypatch.setattr(pay, "recent_signatures", _sigs)
     monkeypatch.setattr(pay, "fetch_tx", _tx)
     assert asyncio.run(pay._watch_once()) == 0 and acts == [] and alerts == []
-    async def _boom(limit=25): raise RuntimeError("rpc down")
+    async def _boom(seen=(), limit=25): raise RuntimeError("rpc down")
     monkeypatch.setattr(pay, "recent_signatures", _boom)
-    assert asyncio.run(pay._watch_once()) == 0
+    assert asyncio.run(pay._watch_once()) is None          # None = chain unreadable, not "nothing on chain"
 
 
 def test_pentest_admin_gates_on_sensitive_views(bot_mod):
@@ -696,3 +697,499 @@ def test_null_tx_from_rpc_is_retried_not_dropped(bot_mod, monkeypatch):
     assert acts == [] and "sigN" not in state.get("seen", []) and state["retry"]["sigN"] == 2
     asyncio.run(pay._watch_once())
     assert acts == [(2, "1month", "sigN")] and "sigN" in state["seen"] and "sigN" not in state["retry"]
+
+
+# ---------------------------------------------------------------- audit fixes: watcher durability
+
+def test_seen_is_ordered_and_no_signature_is_processed_twice(bot_mod, monkeypatch):
+    """600+ signatures through a 25-newest window with a small seen cap: every tx fetched exactly once, eviction oldest-first."""
+    pay = __import__("sigma.payments", fromlist=["x"])
+    state, acts, alerts = _env(pay, monkeypatch, {})
+    monkeypatch.setattr(pay, "SEEN_CAP", 100)
+    chain = []                                              # newest first
+    fetched = []
+    async def _sigs(seen=(), limit=25): return chain[:25]
+    async def _tx(sig):
+        fetched.append(sig)
+        return globals()["_tx"](0.000001)                   # dust: no alerts, no activation, just bookkeeping
+    monkeypatch.setattr(pay, "recent_signatures", _sigs)
+    monkeypatch.setattr(pay, "fetch_tx", _tx)
+    n = 0
+    for _pass in range(32):
+        for _ in range(20):
+            chain.insert(0, f"sig{n:04d}"); n += 1
+        asyncio.run(pay._watch_once())
+    assert n == 640 and len(fetched) == 640 and len(set(fetched)) == 640
+    assert state["seen"] == [f"sig{i:04d}" for i in range(540, 640)]      # newest 100, in order
+    assert acts == [] and alerts == []
+
+
+def test_old_signatures_are_skipped_without_a_fetch_unless_in_retry(bot_mod, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    state, acts, alerts = _env(pay, monkeypatch, {"s": _sess(1, 8.25832, 1000)})
+    import time
+    pay.BLOCK_TIMES.clear()
+    pay.BLOCK_TIMES.update({"ancient": int(time.time()) - 3 * 86400, "fresh": int(time.time()) - 60, "retried": int(time.time()) - 3 * 86400})
+    state["retry"] = {"retried": 2}
+    fetched = []
+    async def _sigs(seen=(), limit=25): return ["fresh", "ancient", "retried"]
+    async def _tx(sig):
+        fetched.append(sig)
+        return globals()["_tx"](8.25832 if sig == "fresh" else 0.1)
+    monkeypatch.setattr(pay, "recent_signatures", _sigs)
+    monkeypatch.setattr(pay, "fetch_tx", _tx)
+    asyncio.run(pay._watch_once())
+    pay.BLOCK_TIMES.clear()
+    assert sorted(fetched) == ["fresh", "retried"] and "ancient" in state["seen"]
+    assert acts == [(1, "1year", "fresh")]
+
+
+def test_recent_signatures_pages_until_a_seen_signature(bot_mod, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    import time
+    now = int(time.time())
+    # 70 txs newest first; the bot last saw 'sig40' (29 newer ones landed while it was down)
+    chain = [{"signature": f"sig{i:02d}", "blockTime": now - i * 60, "err": None} for i in range(70)]
+    calls = []
+    async def _rpc(method, params):
+        assert method == "getSignaturesForAddress"
+        opts = params[1]; calls.append(opts.get("before"))
+        start = 0 if not opts.get("before") else next(i for i, x in enumerate(chain) if x["signature"] == opts["before"]) + 1
+        return chain[start:start + opts["limit"]]
+    async def _accts(): return []
+    monkeypatch.setattr(pay, "SOL_WALLET", WALLET)
+    monkeypatch.setattr(pay, "_rpc", _rpc)
+    monkeypatch.setattr(pay, "token_accounts", _accts)
+    out = asyncio.run(pay.recent_signatures({"sig40", "sig41"}))
+    # page 2 reached sig40 -> no page 3; the page itself is scanned in full (unseen-but-older = retry material, the watcher's blockTime gate drops the rest)
+    assert out == [f"sig{i:02d}" for i in range(40)] + [f"sig{i}" for i in range(42, 50)] and calls == [None, "sig24"]
+    assert pay.BLOCK_TIMES["sig00"] == now
+    # nothing seen at all (fresh install): capped at SIG_PAGES pages, old ones cut by the grace window
+    calls.clear()
+    chain2 = [{"signature": f"x{i:03d}", "blockTime": now - i * 3600 * 2, "err": None} for i in range(400)]  # 2h apart
+    async def _rpc2(method, params):
+        opts = params[1]; calls.append(opts.get("before"))
+        start = 0 if not opts.get("before") else next(i for i, x in enumerate(chain2) if x["signature"] == opts["before"]) + 1
+        return chain2[start:start + opts["limit"]]
+    monkeypatch.setattr(pay, "_rpc", _rpc2)
+    out = asyncio.run(pay.recent_signatures(set()))
+    assert len(calls) == 1 and len(out) == 25                 # first page already crosses the 24h cutoff -> no page 2
+    pay.BLOCK_TIMES.clear()
+
+
+def test_activation_failure_is_retried_then_gives_up(bot_mod, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    state, acts, alerts = _env(pay, monkeypatch, {"s": _sess(1, 8.25832, 1000)})
+    boom = {"n": 2}
+    async def _activate(uid, plan, by, tx=None, usd=None, note=""):
+        if boom["n"] > 0:
+            boom["n"] -= 1; raise RuntimeError("discord 503")
+        acts.append((uid, plan, tx))
+    monkeypatch.setattr(pay, "activate", _activate)
+    async def _sigs(seen=(), limit=25): return ["sigA"]
+    async def _tx(sig): return globals()["_tx"](8.25832)
+    monkeypatch.setattr(pay, "recent_signatures", _sigs)
+    monkeypatch.setattr(pay, "fetch_tx", _tx)
+    asyncio.run(pay._watch_once())
+    s = state["sessions"]["s"]
+    assert s["paid"] and s["activated"] is False and s["activate_tries"] == 1 and "activation failed" in alerts[-1] and acts == []
+    asyncio.run(pay._watch_once())                          # retried at the top of the next pass, fails again
+    assert s["activate_tries"] == 2 and acts == []
+    asyncio.run(pay._watch_once())
+    assert acts == [(1, "1year", "sigA")] and s["activated"] is True and "activate_error" not in s
+    asyncio.run(pay._watch_once())
+    assert len(acts) == 1                                     # activated sessions are never touched again
+    # permanent failure: bounded, ends in a give-up alert, no further attempts
+    state2, acts2, alerts2 = _env(pay, monkeypatch, {"p": {**_sess(2, 1.0, 100, plan="1month"), "paid": True, "activated": False, "tx": "sigP"}})
+    async def _never(uid, plan, by, tx=None, usd=None, note=""): raise RuntimeError("sold out")
+    monkeypatch.setattr(pay, "activate", _never)
+    async def _none(seen=(), limit=25): return []
+    monkeypatch.setattr(pay, "recent_signatures", _none)
+    for _ in range(pay.ACTIVATE_RETRIES + 3):
+        asyncio.run(pay._watch_once())
+    p = state2["sessions"]["p"]
+    assert p["activate_tries"] == pay.ACTIVATE_RETRIES and p["activate_gave_up"] and any("GIVING UP" in a for a in alerts2)
+
+
+def test_grant_is_idempotent_on_tx_and_keeps_lifetime():
+    subs = {}
+    r1 = subsvc.grant(subs, 1, "A", "1month", by="chain", tx="sigX", usd=100)
+    r2 = subsvc.grant(subs, 1, "A", "1month", by="chain", tx="sigX", usd=100)      # activation retry after a crash
+    assert r2 is r1 and len(r2["history"]) == 1 and r2["expires"] == r1["expires"]
+    subsvc.grant(subs, 1, "A", "1month", by="chain", tx="sigY", usd=100)
+    assert len(subs["1"]["history"]) == 2
+    # lifetime member buys a month (or admin extends): payment recorded, plan / days untouched
+    subsvc.grant(subs, 2, "L", "lifetime", by="admin")
+    r = subsvc.grant(subs, 2, "L", "1month", by="chain", tx="sigZ", usd=100)
+    assert r["plan"] == "lifetime" and r["days"] == subsvc.plansvc.LIFETIME_DAYS and len(r["history"]) == 2 and r["history"][-1]["tx"] == "sigZ"
+    # naive expiry on a hand-edited record is read as UTC instead of crashing comparisons
+    subs["3"] = {"plan": "1month", "expires": "2099-01-01T00:00:00", "history": []}
+    assert subsvc.days_left(subs["3"]) > 0 and subs["3"]["expires"].endswith("+00:00")
+
+
+def test_fee_and_value_matches_alert_exact_stays_silent(bot_mod, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    state, acts, alerts = _env(pay, monkeypatch, {"a": _sess(1, 8.25832, 1000), "b": _sess(2, 0.82611, 100, plan="1month")})
+    async def _sigs(seen=(), limit=25): return ["sigFee"]
+    async def _tx(sig): return globals()["_tx"](8.25832 - 0.001)
+    monkeypatch.setattr(pay, "recent_signatures", _sigs)
+    monkeypatch.setattr(pay, "fetch_tx", _tx)
+    asyncio.run(pay._watch_once())
+    assert acts == [(1, "1year", "sigFee")] and len(alerts) == 1
+    a = alerts[0]
+    assert a.startswith("FEE match") and "8.25732 SOL" in a and "<@1>" in a and "8.25832 SOL" in a and "$1,000" in a and "<@2>" in a
+    state, acts, alerts = _env(pay, monkeypatch, {"b": _sess(2, 0.82611, 100, plan="1month")})
+    async def _tx2(sig): return globals()["_tx"](0.83)
+    monkeypatch.setattr(pay, "fetch_tx", _tx2)
+    asyncio.run(pay._watch_once())
+    assert alerts and alerts[0].startswith("VALUE match") and "<@2>" in alerts[0]
+    state, acts, alerts = _env(pay, monkeypatch, {"a": _sess(1, 8.25832, 1000)})
+    async def _tx3(sig): return globals()["_tx"](8.25832)
+    monkeypatch.setattr(pay, "fetch_tx", _tx3)
+    asyncio.run(pay._watch_once())
+    assert acts and alerts == []                              # exact: silent
+
+
+class _FakeResp:
+    def __init__(self, status, body): self.status, self._b = status, body
+    async def json(self): return self._b
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+
+
+class _FakeHTTP:
+    """Maps a host substring -> (status, json) or an Exception; counts calls."""
+    def __init__(self, routes): self.routes, self.calls = routes, []
+    def get(self, url, params=None, timeout=None):
+        self.calls.append(url)
+        for k, v in self.routes.items():
+            if k in url:
+                if isinstance(v, Exception):
+                    raise v
+                return _FakeResp(*v)
+        raise RuntimeError("no route")
+    async def __aenter__(self): return self
+    async def __aexit__(self, *a): return False
+
+
+def test_sol_price_fallback_chain_cache_and_sanity(bot_mod, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    alerts = []
+    async def _alert(msg, key=None): alerts.append(key)
+    monkeypatch.setattr(pay, "ops_alert", _alert)
+    pay._PRICE_CACHE.update({"px": None, "at": 0.0}); pay._PRICE_FAILS = 0
+    # binance down, coinbase answers
+    h = _FakeHTTP({"binance": (503, {}), "coinbase": (200, {"data": {"amount": "120.50"}}), "coingecko": (200, {"solana": {"usd": 119.0}})})
+    monkeypatch.setattr(pay, "http", lambda: h)
+    assert asyncio.run(pay.sol_price()) == 120.5 and [u for u in h.calls if "coingecko" in u] == []
+    # binance back but printing a 40% jump -> rejected, coinbase wins
+    h = _FakeHTTP({"binance": (200, {"price": "70.0"}), "coinbase": (200, {"data": {"amount": "121.00"}})})
+    monkeypatch.setattr(pay, "http", lambda: h)
+    assert asyncio.run(pay.sol_price()) == 121.0 and "price:jump" in alerts
+    # everything down: cached last-good (fresh) is served, no alert on the first total failure
+    alerts.clear()
+    h = _FakeHTTP({"binance": RuntimeError("dns"), "coinbase": (500, {}), "coingecko": RuntimeError("timeout")})
+    monkeypatch.setattr(pay, "http", lambda: h)
+    assert asyncio.run(pay.sol_price()) == 121.0 and alerts == []
+    # cache too old -> None; second consecutive total failure -> ops alert
+    pay._PRICE_CACHE["at"] -= 10 * 60
+    assert asyncio.run(pay.sol_price()) is None and alerts == []
+    assert asyncio.run(pay.sol_price()) is None and alerts == ["price"]
+    pay._PRICE_CACHE.update({"px": None, "at": 0.0}); pay._PRICE_FAILS = 0
+
+
+def test_rpc_outage_alerts_after_ten_minutes_and_429_backs_off(bot_mod, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    state, acts, alerts = _env(pay, monkeypatch, {})
+    pay._RPC.update({"fail_since": 0.0, "alerted": False, "skip": 0})
+    pay.HEARTBEAT.pop("payments", None)
+    clock = {"t": 1_000_000.0}
+    monkeypatch.setattr(pay._time, "time", lambda: clock["t"])
+    async def _down(seen=(), limit=25): raise RuntimeError("rpc down")
+    monkeypatch.setattr(pay, "recent_signatures", _down)
+    assert asyncio.run(pay._watch_once()) is None and alerts == [] and "payments" not in pay.HEARTBEAT
+    clock["t"] += 9 * 60
+    asyncio.run(pay._watch_once())
+    assert alerts == []
+    clock["t"] += 2 * 60
+    asyncio.run(pay._watch_once()); asyncio.run(pay._watch_once())
+    assert len(alerts) == 1 and "failing for 11 min" in alerts[0]         # once, not every pass
+    async def _ok(seen=(), limit=25): return []
+    monkeypatch.setattr(pay, "recent_signatures", _ok)
+    assert asyncio.run(pay._watch_once()) == 0 and pay.HEARTBEAT["payments"] == clock["t"] and pay._RPC["fail_since"] == 0
+    # 429: the next RPC_429_SKIP passes are skipped entirely (no RPC call)
+    calls = {"n": 0}
+    async def _limited(seen=(), limit=25):
+        calls["n"] += 1; raise pay.RpcRateLimited("rpc http 429")
+    monkeypatch.setattr(pay, "recent_signatures", _limited)
+    asyncio.run(pay._watch_once())
+    for _ in range(pay.RPC_429_SKIP):
+        assert asyncio.run(pay._watch_once()) is None
+    assert calls["n"] == 1
+    asyncio.run(pay._watch_once())
+    assert calls["n"] == 2
+    pay._RPC.update({"fail_since": 0.0, "alerted": False, "skip": 0})
+
+
+class _Follow:
+    def __init__(self): self.msgs = []
+    async def send(self, msg=None, **kw): self.msgs.append(msg)
+
+
+class _Resp:
+    async def defer(self, **kw): pass
+    def is_done(self): return True
+
+
+def test_check_now_button_cooldown_and_rpc_down_wording(bot_mod, monkeypatch):
+    import types
+    pay = __import__("sigma.payments", fromlist=["x"])
+    state, acts, alerts = _env(pay, monkeypatch, {"q": _sess(5, 1.0, 100, plan="1month")})
+    clock = {"t": 2_000_000.0}
+    monkeypatch.setattr(pay._time, "time", lambda: clock["t"])
+    pay._RPC.update({"fail_since": 0.0, "alerted": False, "skip": 0})
+    sweeps = {"n": 0}
+    async def _down(seen=(), limit=25):
+        sweeps["n"] += 1; raise RuntimeError("rpc down")
+    monkeypatch.setattr(pay, "recent_signatures", _down)
+    def _it(uid):
+        return types.SimpleNamespace(user=types.SimpleNamespace(id=uid), response=_Resp(), followup=_Follow())
+    v = pay.QuoteView("q")
+    it = _it(5); asyncio.run(v.check(it))
+    assert "Couldn't reach Solana" in it.followup.msgs[0] and sweeps["n"] == 1
+    it = _it(5); asyncio.run(v.check(it))
+    assert "too fast" in it.followup.msgs[0] and sweeps["n"] == 1            # 15s cooldown: no second sweep
+    it = _it(6); asyncio.run(v.check(it))
+    assert "isn't yours" in it.followup.msgs[0]
+    clock["t"] += 16
+    async def _empty(seen=(), limit=25): return []
+    monkeypatch.setattr(pay, "recent_signatures", _empty)
+    it = _it(5); asyncio.run(v.check(it))
+    assert it.followup.msgs[0].startswith("Nothing on chain yet")
+    pay._RPC.update({"fail_since": 0.0, "alerted": False, "skip": 0})
+
+
+def test_promo_owner_cannot_self_refer_and_apply_is_once_per_code(bot_mod, plans_store, monkeypatch):
+    pay = __import__("sigma.payments", fromlist=["x"])
+    pl = plans_store
+    pl.promo_add("sigma-owais", pct="10", owner_id=7, owner_name="Owais", share_pct="25")
+    pl.promo_add("ten", usd="10")
+    with pytest.raises(UserError, match="own referral code"):
+        pl.promo_check("SIGMA-OWAIS", "1year", user_id=7)
+    assert pl.promo_check("SIGMA-OWAIS", "1year", user_id=8)["code"] == "SIGMA-OWAIS"
+    state = {"sessions": {}}
+    monkeypatch.setattr(pay, "SOL_WALLET", WALLET)
+    monkeypatch.setattr(pay, "load_payments", lambda: state)
+    monkeypatch.setattr(pay, "save_payments", lambda d: state.update(d))
+    monkeypatch.setattr(pay, "load_subs", lambda: {})
+    async def _px(): return 100.0
+    monkeypatch.setattr(pay, "sol_price", _px)
+    logged = []
+    async def _lq(s, sid, title): logged.append(title)
+    monkeypatch.setattr(pay, "log_quote", _lq)
+    import types
+    owner = types.SimpleNamespace(id=7, __str__=lambda s: "owais")
+    asyncio.run(pay.new_quote(owner, "1year"))
+    sid = next(iter(state["sessions"]))
+    created = state["sessions"][sid]["created"]
+    with pytest.raises(UserError, match="own referral"):
+        asyncio.run(pay.apply_promo(owner, sid, "sigma-owais"))
+    asyncio.run(pay.apply_promo(owner, sid, "ten"))
+    s = state["sessions"][sid]
+    assert s["usd"] == 990 and s["promo"] == "TEN" and s["created"] == created          # clock not reset
+    amt = s["amount"]
+    asyncio.run(pay.apply_promo(owner, sid, "TEN"))                                     # same code again: no-op
+    assert s["amount"] == amt and logged.count("Promo applied - TEN") == 1
+    pl.promo_add("twenty", usd="20")
+    asyncio.run(pay.apply_promo(owner, sid, "twenty"))                                  # a different code replaces it
+    assert s["usd"] == 980 and s["promo"] == "TWENTY" and logged[-1] == "Promo applied - TWENTY"
+
+
+def test_csv_cells_are_formula_safe(bot_mod):
+    from sigma.members import csv_safe
+    assert csv_safe("=HYPERLINK(1)") == "'=HYPERLINK(1)" and csv_safe("+1") == "'+1" and csv_safe("-x") == "'-x" and csv_safe("@a") == "'@a"
+    assert csv_safe("\tx") == "'\tx" and csv_safe("plain") == "plain" and csv_safe(-1.5) == -1.5 and csv_safe(None) is None
+    pay = __import__("sigma.payments", fromlist=["x"])
+    txt = pay.members_csv({"1": {"name": "=cmd|' /C calc'!A0", "plan": "1month", "history": []}}).read().decode("utf-8-sig")
+    assert "'=cmd" in txt
+    ct = __import__("sigma.commands_trades", fromlist=["x"])
+    t = {"pair": "=BTC", "direction": "LONG", "entry": "100", "sl": "95", "tp1": "110", "closed": False, "created_at": "2026-10-01"}
+    full = ct.build_trades_csv([t], "@scient").read().decode("utf-8-sig").splitlines()[1]
+    assert full.startswith("2026-10-01,'@scient,'=BTC") and ",100," in full and ",95," in full
+    pub = ct.build_trades_csv([t], "scient", pro=False).read().decode("utf-8-sig").splitlines()[1]
+    assert "100" not in pub and "95" not in pub and "110" not in pub and ",OPEN," in pub         # open trade: no levels for non-Pro
+    closed = ct.build_trades_csv([{**t, "closed": True, "result": "WIN"}], "scient", pro=False).read().decode("utf-8-sig").splitlines()[1]
+    assert ",100," in closed
+
+
+def test_open_and_stats_csv_are_pro_only(bot_mod, monkeypatch):
+    import types
+    ct = __import__("sigma.commands_trades", fromlist=["x"])
+    from sigma.config import PRO_ROLE_IDS
+    def _it(role_ids=(), admin=False):
+        u = types.SimpleNamespace(id=1, display_name="x", roles=[types.SimpleNamespace(id=r, name="r") for r in role_ids],
+                                  guild_permissions=types.SimpleNamespace(administrator=admin))
+        f = _Follow()
+        return types.SimpleNamespace(user=u, response=types.SimpleNamespace(defer=f.send, send_message=f.send), followup=f), f
+    it, f = _it()
+    asyncio.run(ct.open_cmd.callback(it))
+    assert f.msgs[-1] == ct.PRO_ONLY
+    it, f = _it(role_ids=(next(iter(PRO_ROLE_IDS)),))
+    monkeypatch.setattr(ct, "build_combined_board_embed", lambda: "BOARD")
+    asyncio.run(ct.open_cmd.callback(it))
+    assert f.msgs[-1] is None and "BOARD" not in f.msgs            # embed= kwarg: not a Pro-only refusal
+    v = ct.StatsCSVView([], "scient")
+    it, f = _it()
+    asyncio.run(v.send_csv(it))
+    assert f.msgs == [ct.PRO_ONLY]
+    it, f = _it(admin=True)
+    asyncio.run(v.send_csv(it))
+    assert f.msgs == [None]                                        # file sent (file= kwarg)
+
+
+def test_help_text_points_at_admin_desk(bot_mod):
+    import inspect
+    pay = __import__("sigma.payments", fromlist=["x"])
+    ca = __import__("sigma.commands_admin", fromlist=["x"])
+    for mod in (pay, ca):
+        src = inspect.getsource(mod)
+        assert "/admin grant" not in src and "/admin members" not in src, mod.__name__
+
+
+# ---------------------------------------------------------------- audit fixes: roles, expiry loop, rejoin
+
+class _Role:
+    def __init__(self, rid): self.id = rid
+
+
+class _Member:
+    def __init__(self, uid, roles=(), fail=None):
+        self.id, self.roles, self.fail, self.display_name, self.sent = uid, list(roles), fail, f"m{uid}", []
+    async def add_roles(self, role, reason=None):
+        if self.fail: raise self.fail
+        self.roles.append(role)
+    async def remove_roles(self, role, reason=None):
+        if self.fail: raise self.fail
+        self.roles = [r for r in self.roles if r is not role]
+    async def send(self, *a, **kw): self.sent.append(kw.get("embed") or (a[0] if a else None))
+
+
+class _Guild:
+    def __init__(self, members, roles):
+        self._m, self._r = {m.id: m for m in members}, {r.id: r for r in roles}
+    def get_member(self, uid): return self._m.get(uid)
+    async def fetch_member(self, uid):
+        import discord
+        if uid in self._m: return self._m[uid]
+        raise discord.NotFound(types_resp(), "no")
+    def get_role(self, rid): return self._r.get(rid)
+
+
+def types_resp():
+    import types
+    return types.SimpleNamespace(status=404, reason="nf")
+
+
+class _Bot:
+    def __init__(self, guild): self.g, self.users = guild, {}
+    def get_guild(self, gid): return self.g
+    def get_user(self, uid): return self.users.get(uid)
+    async def fetch_user(self, uid): return self.users[uid]
+
+
+def test_role_grant_failure_alerts_and_dm_says_being_set_up(bot_mod, monkeypatch):
+    import sigma.members as mem
+    pay = __import__("sigma.payments", fromlist=["x"])
+    alerts = []
+    async def _alert(msg, key=None): alerts.append((key, msg))
+    monkeypatch.setattr(mem, "ops_alert", _alert)
+    monkeypatch.setattr(pay, "ops_alert", _alert)
+    pro = _Role(mem.SUB_ROLE_ID)
+    m = _Member(5)
+    assert asyncio.run(mem._sub_grant_role(_Guild([m], [pro]), 5)) is True and m.roles == [pro]
+    # role missing from the server -> False + alert (used to return True)
+    assert asyncio.run(mem._sub_grant_role(_Guild([m], []), 5)) is False and alerts[-1][0] == "role:5" and "not found" in alerts[-1][1]
+    assert asyncio.run(mem._sub_remove_role(_Guild([m], []), 5)) is False
+    import discord
+    bad = _Member(6, fail=discord.Forbidden(types_resp(), "no perms"))
+    assert asyncio.run(mem._sub_grant_role(_Guild([bad], [pro]), 6)) is False and alerts[-1][0] == "role:6"
+    # activate(): record saved, DM is honest about the missing role, mod-log flags it
+    subs = {}
+    monkeypatch.setattr(pay, "load_subs", lambda: subs)
+    monkeypatch.setattr(pay, "save_subs", lambda d: subs.update(d))
+    logs = []
+    async def _log(t, color=None): logs.append(t)
+    monkeypatch.setattr(pay, "mod_log", _log)
+    monkeypatch.setattr(pay, "bot", _Bot(_Guild([bad], [pro])))
+    rec = asyncio.run(pay.activate(6, "1month", by="chain", tx="sigQ", usd=100))
+    assert "6" in subs and bad.sent and "being set up" in bad.sent[-1].description and "admin has been pinged" in bad.sent[-1].description
+    assert "is live" not in bad.sent[-1].description and "role FAILED" in logs[-1]
+    ok = _Member(7)
+    monkeypatch.setattr(pay, "bot", _Bot(_Guild([ok], [pro])))
+    asyncio.run(pay.activate(7, "1month", by="chain", tx="sigR", usd=100))
+    assert "is live" in ok.sent[-1].description and ok.roles == [pro]
+
+
+def test_expiry_loop_is_per_member_saves_before_dm_and_keeps_record_on_role_failure(bot_mod, monkeypatch):
+    import sigma.members as mem
+    from sigma.services import subs as subsvc
+    now = datetime.now(timezone.utc)
+    pro = _Role(mem.SUB_ROLE_ID)
+    import discord
+    gone = _Member(1, roles=[pro])                                                    # expired, clean path
+    stuck = _Member(2, roles=[pro], fail=discord.Forbidden(types_resp(), "no perms"))  # expired, role removal fails
+    soon = _Member(3, roles=[pro])                                                    # 2 days left -> reminder
+    naive = _Member(4, roles=[pro])                                                   # naive expiry string
+    guild = _Guild([gone, stuck, soon, naive], [pro])
+    fake_bot = _Bot(guild); fake_bot.users = {m.id: m for m in (gone, stuck, soon, naive)}
+    subs = {"1": {"name": "gone", "plan": "1month", "expires": (now - timedelta(days=1)).isoformat(), "reminded": [], "history": []},
+            "2": {"name": "stuck", "plan": "1month", "expires": (now - timedelta(days=1)).isoformat(), "reminded": [], "history": []},
+            "junk": {"name": "junk", "plan": "1month", "expires": "not a date", "history": []},
+            "3": {"name": "soon", "plan": "1month", "expires": (now + timedelta(days=2, hours=5)).isoformat(), "reminded": [], "history": []},
+            "4": {"name": "naive", "plan": "1month", "expires": (now - timedelta(days=1)).replace(tzinfo=None).isoformat(), "reminded": [], "history": []}}
+    saves, archived, logs, alerts = [], [], [], []
+    monkeypatch.setattr(mem, "bot", fake_bot)
+    monkeypatch.setattr(mem, "load_subs", lambda: subs)
+    def _save(d):
+        if d is not subs:
+            subs.clear(); subs.update(d)
+        saves.append(sorted(d))
+    monkeypatch.setattr(mem, "save_subs", _save)
+    async def _archive(uid, rec, why): archived.append((uid, why))
+    monkeypatch.setattr(mem, "_archive_lapsed", _archive)
+    async def _alert(msg, key=None): alerts.append(key)
+    monkeypatch.setattr(mem, "ops_alert", _alert)
+    pay = __import__("sigma.payments", fromlist=["x"])
+    async def _log(t, color=None): logs.append(t)
+    monkeypatch.setattr(pay, "mod_log", _log)
+    # make the DM to 'gone' blow up: the record must already be gone from the file when that happens
+    async def _dm_boom(*a, **kw):
+        assert "1" not in subs, "expired DM sent before the record was saved"
+        raise RuntimeError("dm closed")
+    gone.send = _dm_boom
+    out = asyncio.run(mem.subs_check_once(now))
+    assert out == {"expired": 2, "reminded": 1, "failed": 1}
+    assert "1" not in subs and "4" not in subs and gone.roles == [] and [a[0] for a in archived] == ["1", "4"]
+    assert "2" in subs and subs["2"]["expire_failed_at"] and stuck.roles == [pro] and "expire:2" in alerts     # retried tomorrow
+    assert subs["3"]["reminded"] == [3, 7] and soon.sent and "2 day(s)" in soon.sent[-1]
+    assert "junk" in subs                                                                 # bad record skipped, loop went on
+    assert sum("Expired" in l for l in logs) == 2
+    # second run: nothing repeats except the stuck one
+    out = asyncio.run(mem.subs_check_once(now))
+    assert out == {"expired": 0, "reminded": 0, "failed": 1} and len(soon.sent) == 1
+
+
+def test_rejoin_restores_role_with_zero_days_left(bot_mod, monkeypatch):
+    import sigma.members as mem
+    now = datetime.now(timezone.utc)
+    pro = _Role(mem.SUB_ROLE_ID)
+    m = _Member(9); m.bot = False; m.guild = _Guild([m], [pro])
+    subs = {"9": {"plan": "1month", "expires": (now + timedelta(hours=6)).isoformat()}}    # days_left == 0: still active today
+    monkeypatch.setattr(mem, "load_subs", lambda: subs)
+    monkeypatch.setattr(mem, "build_join_dm", lambda: "welcome")
+    asyncio.run(mem.on_member_join(m))
+    assert m.roles == [pro]
+    m2 = _Member(10); m2.bot = False; m2.guild = _Guild([m2], [pro])
+    subs["10"] = {"plan": "1month", "expires": (now - timedelta(hours=6)).isoformat()}
+    asyncio.run(mem.on_member_join(m2))
+    assert m2.roles == []

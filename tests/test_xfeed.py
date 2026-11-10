@@ -84,3 +84,31 @@ def test_state_lost_but_message_in_channel_is_not_reposted(env):
     xfeed._POSTED.clear()
     asyncio.run(xfeed.x_poll_loop.coro())
     assert len(chan.sent) == 1 and "2" in store["ids"]
+
+
+class _StatusResp(_Resp):
+    def __init__(self, status, data=None): super().__init__(data); self.status = status
+
+
+def test_non_dict_body_is_ignored_not_crashed(env, monkeypatch):
+    chan, store, saves = env
+    monkeypatch.setattr(xfeed, "http", lambda: _Session(["not", "a", "dict"]))
+    xfeed._FAIL["n"] = 0
+    asyncio.run(xfeed.x_poll_loop.coro())
+    assert chan.sent == [] and saves["n"] == 0 and xfeed._FAIL["n"] == 1
+
+
+def test_three_failed_polls_alert_once_and_success_resets(env, monkeypatch):
+    chan, store, saves = env
+    got = []
+    async def _alert(text, key=None, cooldown=600): got.append(key)
+    monkeypatch.setattr(xfeed, "ops_alert", _alert)
+    xfeed._FAIL["n"] = 0
+    sess = _Session(None); sess.get = lambda *a, **k: _StatusResp(402)       # payment required: key out of credit
+    monkeypatch.setattr(xfeed, "http", lambda: sess)
+    for _ in range(5):
+        asyncio.run(xfeed.x_poll_loop.coro())
+    assert got == ["xfeed"] and chan.sent == [] and xfeed._FAIL["n"] == 5
+    monkeypatch.setattr(xfeed, "http", lambda: _Session({"tweets": [{"id": 2, "author": {"username": "Crypto_Scient"}}]}))
+    asyncio.run(xfeed.x_poll_loop.coro())
+    assert xfeed._FAIL["n"] == 0 and "x_poll" in xfeed.HEARTBEAT and len(chan.sent) == 1

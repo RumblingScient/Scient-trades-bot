@@ -16,20 +16,55 @@ from sigma.config import BOARD_FILE, JOURNAL_FILE, RESULTS_FILE, SPOT_BOARD_FILE
 from sigma.ops import _note_error
 
 
-_CORRUPT: set = set()   # paths that failed to parse - saves to them are refused until fixed
+_CORRUPT: set = set()   # paths that failed to parse - saves to them are refused until the file is restored
+
+# One lock per data file. Every load-modify-save of a shared file must run inside `async with lock_for(path)` -
+# background loops hold a loaded dict across awaits, and a plain save from a command in that window is lost.
+_LOCKS: dict = {}
+
+
+def lock_for(path) -> asyncio.Lock:
+    key = str(path)
+    if key not in _LOCKS:
+        _LOCKS[key] = asyncio.Lock()
+    return _LOCKS[key]
+
+
+def _bak(path: Path) -> Path:
+    return path.with_suffix(path.suffix + ".bak")
+
 
 def _load(path: Path) -> dict:
+    bak = _bak(path)
     if not path.exists():
+        if bak.exists():
+            # a crash between the two renames of an old save, or someone moved the file - serve the last-good copy
+            try:
+                data = json.loads(bak.read_text())
+                _note_error("data-load", f"{path.name} missing - served from {bak.name} (restoring it)")
+                try:
+                    import shutil
+                    shutil.copy2(bak, path)
+                except Exception:
+                    pass
+                return data
+            except Exception:
+                pass
         return {}
     try:
-        return json.loads(path.read_text())
+        data = json.loads(path.read_text())
+        _CORRUPT.discard(str(path))              # a file that parses again is fine again
+        return data
     except Exception as e:
-        bak = path.with_suffix(path.suffix + ".bak")
         if bak.exists():
             try:
                 data = json.loads(bak.read_text())
-                log.error(f"[data] {path.name} is corrupt ({e}) - served from {bak.name}")
-                _CORRUPT.add(str(path))
+                # the main file is junk but the last-good copy is fine: put it back so the bot keeps working
+                import shutil
+                shutil.copy2(path, path.with_suffix(path.suffix + ".corrupt"))
+                shutil.copy2(bak, path)
+                _CORRUPT.discard(str(path))
+                _note_error("data-load", f"{path.name} was corrupt ({e}) - restored from {bak.name}; the bad copy is {path.name}.corrupt")
                 return data
             except Exception:
                 pass
@@ -37,18 +72,24 @@ def _load(path: Path) -> dict:
         _note_error("data-load", f"{path.name} unreadable and no valid .bak: {e}")
         return {}
 
+
 def _save(path: Path, data: dict):
     if str(path) in _CORRUPT:
         _note_error("data-save", f"REFUSED write to {path.name}: file was corrupt at load")
         raise RuntimeError(f"{path.name} is marked corrupt - restore from backup, then restart")
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False))
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(data, indent=2, ensure_ascii=False))
+        f.flush()
+        os.fsync(f.fileno())
     if path.exists():
         try:
-            os.replace(path, path.with_suffix(path.suffix + ".bak"))   # last-good copy, always
+            import shutil
+            shutil.copy2(path, _bak(path))          # copy, not rename: the live file never disappears
         except Exception:
             pass
-    os.replace(tmp, path)  # atomic on POSIX - never leaves a half-written file
+    os.replace(tmp, path)                           # atomic on POSIX - never leaves a half-written file
+
 
 def load_trades() -> dict: return _load(JOURNAL_FILE)
 
@@ -106,8 +147,13 @@ def load_sources() -> dict: return _load(SOURCES_FILE)
 
 def save_sources(d: dict): _save(SOURCES_FILE, d)
 
-_results_lock = asyncio.Lock()
+_results_lock = lock_for(RESULTS_FILE)
 
 def load_results() -> dict: return _load(RESULTS_FILE)
 
 def save_results(d: dict): _save(RESULTS_FILE, d)
+
+# locks for the files that more than one loop/command writes
+PAY_LOCK = lock_for(PAYMENTS_FILE)
+SUBS_LOCK = lock_for(SUBS_FILE)
+ALERTS_LOCK = lock_for(ALERTS_FILE)

@@ -36,10 +36,16 @@ async def ops_alert(text: str, key: str = None, cooldown: int = 600):
     _ops_recent[key] = now
     log.warning(f"[ops] {text}")
     try:
-        from sigma.config import MOD_LOG_CHANNEL_ID
+        from sigma.config import MOD_LOG_CHANNEL_ID, ANALYSTS
         cid = OPS_CHANNEL_ID or MOD_LOG_CHANNEL_ID          # no ops channel configured -> the mod-log hears it
         ch = bot.get_channel(cid) if cid else None
         if ch:
             await ch.send(f"\u26a0 **ops** \u00b7 {text[:1800]}")
+        else:
+            # last resort: DM the owner rather than let an alert die in the log file
+            owner = (ANALYSTS.get("scient", {}).get("user_ids") or [None])[0]
+            if owner:
+                u = bot.get_user(owner) or await bot.fetch_user(owner)
+                await u.send(f"\u26a0 **ops** (no ops/mod-log channel set) \u00b7 {text[:1800]}")
     except Exception:
         pass

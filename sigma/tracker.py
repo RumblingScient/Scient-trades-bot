@@ -15,7 +15,7 @@ from sigma.core import bot
 from sigma.ops import HEARTBEAT, ops_alert
 from sigma.http import http
 from sigma.storage import load_trades, save_trades
-from sigma.calculations import any_entry_filled, entry_num, first_num, fnum, sl_num
+from sigma.calculations import any_entry_filled, entry_num, fills_pct, first_num, fnum, sl_num
 from sigma.errors import UserError
 from sigma.services import trades as _svc
 from sigma.cards import post_update_feed, refresh_and_edit
@@ -108,8 +108,11 @@ async def _pw_process_trade(tid: str, t: dict, candles):
             tp_touched = any_entry_filled(t) and any(
                 first_num(t.get(k)) is not None and not t.get(f"{k}_hit") and crossed_tp(first_num(t.get(k)), lo, hi)
                 for k in ("tp1", "tp2", "tp3", "tp4"))
-            entry_touched = (not any_entry_filled(t)) and t.get("entry_type") != "MARKET" and (
-                (e1 and crossed_entry(e1, lo, hi)) or (e2 and crossed_entry(e2, lo, hi)))
+            # an UNFILLED leg counts even when the other leg is live: filling entry 2 and stopping the doubled
+            # position out of one candle is the worst record the journal can get - the analyst confirms that one
+            e1_open = bool(e1) and not t.get("entry1_filled") and t.get("entry_type") != "MARKET" and crossed_entry(e1, lo, hi)
+            e2_open = bool(e2) and not t.get("entry2_filled") and crossed_entry(e2, lo, hi)
+            entry_touched = e1_open or e2_open
             if tp_touched or entry_touched:
                 t["watch_disabled"] = True
                 t["watch_ambiguous_ms"] = open_ms
@@ -132,6 +135,8 @@ async def _pw_process_trade(tid: str, t: dict, candles):
         # TP hits, in order, only once in a position
         if any_entry_filled(t):
             for idx, key in enumerate(("tp1", "tp2", "tp3", "tp4")):
+                if t.get("closed"):
+                    break                                               # 100% taken - the service auto-closed it
                 tp_px = first_num(t.get(key))
                 if not tp_px or t.get(f"{key}_hit"):
                     continue
@@ -148,7 +153,8 @@ async def _pw_process_trade(tid: str, t: dict, candles):
                                        "Auto-tracked - no split % on the card, record the size with Manage > TP hit"))
         # SL - once the analyst moved the stop to entry, ENTRY is the stop
         stop_lvl = (entry_num(t) if t.get("be") else slv)
-        if stop_lvl and not t.get("closed") and any_entry_filled(t) and crossed_sl(stop_lvl, lo, hi):
+        if (stop_lvl and not t.get("closed") and any_entry_filled(t) and fills_pct(t) < 99.99     # nothing open = nothing to stop
+                and crossed_sl(stop_lvl, lo, hi)):
             if soft_sl:
                 warned = t.get("watch_sl_warned_ms") or 0
                 if open_ms - warned > 4 * 3600 * 1000:
@@ -198,11 +204,25 @@ async def _price_watch_tick():
             by_sym.setdefault(sym, []).append((tid, t))
         changed = False
         for sym, items in by_sym.items():
-            since = min(int(t.get("watch_ms") or (now_ms - 120_000)) for _, t in items)
+            live = [(tid, t) for tid, t in items if not t.get("watch_disabled")]
+            if not live:
+                continue                       # every record on this symbol is manual - no feed call needed
+            since = min(int(t.get("watch_ms") or (now_ms - 120_000)) for _, t in live)
             candles = await _pw_klines(sym, since)
             if candles == "BAD_SYMBOL":
                 _pw_unsupported.add(sym)
                 print(f"[watch] {sym} not on Binance futures - manual tracking only", flush=True)
+                # flag every record on it so the panel says why, and tell the feed once (the symbol is skipped from here on)
+                reason = "symbol not on Binance futures"
+                for tid, t in live:
+                    t["watch_disabled"] = True
+                    t["watch_reason"] = reason
+                    data[tid] = t
+                save_trades(data)
+                for tid, t in live:
+                    await _pw_announce(t, "Auto-tracking disabled", GREY,
+                                       f"**{t.get('pair', '?').upper()}** isn't listed on Binance futures, so there is no price feed for it. "
+                                       f"This setup is **manual tracking only** - fills, take profits and the stop from Manage on the card.")
                 continue
             if candles is None:
                 n = _pw_fail[sym] = _pw_fail.get(sym, 0) + 1
@@ -219,6 +239,7 @@ async def _price_watch_tick():
                     last_close = candles[-1][3] if candles else None
                     if ref and last_close and not (0.5 <= last_close / ref <= 2.0):
                         t["watch_disabled"] = True
+                        t["watch_reason"] = "price feed doesn't match this setup"
                         data[tid] = t
                         save_trades(data)
                         print(f"[watch] FEED MISMATCH {t.get('pair')} - binance {last_close} vs entry {ref}; auto-tracking OFF", flush=True)
@@ -235,7 +256,9 @@ async def _price_watch_tick():
                 t_since = int(t.get("watch_ms") or (now_ms - 120_000))
                 mine = [c for c in candles if c[0] >= t_since]
                 events = await _pw_process_trade(tid, t, mine)
-                t["watch_ms"] = now_ms
+                # cursor = open time of the LAST candle seen, not "now": that candle is still forming, so the next
+                # tick reads it again with its final high/low. Every handler is flag-guarded, so a re-read can't double-fire.
+                t["watch_ms"] = mine[-1][0] if mine else t_since
                 if events:
                     changed = True
                     data[tid] = t

@@ -12,7 +12,8 @@ import functools as _functools
 from sigma.logging_setup import print
 from sigma.config import IST, RECAP_CHANNEL_ID, RECAP_DAY, RECAP_UTC, RESULTS_ANALYST_IDS, RESULTS_CHANNEL_ID, RESULTS_POLL_MIN, SIGMA_AMBER, SIGMA_ASH, SIGMA_BG, SIGMA_CARD, SIGMA_CYAN, SIGMA_GREEN, SIGMA_PAPER, SIGMA_RED, SIGMA_SLATE
 from sigma.core import bot
-from sigma.storage import load_results, load_trades
+from sigma.ops import HEARTBEAT, _note_error, ops_alert
+from sigma.storage import _results_lock, load_results, load_trades, save_results
 from sigma.charts_theme import _sigma_fonts
 from sigma.calculations import _last_complete_month_range, _rec_r
 from sigma.tracker import price_watch_loop
@@ -373,13 +374,42 @@ async def post_monthly_recap(start=None, end=None, label=None) -> bool:
         print(f"[recap] monthly error: {e}", flush=True)
         return False
 
+def _prev_month_key(now=None) -> str:
+    now = now or datetime.now(IST)
+    return (now.replace(day=1) - timedelta(days=1)).strftime("%Y-%m")
+
+async def monthly_catchup() -> bool:
+    """Post last month's recap once, whenever it has not been posted yet - the daily tick, a boot after
+    an outage on the 1st, it does not matter which. `last_monthly_posted` in results_board.json is the receipt.
+    Returns True when something was posted this call."""
+    prev = _prev_month_key()
+    async with _results_lock:
+        st = load_results()
+        last = st.get("last_monthly_posted")
+        if last == prev:
+            return False
+        if last is None and datetime.now(IST).day != 1:
+            # first run with this receipt mid-month: the old code posted on the 1st, do not post it twice
+            st["last_monthly_posted"] = prev
+            save_results(st)
+            return False
+    await post_monthly_recap()            # returns False with no closed setups - still counts as handled for the month
+    await post_analyst_journals()
+    async with _results_lock:
+        st = load_results()
+        st["last_monthly_posted"] = prev
+        save_results(st)
+    return True
+
 @tasks.loop(time=RECAP_UTC)
 async def sigma_monthly_loop():
-    # runs daily at 10:00 IST; posts only on the 1st, for the month just ended
-    if datetime.now(IST).day != 1:
-        return
-    await post_monthly_recap()
-    await post_analyst_journals()
+    # runs daily at 10:00 IST; posts the month just ended as soon as a day comes where it has not been posted
+    try:
+        await monthly_catchup()
+        HEARTBEAT["monthly"] = _time.time()
+    except Exception as e:
+        _note_error("loop:monthly", e)
+        await ops_alert(f"monthly recap tick failed: `{type(e).__name__}: {str(e)[:160]}` - will retry tomorrow", key="monthly")
 
 @sigma_monthly_loop.before_loop
 async def _before_sigma_monthly():
@@ -410,9 +440,13 @@ async def post_weekly_recap() -> bool:
 
 @tasks.loop(time=RECAP_UTC)
 async def sigma_recap_loop():
-    if datetime.now(timezone.utc).weekday() != RECAP_DAY:
-        return
-    await post_weekly_recap()
+    try:
+        if datetime.now(timezone.utc).weekday() == RECAP_DAY:
+            await post_weekly_recap()
+        HEARTBEAT["weekly"] = _time.time()
+    except Exception as e:
+        _note_error("loop:weekly", e)
+        await ops_alert(f"weekly recap tick failed: `{type(e).__name__}: {str(e)[:160]}`", key="weekly")
 
 @sigma_recap_loop.before_loop
 async def _before_sigma_recap():

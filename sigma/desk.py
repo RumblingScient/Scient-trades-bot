@@ -20,7 +20,7 @@ from sigma.core import bot
 from sigma.errors import UserError
 from sigma.members import is_analyst
 from sigma.calculations import (_tp_presets, any_entry_filled, display_rr, entry_num, fills_pct, first_num, fnum,
-                                initial_sl_num, parse_num, sl_num, spot_num, spot_zone_projection, stop_locked_r, stop_trailed)
+                                initial_sl_num, num_str, parse_num, sl_num, spot_num, spot_zone_projection, stop_locked_r, stop_trailed)
 from sigma.cards import entry_display, full_status, jump_url, spot_status_line, stop_state, unified_tp_text, within_edit_window
 from sigma.tracker import STATE_LOCK
 from sigma.services import store
@@ -143,7 +143,7 @@ class Desk(discord.ui.View):
             if tpt:
                 lines.append(tpt)
             if t.get("watch_disabled"):
-                lines.append("Auto-tracking: off")
+                lines.append("Auto-tracking: off" + (f" - {t['watch_reason']}" if t.get("watch_reason") else ""))
         if t.get("closed"):
             lines.append(f"Closed{' - ' + t['close_note'] if t.get('close_note') else ''}")
         e = discord.Embed(title=head, description="\n".join(lines)[:4000], color=discord.Color.dark_grey())
@@ -198,7 +198,8 @@ class Desk(discord.ui.View):
         locked = stop_locked_r(t)
         past_entry = bool(t.get("be")) or (locked is not None and locked > 0.05)     # already at or beyond entry
         self._btn("Stop to entry", self.on_be, discord.ButtonStyle.secondary, row=0, disabled=(not filled or past_entry))
-        self._btn("Trail stop", self.on_trail, discord.ButtonStyle.secondary, row=0)
+        # before a fill there is nothing to protect: a stop change on a pending setup is a correction of the posted stop (Edit)
+        self._btn("Trail stop", self.on_trail, discord.ButtonStyle.secondary, row=0, disabled=not filled)
         self._btn("Stopped out", self.on_stopped, discord.ButtonStyle.danger, row=0, disabled=not filled)
         self._btn("Close", self.on_close, discord.ButtonStyle.danger, row=1, disabled=not filled)
         self._btn("Edit", self.on_edit, discord.ButtonStyle.secondary, row=1)
@@ -254,8 +255,11 @@ class Desk(discord.ui.View):
         except UserError as e:
             self.last = f"⚠ {e.message}"
         except Exception as ex:
+            # everything after the save (card, board, feed, thread, results) is caught inside sigma.actions, so an
+            # exception landing here came from before or during the save - but say so without promising either way
             print(f"[desk] action error: {ex!r}", flush=True)
-            self.last = "⚠ Something broke - nothing was changed. Try again, and ping ops if it repeats."
+            self.last = ("⚠ Something broke. If the change isn't on the card, it wasn't saved - try again; "
+                         "if it is there, only the card / feed update failed. Ping ops if it repeats.")
         await self._refresh(interaction)
 
     async def _event(self, interaction, event, price=None, pct=None, note=None):
@@ -302,8 +306,8 @@ class Desk(discord.ui.View):
     async def on_tp(self, interaction):
         t = self.rec()
         pend = [(k, px, plan) for _i, k, px, plan in _tp_presets(t) if not t.get(f"{k}_hit")]
-        px_def = f"{pend[0][1]:g}" if pend else ""
-        pct_def = f"{pend[0][2]:g}" if pend and pend[0][2] is not None else ""
+        px_def = num_str(pend[0][1]) if pend else ""
+        pct_plan = f"{pend[0][2]:g}" if pend and pend[0][2] is not None else ""
         hint = f"next planned: {px_def}" if pend else "no preset left - any price"
 
         async def ok(i, v):
@@ -314,9 +318,11 @@ class Desk(discord.ui.View):
             is_long = t.get("direction") == "LONG"
             reached = bool(pend) and ((px >= pend[0][1]) if is_long else (px <= pend[0][1]))
             await self._event(i, "TPN" if reached else "PTP", price=v["price"], pct=(v["pct"] or None), note=(v["note"] or None))
+        # planned % is a placeholder, not a default: an untouched field submits blank, so a price past several
+        # targets books each one at its own planned % instead of the first target's % at the last price
         await interaction.response.send_modal(self._form("Take profit", [
             ("price", "Fill price", px_def, True, hint),
-            ("pct", "% of the position closed here", pct_def, not pct_def, "e.g. 40 - blank = planned %"),
+            ("pct", "% of the position closed here", "", not pct_plan, f"blank = planned {pct_plan}%" if pct_plan else "e.g. 40"),
             ("note", "Note (optional)", "", False, "shown in the update feed"),
         ], ok))
 
@@ -338,7 +344,7 @@ class Desk(discord.ui.View):
         async def ok(i, v):
             await self._event(i, "SL", price=(v["price"] or None), note=(v["note"] or None))
         await interaction.response.send_modal(self._form("Stopped out", [
-            ("price", "Exit price", (f"{s:g}" if s is not None and not t.get("sl_condition") else ""),
+            ("price", "Exit price", (num_str(s) if s is not None and not t.get("sl_condition") else ""),
              bool(t.get("sl_condition")) and not t.get("be"), "blank = the stop level on the card"),
             ("note", "Note (optional)", "", False, ""),
         ], ok))
@@ -381,8 +387,8 @@ class Desk(discord.ui.View):
     async def on_sold(self, interaction):
         t = self.rec()
         pend = [(k, px, plan) for _i, k, px, plan in _tp_presets(t, spot=True) if not t.get(f"{k}_hit")]
-        px_def = f"{pend[0][1]:g}" if pend else ""
-        pct_def = f"{pend[0][2]:g}" if pend and pend[0][2] is not None else ""
+        px_def = num_str(pend[0][1]) if pend else ""
+        pct_plan = f"{pend[0][2]:g}" if pend and pend[0][2] is not None else ""
         async def ok(i, v):
             px = spot_num(v["price"])
             if px is None:
@@ -392,7 +398,7 @@ class Desk(discord.ui.View):
             await self._event(i, "TPN" if reached else "PTP", price=v["price"], pct=(v["pct"] or None), note=(v["note"] or None))
         await interaction.response.send_modal(self._form("Sold", [
             ("price", "Sell price", px_def, True, f"next target: {px_def}" if pend else "any price"),
-            ("pct", "% of the bag sold here", pct_def, not pct_def, "e.g. 30 - blank = planned %"),
+            ("pct", "% of the bag sold here", "", not pct_plan, f"blank = planned {pct_plan}%" if pct_plan else "e.g. 30"),   # placeholder, see on_tp
             ("note", "Note (optional)", "", False, ""),
         ], ok))
 

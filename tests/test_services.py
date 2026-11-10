@@ -416,6 +416,90 @@ def test_fx_price_format_edges():
     assert fx(None) == "-" and fx(97000.25) == "97,000.25"
 
 
+def test_edit_stop_after_be_or_trail_only_moves_the_posted_stop():
+    """The live stop was moved on purpose; a stop edit then corrects what 1R is, never the protection."""
+    from sigma.calculations import signed_r
+    t = fut(entry1_filled=True, initial_sl="95")
+    svc.apply_event("fut", t, "BE")
+    ch = svc.edit("fut", t, {"stop": "94"})
+    assert t["sl"] == "100" and t["be"] and t["initial_sl"] == "94" and t["sl_condition"] is None
+    assert signed_r(t, 112) == pytest.approx(2.0) and "posted stop" in ch[0]
+    t = fut(entry1_filled=True, initial_sl="95")
+    svc.apply_event("fut", t, "SLU", price="4h close below 103")
+    svc.edit("fut", t, {"stop": "1d close below 96"})
+    assert t["sl"] == "103" and t["sl_condition"] == "4h close below" and not t["be"] and t["initial_sl"] == "96"
+    # untouched stop: the edit replaces the live stop and its condition as before
+    t = fut(entry1_filled=True, initial_sl="95")
+    svc.edit("fut", t, {"stop": "4h close below 96"})
+    assert t["sl"] == "96" and t["initial_sl"] == "96" and t["sl_condition"] == "4h close below"
+    # legacy be record (no initial_sl) is migrated first, then only the posted stop moves
+    old = fut(entry1_filled=True, be=True)
+    svc.edit("fut", old, {"stop": "93"})
+    assert old["sl"] == "100" and old["be"] and old["initial_sl"] == "93"
+
+
+def test_tiny_price_numbers_survive_the_round_trip():
+    """0.00001234 must never turn into 1.234e-05 on the record, and if it does, parse back to the same number."""
+    from sigma.calculations import first_num, num_str, parse_num, entry_num
+    assert parse_num("1.234e-05") == pytest.approx(1.234e-05) and parse_num("1,234.5") == 1234.5 and parse_num("$5") == 5.0
+    assert parse_num("40%") == 40.0 and parse_num("abc") is None and parse_num("inf") is None
+    assert first_num("1.234e-05") == pytest.approx(1.234e-05) and first_num(".5") == 0.5 and first_num("63,000 (4h)") == 63000.0
+    assert num_str(0.00001234) == "0.00001234" and num_str(63000.5) == "63000.5" and num_str(100.0) == "100" and num_str(123456789.0) == "123456789"
+    t = fut(entry="0.00001234", sl="0.00001100", tp1="0.00001500", tp2=None, tp3=None, tp_split=None, entry1_filled=True)
+    svc.apply_event("fut", t, "BE")
+    assert t["sl"] == "0.00001234" and "e" not in t["sl"]
+    from sigma.calculations import sl_num
+    assert sl_num(t) == pytest.approx(0.00001234) and entry_num(t) == pytest.approx(0.00001234)
+    out = svc.apply_event("fut", t, "SL")
+    assert t["result"] == "BE"
+    p = spot(avg_entry=None, buys=[], dca_zone="0.00002 - 0.00001")
+    svc.apply_event("spot", p, "BUY", price="0.000012", pct="50")
+    assert p["avg_entry"] == "0.000012"
+
+
+def test_entry_num_only_averages_a_written_range():
+    from sigma.calculations import entry_num
+    assert entry_num({"entry": "63000 4h"}) == 63000.0
+    assert entry_num({"entry": "63000 - 62500"}) == 62750.0
+    assert entry_num({"entry": "63,000/62,500"}) == 62750.0
+    assert entry_num({"entry": "100 (retest of 90)"}) == 100.0
+    assert entry_num({"entry": "0.5 - 0.45 (4h)"}) == pytest.approx(0.475)
+
+
+def test_futures_auto_close_when_every_percent_is_taken():
+    t = fut(entry1_filled=True)                            # plan 50/30/20
+    svc.apply_event("fut", t, "TPN")
+    svc.apply_event("fut", t, "TPN")
+    assert not t["closed"]
+    out = svc.apply_event("fut", t, "TPN")
+    assert out.closed and t["closed"] and t["result"] == "WIN" and t["close_note"].startswith("Position fully closed")
+    assert t["result_r"] == pytest.approx((0.5 * 110 + 0.3 * 120 + 0.2 * 130 - 100) / 5)
+    assert out.desc.startswith("TP3 reached @ 130")
+    t = fut(entry1_filled=True, tp_split=None)
+    svc.apply_event("fut", t, "PTP", price="105", pct="100")
+    assert t["closed"] and t["result"] == "WIN"
+
+
+def test_entry_fill_twice_is_refused():
+    t = fut(entry1_filled=True)
+    with pytest.raises(UserError, match="already recorded as filled"):
+        svc.apply_event("fut", t, "EF1")
+    t = svc.build_futures(analyst=A, pair="SOL", direction="LONG", entry="150", stop="138", tp1="165", entry2="144")
+    svc.apply_event("fut", t, "EF2")
+    with pytest.raises(UserError, match="already recorded as filled"):
+        svc.apply_event("fut", t, "EF2")
+
+
+def test_spot_buys_cannot_exceed_the_bag():
+    p = spot(buys=[{"price": 1.2, "pct": 60}], avg_entry="1.2")
+    with pytest.raises(UserError, match="only 40% is left"):
+        svc.apply_event("spot", p, "BUY", price="1.0", pct="50")
+    svc.apply_event("spot", p, "BUY", price="1.0", pct="40")
+    assert len(p["buys"]) == 2
+    svc.apply_event("spot", p, "BUY", price="0.9")         # no pct given - never blocked
+    assert len(p["buys"]) == 3
+
+
 def test_tpn_past_several_targets_books_each_one_per_plan():
     t = svc.build_futures(analyst=A, pair="BTC", direction="LONG", entry="100", stop="95", tp1="110", tp2="120", tp3="130",
                           tp_split="50/30/20")

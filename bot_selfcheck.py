@@ -35,7 +35,8 @@ _adm = next((c for c in cmds if c.name == "admin"), None)
 check("/admin hidden from members", _adm is not None and _adm.default_permissions is not None and _adm.default_permissions.administrator)
 _aliases = [c.name for c in cmds if (getattr(c, "extras", None) or {}).get("moved")]
 check("old admin names kept as aliases (one release)", len(_aliases) == 4, f"({len(_aliases)})")
-check("all 14 loops present", len(m._loops()) == 14)
+_lp = m._loops()
+check("all 15 loops registered", len(_lp) == 15, f"({sum(1 for _, _, on in _lp if on)} enabled, {sum(1 for _, _, on in _lp if not on)} off by config)")
 # Discord hard limits - a single violation makes the WHOLE command sync fail on boot
 def _walk_cmds(cmds):
     for c in cmds:
@@ -83,17 +84,25 @@ _svc.close("spot", _p, "12"); check("service spot close R", _p["result"] == "WIN
 
 tf = Path(tempfile.mkdtemp()) / "t.json"
 m._save(tf, {"a":1}); m._save(tf, {"a":2}); tf.write_text("{corrupt")
-check("corrupt file served from .bak", m._load(tf) == {"a":1})
+check("corrupt file served from .bak and restored", m._load(tf) == {"a":1} and json.loads(tf.read_text()) == {"a":1})
+# no .bak to fall back on -> writes are refused until a human looks
+uf = tf.parent / "u.json"; uf.write_text("{corrupt"); m._load(uf)
 refused = False
-try: m._save(tf, {"a":3})
+try: m._save(uf, {"a":3})
 except RuntimeError: refused = True
-check("save refused on corrupt file", refused)
-m._CORRUPT.discard(str(tf))
+check("save refused on corrupt file without .bak", refused)
+m._CORRUPT.discard(str(uf))
 
-# live data files on this box must parse
-for nm, pth in (("trades", m.JOURNAL_FILE), ("spot", m.SPOT_FILE), ("results", m.RESULTS_FILE)):
-    if pth.exists():
-        try: json.loads(pth.read_text()); check(f"data file {nm} parses", True, f"({pth.stat().st_size//1024} KB)")
-        except Exception as e: check(f"data file {nm} parses", False, str(e))
+# every live data file on this box must parse - one bad file wedges every save to it
+_root = Path(__file__).resolve().parent
+for pth in sorted(_root.glob("*.json")):
+    try: json.loads(pth.read_text()); check(f"data file {pth.name} parses", True, f"({pth.stat().st_size//1024} KB)")
+    except Exception as e: check(f"data file {pth.name} parses", False, str(e))
+# .env essentials (config has already loaded .env into the environment, so systemd Environment= counts too)
+if (_root / ".env").exists():
+    check(".env has SIGMA_SOL_WALLET", bool((os.getenv("SIGMA_SOL_WALLET") or "").strip()))
+    check(".env has SIGMA_OPS_CHANNEL_ID or SIGMA_MODLOG_CHANNEL_ID", bool(m.OPS_CHANNEL_ID or m.MOD_LOG_CHANNEL_ID))
+else:
+    out.write("  SKIP  .env checks (no .env on this box)\n")
 out.write(f"\n{ok} passed, {fail} failed -> {'SAFE TO RESTART' if fail == 0 else 'DO NOT RESTART'}\n")
 sys.exit(0 if fail == 0 else 1)

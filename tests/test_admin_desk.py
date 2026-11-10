@@ -81,7 +81,8 @@ def env(bot_mod, monkeypatch):
     monkeypatch.setattr(pay, "refresh_panel", _refresh)
     monkeypatch.setattr(pay, "activate", _activate)
     monkeypatch.setattr(mem, "_sub_remove_role", _remove_role)
-    monkeypatch.setattr(mem, "_archive_lapsed", lambda uid, rec, why: payments["lapsed"].append({"uid": uid, "why": why, **rec}))
+    async def _archive(uid, rec, why): payments["lapsed"].append({"uid": uid, "why": why, **rec})
+    monkeypatch.setattr(mem, "_archive_lapsed", _archive)
     pro = [FakeMember(22, "Owais", roles=(mem.SUB_ROLE_ID,)), FakeMember(44, "OldPaid", roles=(mem.SUB_ROLE_ID,)),
            FakeMember(55, "Ref", roles=(mem.SUB_ROLE_ID,)), FakeMember(66, "Analyst", roles=(mem.SUB_ROLE_ID,))]
     pro[3].roles.append(types.SimpleNamespace(id=1, name="Analyst"))
@@ -258,3 +259,77 @@ def test_unrecorded_bulk_grant_and_remove(env):
     asyncio.run(_btn(view, "Remove Pro role from all unrecorded (1)").callback(it3))
     _submit(it3, env, {"note": "", "confirm": "REMOVE"})
     assert env["roles"][-1] == ("remove", 77) and any("Bulk role removal" in l for l in env["logs"])
+
+
+# ---------------------------------------------------------------- audit fixes
+
+def test_settle_confirms_with_owed_total_then_stamps_rows(env):
+    env["payments"]["referrals"] = [
+        {"code": "SIGMA-OWAIS", "owner_id": 22, "owner_name": "Owais", "user_id": 1, "user": "m1", "plan": "1year", "usd": 1000,
+         "share_pct": 25, "share_usd": 250.0, "tx": "sigA", "at": "2026-10-01T00:00:00+00:00", "settled": None},
+        {"code": "SIGMA-OWAIS", "owner_id": 22, "owner_name": "Owais", "user_id": 2, "user": "m2", "plan": "1month", "usd": 100,
+         "share_pct": 25, "share_usd": 25.0, "tx": "sigB", "at": "2026-10-02T00:00:00+00:00", "settled": None}]
+    it, view = _open(env)
+    asyncio.run(_btn(view, "Payouts").callback(FakeInteraction(FakeUser(), env["guild"])))
+    it2 = FakeInteraction(FakeUser(), env["guild"])
+    asyncio.run(_btn(view, "Settle an owner").callback(it2))
+    _submit(it2, env, {"owner": "22", "note": "tx9"})
+    assert view.pending and "Settle $275.00 for Owais" in view.last           # nothing stamped yet
+    assert all(r["settled"] is None for r in env["payments"]["referrals"]) and not any("Payout settled" in l for l in env["logs"])
+    _confirm(view, env)
+    assert view.last == "Settled **$275.00** for Owais." and all(r["settled"] for r in env["payments"]["referrals"])
+    assert any("Payout settled" in l and "$275.00" in l for l in env["logs"]) and view.pending is None
+    # cancel path leaves the rows alone
+    for r in env["payments"]["referrals"]:
+        r["settled"] = None
+    it3 = FakeInteraction(FakeUser(), env["guild"])
+    asyncio.run(_btn(view, "Settle an owner").callback(it3))
+    _submit(it3, env, {"owner": "<@22>", "note": ""})
+    asyncio.run(_btn(view, "✖ Cancel").callback(FakeInteraction(FakeUser(), env["guild"])))
+    assert all(r["settled"] is None for r in env["payments"]["referrals"]) and view.last.startswith("Cancelled")
+
+
+def test_members_tab_caps_embed_size_with_overflow_marker(env):
+    import sigma.payments as pay
+    now = __import__("datetime").datetime.now(__import__("datetime").timezone.utc)
+    for i in range(400):
+        env["subs"][str(1000 + i)] = {"name": f"member-with-a-fairly-long-display-name-{i:03d}", "plan": "1month", "days": 30,
+                                      "expires": (now + __import__("datetime").timedelta(days=1 + i % 29)).isoformat(), "history": []}
+    e = pay.members_embed(env["guild"], "members")
+    total = len(e.title or "") + sum(len(f.name) + len(f.value) for f in e.fields) + len(e.footer.text or "")
+    assert total <= 5500 and all(len(f.value) <= 1024 for f in e.fields)
+    marker = next(f.value for f in e.fields if "more" in f.value)
+    shown = sum(f.value.count("\n") + 1 for f in e.fields if "more" not in f.value)
+    assert marker == f"**+{401 - shown} more** - use Export CSV for the full list" and "Export CSV" in marker
+
+
+def test_free_text_ints_become_user_errors_and_generic_errors_alert(env, monkeypatch):
+    it, view = _open(env)
+    asyncio.run(_btn(view, "Plans").callback(FakeInteraction(FakeUser(), env["guild"])))
+    asyncio.run(_select(view, 3).callback(FakeInteraction(FakeUser(), env["guild"], values=["1month"])))
+    it2 = FakeInteraction(FakeUser(), env["guild"])
+    asyncio.run(_btn(view, "Edit").callback(it2))
+    _submit(it2, env, {"name": "", "price": "", "days": "", "seats": "ten", "position": ""})
+    assert view.last == "⚠ Seats must be a whole number, got `ten`." and env["plans"].get("1month").get("seats") is None
+    it3 = FakeInteraction(FakeUser(), env["guild"])
+    asyncio.run(_btn(view, "Add plan").callback(it3))
+    _submit(it3, env, {"key": "x", "name": "X", "price": "1", "days": "1", "seats": "1.5"})
+    assert view.last.startswith("⚠ Seats must be a whole number") and "x" not in env["plans"].all()
+    # an unexpected exception inside an action -> Last line + ops alert (not just a log line)
+    alerts = []
+    async def _alert(msg, key=None): alerts.append((key, msg))
+    monkeypatch.setattr(env["ad"], "ops_alert", _alert)
+    async def _boom(): raise KeyError("plans.json")
+    asyncio.run(view._apply(FakeInteraction(FakeUser(), env["guild"]), _boom))
+    assert view.last == "⚠ Something broke - check the logs." and alerts and alerts[0][0] == "desk:KeyError" and "plans.json" in alerts[0][1]
+
+
+def test_revoke_and_note_take_the_subs_lock(bot_mod):
+    import inspect
+    import sigma.admin_desk as ad
+    assert "SUBS_LOCK" in inspect.getsource(ad.AdminDesk.on_revoke) and "SUBS_LOCK" in inspect.getsource(ad.AdminDesk.on_note)
+    assert "PAY_LOCK" in inspect.getsource(ad.AdminDesk.on_settle)
+    import sigma.payments as pay, sigma.members as mem
+    assert "SUBS_LOCK" in inspect.getsource(pay.activate) and "PAY_LOCK" in inspect.getsource(pay.new_quote)
+    assert "PAY_LOCK" in inspect.getsource(pay.apply_promo) and "PAY_LOCK" in inspect.getsource(pay._watch_once)
+    assert "PAY_LOCK" in inspect.getsource(mem._archive_lapsed) and not hasattr(pay, "_watch_lock")

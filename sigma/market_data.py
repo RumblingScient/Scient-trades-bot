@@ -11,15 +11,36 @@ import logging, logging.handlers, builtins, time as _time, traceback as _tb
 import functools as _functools
 from sigma.config import TRADFI_SYMBOLS
 from sigma.http import http
+from sigma.ops import ops_alert
 
 
 # ================= Unified market data (Binance -> Bybit fallback) =================
 # Bybit intervals differ from Binance: map them.
 _BYBIT_IV = {"1m": "1", "5m": "5", "15m": "15", "30m": "30", "1h": "60", "2h": "120", "4h": "240", "1d": "D", "1w": "W"}
 
+_binance_until = 0.0     # ts until which Binance is skipped (fall through to Bybit) after a 429/418
+_BINANCE_DEFAULT_WAIT = 60
+
+def _retry_after(r) -> int:
+    """Seconds Binance asked us to wait; 418 (IP ban) without a header is treated as a long one."""
+    try:
+        v = int(float(r.headers.get("Retry-After", "")))
+        return max(1, v)
+    except Exception:
+        return 300 if r.status == 418 else _BINANCE_DEFAULT_WAIT
+
 async def _get_json(session, url, params=None, timeout=15):
+    global _binance_until
+    is_binance = "binance.com" in url
+    if is_binance and _time.time() < _binance_until:
+        return None                      # still in the penalty window: every caller has a Bybit fallback
     try:
         async with session.get(url, params=params, timeout=timeout) as r:
+            if is_binance and r.status in (429, 418):
+                wait = _retry_after(r)
+                _binance_until = _time.time() + wait
+                await ops_alert(f"Binance replied {r.status} - backing off for {wait}s, using Bybit meanwhile", key="binance:429")
+                return None
             if r.status != 200:
                 return None
             return await r.json()

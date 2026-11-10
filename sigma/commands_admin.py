@@ -183,7 +183,7 @@ async def admin_import(interaction: discord.Interaction, action: app_commands.Ch
     await mod_log(f"**Import** by {interaction.user.display_name}: {done} member(s) imported, {skipped} skipped, {archived} expired archived")
     await interaction.followup.send(f"Imported **{done}** member(s), skipped {skipped} (expired / no plan / failed - see mod-log), "
                                     f"archived {archived} expired for revenue history. "
-                                    f"Run `/admin members view:Unrecorded` to see what's left.", ephemeral=True)
+                                    f"Open `/admin desk` -> Unrecorded to see what's left.", ephemeral=True)
 
 
 bot.tree.add_command(admin)

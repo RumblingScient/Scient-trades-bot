@@ -340,7 +340,7 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
                 sub += f" \u00b7 avg {fx(avg_e)}"
         entry_val += f"\n{sub}"
     else:
-        entry_val = f"**{fx(e1)}**" if e1 is not None else f"**{t.get('entry')}**"
+        entry_val = f"**{fx(e1)}**" if e1 is not None else f"**{str(t.get('entry'))[:1000]}**"     # raw text: keep under the 1024 field cap
         state = "market" if (t.get("entry_type") == "MARKET" and not closed) else ("filled" if t.get("entry1_filled") else "pending")
         if closed:
             state = "filled" if any_entry_filled(t) else "never filled"
@@ -349,7 +349,7 @@ def build_embed(t: dict, image_url: str = None) -> discord.Embed:
         entry_val += f"\n{state}"
     embed.add_field(name="ENTRY", value=entry_val, inline=True)
 
-    sl_shown = fx(sl_num(t)) if sl_num(t) is not None else str(t.get("sl"))
+    sl_shown = fx(sl_num(t)) if sl_num(t) is not None else str(t.get("sl"))[:1000]
     cond = (t.get("sl_condition") + " ") if t.get("sl_condition") else ""
     sl_val = f"**{cond}{sl_shown}**"
     if t.get("sl_hit"):
@@ -422,7 +422,7 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
     lines.append(HAIRLINE)
     embed.description = "\n".join(lines)
 
-    zone_val = f"**{p.get('dca_zone') or '-'}**"
+    zone_val = f"**{str(p.get('dca_zone') or '-')[:1000]}**"       # raw text fields: keep under the 1024 field cap
     if p.get("avg_entry"):
         zone_val += f"\navg {p['avg_entry']}" + ("" if (p.get("zone_filled") or closed) else " \u00b7 bidding")
     elif not closed and not p.get("zone_filled"):
@@ -431,7 +431,7 @@ def build_spot_embed(p: dict, image_url: str = None) -> discord.Embed:
     else:
         zone_val += "\nfilled"
     embed.add_field(name="ZONE", value=zone_val, inline=True)
-    embed.add_field(name="INVALIDATION", value=f"**{p.get('invalidation') or '-'}**", inline=True)
+    embed.add_field(name="INVALIDATION", value=f"**{str(p.get('invalidation') or '-')[:1000]}**", inline=True)
     tb = targets_block(p, spot=True)
     if tb:
         embed.add_field(name="TARGETS", value=tb[:1020], inline=False)

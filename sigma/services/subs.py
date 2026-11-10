@@ -41,30 +41,58 @@ def parse_date(text):
     raise UserError("Date must look like `2026-11-15` or `15 Nov`.")
 
 
+def expiry(rec: dict):
+    """Aware expiry datetime of a record, or None. A naive stamp (hand-edited file, old import) is taken as UTC
+    instead of blowing up every comparison in the expiry loop."""
+    try:
+        exp = datetime.fromisoformat(rec["expires"])
+    except Exception:
+        return None
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+        rec["expires"] = exp.isoformat()
+    return exp
+
+
+def is_lifetime(rec: dict) -> bool:
+    return int(rec.get("days") or 0) >= plansvc.LIFETIME_DAYS
+
+
 def grant(subs: dict, uid, name: str, plan: str, by: str, note: str = "", tx: str = None, usd: float = None,
           expires_at=None) -> dict:
     """Mutates subs; returns the new record. Raises UserError for an unknown plan or a sold-out one.
-    expires_at: explicit expiry (datetime or date text) - used when importing members from the old bot."""
+    expires_at: explicit expiry (datetime or date text) - used when importing members from the old bot.
+    Idempotent on tx: a second call with a tx already in the history is a no-op (activation retries)."""
     p = plansvc.all().get(plan)
     if not p:
         raise UserError("Unknown plan.")
     uid = str(uid)
     existing = subs.get(uid)
+    if existing and tx and any(h.get("tx") == tx for h in existing.get("history", [])):
+        return existing
     if p.get("seats") is not None and (not existing or existing.get("plan") != plan) and seats_left(subs, plan) <= 0:
         raise UserError(f"{p['label']} is sold out - all {p['seats']} seats are taken.")
     now = _now()
     base = now
     if existing and existing.get("expires"):
-        try:
-            cur = datetime.fromisoformat(existing["expires"])
+        cur = expiry(existing)
+        if cur is not None:
             base = max(cur, now)
-        except Exception:
-            pass
     expires = base + timedelta(days=p["days"])
     if expires_at not in (None, ""):
         expires = expires_at if isinstance(expires_at, datetime) else parse_date(expires_at)
+        if expires.tzinfo is None:
+            expires = expires.replace(tzinfo=timezone.utc)
         if expires <= now:
             raise UserError("That expiry is already in the past.")
+    row = {"plan": plan, "price": p["price"], "usd": usd if usd is not None else p["price"], "at": now.isoformat(), "by": by, "tx": tx}
+    if existing and is_lifetime(existing) and p["days"] < plansvc.LIFETIME_DAYS and expires_at in (None, ""):
+        # a shorter plan on top of lifetime must not demote the member - record the payment, keep the record
+        existing.setdefault("history", []).append(row)
+        existing["name"] = name
+        if note:
+            existing["note"] = note[:120]
+        return existing
     rec = {
         "name": name,
         "plan": plan,
@@ -74,10 +102,7 @@ def grant(subs: dict, uid, name: str, plan: str, by: str, note: str = "", tx: st
         "expires": expires.isoformat(),
         "reminded": [],
         "note": (note or "")[:120],
-        "history": (existing.get("history", []) if existing else []) + [
-            {"plan": plan, "price": p["price"], "usd": usd if usd is not None else p["price"],
-             "at": now.isoformat(), "by": by, "tx": tx}
-        ],
+        "history": (existing.get("history", []) if existing else []) + [row],
     }
     subs[uid] = rec
     return rec
@@ -91,9 +116,8 @@ def revoke(subs: dict, uid) -> dict:
 
 
 def days_left(rec: dict, now=None) -> int | None:
-    try:
-        exp = datetime.fromisoformat(rec["expires"])
-    except Exception:
+    exp = expiry(rec)
+    if exp is None:
         return None
     return (exp - (now or _now())).days
 

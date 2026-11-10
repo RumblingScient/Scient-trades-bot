@@ -12,6 +12,7 @@ import functools as _functools
 from sigma.logging_setup import print
 from sigma.config import DIGEST_SPONSOR_WORDS, DISCORD_INVITE, IST, NAVY, NEWS_CHANNEL_ID, TELEGRAM_BOT_TOKEN, TG_BRIEF_UTC_HOUR, TG_BRIEF_UTC_MIN, TG_CHANNEL, TG_DIGEST_MAX, TG_DIGEST_UTC_HOUR, TG_DIGEST_UTC_MIN, TG_ENABLED, TG_MACRO_CORE, TG_MOVE_COOLDOWN_MIN, TG_MOVE_SYMBOLS, TG_MOVE_THRESHOLD, TG_NEWS_CHANNELS, TG_NEWS_POLL_MIN
 from sigma.core import bot
+from sigma.ops import HEARTBEAT
 from sigma.http import http
 from sigma.storage import load_digest, load_sources, save_digest, save_sources
 from sigma.market_data import md_klines
@@ -110,6 +111,7 @@ async def tg_move_loop():
         if ok:
             _tg_move_state[sym] = {"last_alert": now}
             print(f"[tg] move alert sent: {sym} {chg:+.2f}%")
+    HEARTBEAT["tg_move"] = _time.time()
 
 @tg_move_loop.before_loop
 async def before_tg_move():
@@ -204,6 +206,8 @@ async def tg_brief_loop():
     text = await build_daily_brief()
     ok = await tg_send(text)
     print(f"[tg] daily brief {'sent' if ok else 'FAILED'}")
+    if ok:
+        HEARTBEAT["tg_brief"] = _time.time()
 
 @tg_brief_loop.before_loop
 async def before_tg_brief():
@@ -251,12 +255,15 @@ async def tg_sources_loop():
         if not posts:
             print(f"[digest] {ch}: no posts parsed")
             continue
-        seen = set(state.get(ch, []))
+        # ordered list, oldest first: a set here evicted random ids and let old posts come back as "new"
         first_run = ch not in state
-        new_ids = []
+        known = [str(x) for x in (state.get(ch) or [])]
+        seen = set(known)
         for post_id, txt in posts:
-            new_ids.append(post_id)
-            if first_run or post_id in seen:
+            if post_id in seen:
+                continue
+            known.append(post_id); seen.add(post_id)
+            if first_run:
                 continue
             low = txt.lower()
             if len(txt) < 25:
@@ -275,10 +282,11 @@ async def tg_sources_loop():
                 "ts": datetime.now(timezone.utc).isoformat(),
             })
             added += 1
-        state[ch] = list(dict.fromkeys(list(seen) + new_ids))[-200:]
+        state[ch] = known[-500:]
     dg["items"] = items[-100:]
     save_digest(dg)
     save_sources(state)
+    HEARTBEAT["tg_sources"] = _time.time()
     if added:
         print(f"[digest] buffered {added} new item(s)")
 
@@ -362,6 +370,7 @@ async def tg_digest_loop():
         t_ok = await tg_send(text)
     if d_ok or t_ok:
         save_digest({"items": []})
+        HEARTBEAT["tg_digest"] = _time.time()
     print(f"[tg] digest discord={'ok' if d_ok else 'fail'} tg={'ok' if t_ok else 'fail'}")
 
 @tg_digest_loop.before_loop

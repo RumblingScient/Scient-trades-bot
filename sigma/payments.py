@@ -2,13 +2,14 @@
 
 Member: dropdown in #join-via-payment -> private quote (wallet, exact SOL, 30 min) -> pays ->
 the watcher sees the transfer on chain, matches the amount to the session -> role + DM + mod-log.
-Admin: /admin panel kind:pay (post the panel), /admin members (dashboard), /admin grant with a
-tx note for anything that didn't match (the watcher alerts the ops channel on unmatched payments).
+Admin: /admin panel kind:pay (post the panel), /admin desk (members dashboard, grant with a tx note for
+anything that didn't match - the watcher alerts the ops channel on unmatched payments).
 
-Everything that touches the subs record goes through sigma.services.subs - same path as /admin grant.
+Everything that touches the subs record goes through sigma.services.subs - same path as the desk's Grant.
 """
 import asyncio
 import random
+import time as _time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -22,14 +23,20 @@ from sigma.config import (GOLD, GREEN, GREY, GUILD_ID, MOD_LOG_CHANNEL_ID, NAVY,
 from sigma.core import bot
 from sigma.ops import HEARTBEAT, ops_alert
 from sigma.http import http
-from sigma.storage import load_payments, save_payments, load_subs, save_subs
+from sigma.storage import load_payments, save_payments, load_subs, save_subs, PAY_LOCK, SUBS_LOCK
 from sigma.errors import UserError
 from sigma.services import subs as subsvc
 from sigma.services import plans as plansvc
-from sigma.members import _sub_grant_role
+from sigma.members import _sub_grant_role, csv_safe
 
 LAMPORTS = 1_000_000_000
 LIFETIME_DAYS = plansvc.LIFETIME_DAYS
+SEEN_CAP = 5000                # processed signatures kept (oldest evicted first - never random)
+ACTIVATE_RETRIES = 10          # watcher passes a paid-but-not-activated session is retried before we give up
+CHECK_COOLDOWN_S = 15          # 'I've paid - check now' per user
+SIG_PAGES = 8                  # getSignaturesForAddress pages per address when catching up after downtime
+RPC_ALERT_AFTER_S = 600        # continuous RPC failure before the ops channel hears about it
+RPC_429_SKIP = 4               # passes skipped after a 429 (2 min at the 30s poll)
 
 
 # ----------------------------------------------------------------------------- pure helpers
@@ -176,26 +183,75 @@ def prune(state: dict, now=None):
         if s.get("paid") or age <= timedelta(hours=PAY_LATE_GRACE_H):
             keep[sid] = s
     state["sessions"] = keep
-    state["seen"] = (state.get("seen") or [])[-500:]
+    # ordered, oldest first, so eviction drops what the RPC stopped returning long ago - a set() here evicted at
+    # random and let a months-old signature come back as "new"
+    state["seen"] = list(dict.fromkeys(state.get("seen") or []))[-SEEN_CAP:]
     return state
 
 
 # ----------------------------------------------------------------------------- chain + price
 
-async def sol_price() -> float | None:
+_PRICE_CACHE = {"px": None, "at": 0.0}
+_PRICE_FAILS = 0
+PRICE_CACHE_MAX_S = 300
+PRICE_JUMP_MAX = 0.20          # a source that disagrees with the last-good price by more than this is lying or broken
+
+
+async def _price_from(name: str, url: str, params: dict, pick) -> float | None:
     try:
         async with http() as s:
-            async with s.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": "SOLUSDT"}, timeout=10) as r:
+            async with s.get(url, params=params, timeout=10) as r:
                 if r.status == 200:
-                    return float((await r.json())["price"])
+                    v = float(pick(await r.json()))
+                    return v if v > 0 else None
+                print(f"[pay] price {name} http {r.status}", flush=True)
     except Exception as e:
-        print(f"[pay] price error: {e}", flush=True)
+        print(f"[pay] price {name} error: {e}", flush=True)
     return None
+
+
+_PRICE_SOURCES = (
+    ("binance", "https://api.binance.com/api/v3/ticker/price", {"symbol": "SOLUSDT"}, lambda j: j["price"]),
+    ("coinbase", "https://api.coinbase.com/v2/prices/SOL-USD/spot", {}, lambda j: j["data"]["amount"]),
+    ("coingecko", "https://api.coingecko.com/api/v3/simple/price", {"ids": "solana", "vs_currencies": "usd"}, lambda j: j["solana"]["usd"]),
+)
+
+
+async def sol_price() -> float | None:
+    """Binance -> Coinbase -> CoinGecko, first sane answer wins. Sane = within PRICE_JUMP_MAX of the last good price
+    (one exchange printing a bad tick must not mint a quote at half price). Last good price (<= 5 min old) is the
+    final fallback; two total failures in a row ping ops."""
+    global _PRICE_FAILS
+    last, at = _PRICE_CACHE["px"], _PRICE_CACHE["at"]
+    for name, url, params, pick in _PRICE_SOURCES:
+        v = await _price_from(name, url, params, pick)
+        if v is None:
+            continue
+        if last and abs(v - last) / last > PRICE_JUMP_MAX:
+            print(f"[pay] price {name} {v:.2f} rejected - {abs(v - last) / last:.0%} from last good {last:.2f}", flush=True)
+            await ops_alert(f"SOL price from {name} is ${v:,.2f}, last good ${last:,.2f} - ignored that source", key="price:jump")
+            continue
+        _PRICE_CACHE.update({"px": v, "at": _time.time()})
+        _PRICE_FAILS = 0
+        return v
+    if last and _time.time() - at <= PRICE_CACHE_MAX_S:
+        print(f"[pay] all price sources failed - using cached {last:.2f}", flush=True)
+        return last
+    _PRICE_FAILS += 1
+    if _PRICE_FAILS >= 2:
+        await ops_alert("SOL price: every source (Binance, Coinbase, CoinGecko) failed twice in a row - quotes are refused until one answers.", key="price")
+    return None
+
+
+class RpcRateLimited(RuntimeError):
+    pass
 
 
 async def _rpc(method: str, params: list):
     async with http() as s:
         async with s.post(SOL_RPC, json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=20) as r:
+            if r.status == 429:
+                raise RpcRateLimited(f"rpc {method} http 429")
             if r.status != 200:
                 raise RuntimeError(f"rpc {method} http {r.status}")
             j = await r.json()
@@ -232,22 +288,59 @@ async def token_accounts() -> list:
     return [a for lst in out.values() for a in lst]
 
 
-async def recent_signatures(limit: int = 25) -> list:
-    """Newest-first signatures touching the wallet OR any of its stablecoin token accounts (deduped, order kept)."""
+BLOCK_TIMES: dict = {}         # signature -> blockTime (unix s) from the last getSignaturesForAddress sweep
+
+
+async def _signatures_for(addr: str, seen, limit: int, cutoff: int) -> list:
+    """Newest-first, paged with `before=` until a page contains something we already processed or something older
+    than the grace window - so a payment that landed while the bot was down is still found, however many
+    transactions came after it. The first page is always scanned in full (retries live there)."""
+    out, before = [], None
+    for _ in range(SIG_PAGES):
+        opts = {"limit": limit}
+        if before:
+            opts["before"] = before
+        res = await _rpc("getSignaturesForAddress", [addr, opts]) or []
+        if not res:
+            break
+        reached = False
+        for x in res:
+            sig = x["signature"]
+            bt = x.get("blockTime")
+            if bt:
+                BLOCK_TIMES[sig] = int(bt)
+            if sig in seen:
+                reached = True
+                continue
+            if bt and int(bt) < cutoff:
+                reached = True               # still returned: the watcher marks it seen (or retries it) itself
+            if not x.get("err"):
+                out.append(sig)
+        if reached or len(res) < limit:
+            break
+        before = res[-1]["signature"]
+    return out
+
+
+async def recent_signatures(seen=(), limit: int = 25) -> list:
+    """Newest-first signatures touching the wallet OR any of its stablecoin token accounts (deduped, order kept).
+    `seen`: signatures already processed - paging stops once a page reaches one. BLOCK_TIMES is refreshed."""
     addrs = [SOL_WALLET] + [a for a in await token_accounts() if a != SOL_WALLET]
-    seen, out = set(), []
+    seen = set(seen or ())
+    cutoff = int(_time.time()) - PAY_LATE_GRACE_H * 3600
+    BLOCK_TIMES.clear()
+    have, out = set(), []
     for addr in addrs:
         try:
-            res = await _rpc("getSignaturesForAddress", [addr, {"limit": limit}]) or []
+            res = await _signatures_for(addr, seen, limit, cutoff)
         except Exception as e:
             if addr == SOL_WALLET:
                 raise
             print(f"[pay] signatures for token account {addr[:8]} failed: {e}", flush=True)
             continue
-        for x in res:
-            sig = x["signature"]
-            if not x.get("err") and sig not in seen:
-                seen.add(sig); out.append(sig)
+        for sig in res:
+            if sig not in have:
+                have.add(sig); out.append(sig)
     return out
 
 
@@ -270,7 +363,7 @@ async def mod_log(text: str, color=GREY):
 
 
 async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = None, note: str = "", expires_at=None) -> dict:
-    """Grant (or extend) + role + DM + mod-log. Used by the chain watcher and by /admin grant."""
+    """Grant (or extend) + role + DM + mod-log. Used by the chain watcher and by /admin desk (Grant / Extend, bulk grant, import)."""
     guild = bot.get_guild(GUILD_ID)
     member = None
     if guild:
@@ -279,20 +372,31 @@ async def activate(uid: int, plan: str, by: str, tx: str = None, usd: float = No
         except Exception:
             member = None
     name = member.display_name if member else str(uid)
-    subs = load_subs()
-    rec = subsvc.grant(subs, uid, name, plan, by, note=note, tx=tx,
-                       usd=(usd if usd is not None else (0.0 if expires_at else None)), expires_at=expires_at)
-    save_subs(subs)
-    ok = await _sub_grant_role(guild, uid) if guild else False
+    async with SUBS_LOCK:
+        subs = load_subs()
+        rec = subsvc.grant(subs, uid, name, plan, by, note=note, tx=tx,
+                           usd=(usd if usd is not None else (0.0 if expires_at else None)), expires_at=expires_at)
+        save_subs(subs)
+    if guild:
+        ok = await _sub_grant_role(guild, uid)
+    else:
+        ok = False
+        await ops_alert(f"Pro role NOT granted to <@{uid}> - the bot isn't in guild {GUILD_ID}. Add it by hand.", key=f"role:{uid}")
     p = plansvc.get(plan)
-    exp = datetime.fromisoformat(rec["expires"])
+    exp = subsvc.expiry(rec)
+    life = int(rec.get("days") or p["days"]) >= LIFETIME_DAYS
     if member:
         try:
+            until = "lifetime" if life else exp.strftime("%d %b %Y")
+            if ok:
+                body = f"**{p['label']}** is live.\n**Access until:** {until}"
+            else:
+                # never tell someone their access is live when the role didn't land - say what's actually true
+                body = (f"Payment received for **{p['label']}** - your access is being set up and an admin has been pinged. "
+                        f"You'll have the Pro role shortly.\n**Access until:** {until}")
             e = discord.Embed(
                 title="Sigma Pro - membership moved to the new bot" if expires_at else "Sigma Pro activated",
-                description=(f"**{p['label']}** is live.\n**Access until:** "
-                             + ("lifetime" if p["days"] >= LIFETIME_DAYS else exp.strftime("%d %b %Y"))
-                             + (f"\n\nTx: `{tx[:20]}...`" if tx else "")
+                description=(body + (f"\n\nTx: `{tx[:20]}...`" if tx else "")
                              + f"\n\nRenewal reminders come {', '.join(str(d) for d in SUB_REMINDER_DAYS)} days before it ends."),
                 color=GOLD)
             await member.send(embed=e)
@@ -459,18 +563,33 @@ class QuoteView(SafeView):
 
     async def check(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
-        st = load_payments()
-        s = (st.get("sessions") or {}).get(self.sid)
-        if not s or s.get("user_id") != interaction.user.id:
-            await interaction.followup.send("That quote isn't yours or has expired - pick a plan again.", ephemeral=True)
-            return
+        now = _time.time()
+        async with PAY_LOCK:
+            st = load_payments()
+            s = (st.get("sessions") or {}).get(self.sid)
+            if not s or s.get("user_id") != interaction.user.id:
+                await interaction.followup.send("That quote isn't yours or has expired - pick a plan again.", ephemeral=True)
+                return
+            wait = CHECK_COOLDOWN_S - (now - float(s.get("last_check") or 0))
+            if wait > 0 and not s.get("paid"):
+                # every tap is a full RPC sweep - one member hammering the button must not rate-limit the watcher for everyone
+                await interaction.followup.send(f"Checking too fast - the chain is polled every {PAY_POLL_SEC}s anyway. Try again in {int(wait) + 1}s.", ephemeral=True)
+                return
+            s["last_check"] = now
+            save_payments(st)
         found = await _watch_once()
         s = load_payments().get("sessions", {}).get(self.sid) or {}
         if s.get("paid"):
-            await interaction.followup.send("Payment found - your access is live. Check your DMs.", ephemeral=True)
+            if s.get("activated") is False:
+                await interaction.followup.send("Payment found - your access is being set up and an admin has been pinged. Check your DMs.", ephemeral=True)
+            else:
+                await interaction.followup.send("Payment found - your access is live. Check your DMs.", ephemeral=True)
         elif s.get("underpaid"):
             await interaction.followup.send(f"Your transfer landed but is worth less than the plan (~${s.get('worth_usd', 0):,.0f} vs ${s['usd']:,.0f}) - "
                                             "an admin has been notified and will sort it out with you.", ephemeral=True)
+        elif found is None:
+            await interaction.followup.send("Couldn't reach Solana right now - this isn't about your transfer. "
+                                            "The watcher keeps retrying every 30s and will match it by itself; try again in a minute.", ephemeral=True)
         elif not session_open(s):
             await interaction.followup.send("This quote has expired. If you already sent SOL it will still be matched for 24h - "
                                             "otherwise pick a plan again for a fresh amount.", ephemeral=True)
@@ -496,21 +615,27 @@ class PromoModal(discord.ui.Modal, title="Promo code"):
 
 
 async def apply_promo(user, sid: str, code: str):
-    st = prune(load_payments())
-    s = (st.get("sessions") or {}).get(sid)
-    if not s or s.get("user_id") != user.id or s.get("paid"):
-        raise UserError("That quote isn't yours or is already paid - pick a plan again.")
-    promo = plansvc.promo_check(code, s["plan"])
-    p = plansvc.get(s["plan"])
-    usd, why = plansvc.effective_price(p, promo)
-    if usd <= 0:
-        raise UserError("That code would make the plan free - ping an admin to grant it directly.")
-    token = s.get("token", "SOL")
-    price = s.get("sol_price") or (await sol_price() if token == "SOL" else 1.0)
-    taken = {float(x["amount"]) for k, x in st["sessions"].items() if not x.get("paid") and k != sid and x.get("token", "SOL") == token}
-    s.update({"usd": usd, "amount": quote_amount(usd, price, taken, token), "promo": promo["code"], "why": why,
-              "created": _now().isoformat()})     # fresh 30 min on the new amount
-    save_payments(st)
+    """Re-price an open quote with a code. Same code twice = no-op (no new amount, no mod-log line); a different
+    code replaces the first. The quote's clock is NOT reset - a code must not be a way to keep a stale SOL price alive."""
+    async with PAY_LOCK:
+        st = prune(load_payments())
+        s = (st.get("sessions") or {}).get(sid)
+        if not s or s.get("user_id") != user.id or s.get("paid"):
+            raise UserError("That quote isn't yours or is already paid - pick a plan again.")
+        if not session_open(s):
+            raise UserError("This quote has expired - pick a plan again, then add the code.")
+        promo = plansvc.promo_check(code, s["plan"], user_id=user.id)
+        if s.get("promo") == promo["code"]:
+            return quote_embed(s, sid), QuoteView(sid)
+        p = plansvc.get(s["plan"])
+        usd, why = plansvc.effective_price(p, promo)
+        if usd <= 0:
+            raise UserError("That code would make the plan free - ping an admin to grant it directly.")
+        token = s.get("token", "SOL")
+        price = s.get("sol_price") or (await sol_price() if token == "SOL" else 1.0)
+        taken = {float(x["amount"]) for k, x in st["sessions"].items() if not x.get("paid") and k != sid and x.get("token", "SOL") == token}
+        s.update({"usd": usd, "amount": quote_amount(usd, price, taken, token), "promo": promo["code"], "why": why})
+        save_payments(st)
     await log_quote(s, sid, f"Promo applied - {promo['code']}")
     return quote_embed(s, sid), QuoteView(sid)
 
@@ -527,19 +652,20 @@ async def new_quote(user: discord.abc.User, plan: str, token: str = "SOL"):
     if p.get("seats") is not None and subsvc.seats_left(subs, plan) <= 0:
         raise UserError(f"{p['label']} is sold out.")
     price = await sol_price() if token == "SOL" else 1.0
-    st = prune(load_payments())
-    sessions = st.setdefault("sessions", {})
-    # one open quote per user per plan per token - reuse it instead of minting another amount
-    for sid, s in sessions.items():
-        if s.get("user_id") == user.id and s.get("plan") == plan and s.get("token", "SOL") == token and not s.get("paid") and session_open(s):
-            return quote_embed(s, sid), QuoteView(sid)
-    taken = {float(s["amount"]) for s in sessions.values() if not s.get("paid") and s.get("token", "SOL") == token}
-    usd, why = plansvc.effective_price(p)
-    amt = quote_amount(usd, price, taken, token)
-    sid = uuid.uuid4().hex[:12]
-    sessions[sid] = {"user_id": user.id, "user": str(user), "plan": plan, "token": token, "usd": usd, "list_usd": p["price"], "why": why,
-                     "sol_price": price, "amount": amt, "created": _now().isoformat(), "paid": False}
-    save_payments(st)
+    async with PAY_LOCK:
+        st = prune(load_payments())
+        sessions = st.setdefault("sessions", {})
+        # one open quote per user per plan per token - reuse it instead of minting another amount
+        for sid, s in sessions.items():
+            if s.get("user_id") == user.id and s.get("plan") == plan and s.get("token", "SOL") == token and not s.get("paid") and session_open(s):
+                return quote_embed(s, sid), QuoteView(sid)
+        taken = {float(s["amount"]) for s in sessions.values() if not s.get("paid") and s.get("token", "SOL") == token}
+        usd, why = plansvc.effective_price(p)
+        amt = quote_amount(usd, price, taken, token)
+        sid = uuid.uuid4().hex[:12]
+        sessions[sid] = {"user_id": user.id, "user": str(user), "plan": plan, "token": token, "usd": usd, "list_usd": p["price"], "why": why,
+                         "sol_price": price, "amount": amt, "created": _now().isoformat(), "paid": False}
+        save_payments(st)
     await log_quote(sessions[sid], sid, "Plan selected")
     return quote_embed(sessions[sid], sid), QuoteView(sid)
 
@@ -593,28 +719,89 @@ def quote_embed(s: dict, sid: str) -> discord.Embed:
 
 # ----------------------------------------------------------------------------- watcher
 
-_watch_lock = asyncio.Lock()
+_RPC = {"fail_since": 0.0, "alerted": False, "skip": 0}     # watcher-level RPC health (see _rpc_failed / _rpc_ok)
 
 
-async def _watch_once() -> int:
-    """Pull new transfers, match them to quotes, activate. Returns number of new incoming transfers seen.
-    Serialised: the 30s loop and the 'check now' button can never process the same signature twice."""
+async def _watch_once() -> int | None:
+    """Pull new transfers, match them to quotes, activate. Returns the number of new incoming transfers seen,
+    or None when the chain couldn't be read this pass (so callers can say 'RPC down', not 'nothing on chain').
+    Serialised under PAY_LOCK: the 30s loop and the 'check now' button can never process the same signature twice."""
     if not SOL_WALLET:
         return 0
-    async with _watch_lock:
+    if _RPC["skip"] > 0:
+        _RPC["skip"] -= 1                 # 429 backoff: sit out a few passes instead of hammering the endpoint
+        return None
+    async with PAY_LOCK:
         return await _watch_once_inner()
 
 
-async def _watch_once_inner() -> int:
+async def _rpc_failed(e: Exception):
+    now = _time.time()
+    if isinstance(e, RpcRateLimited):
+        _RPC["skip"] = RPC_429_SKIP
+    if not _RPC["fail_since"]:
+        _RPC["fail_since"] = now
+    if now - _RPC["fail_since"] >= RPC_ALERT_AFTER_S and not _RPC["alerted"]:
+        _RPC["alerted"] = True
+        await ops_alert(f"Solana RPC has been failing for {int((now - _RPC['fail_since']) // 60)} min - payments are NOT being matched. "
+                        f"Last error: `{str(e)[:160]}`. Check SIGMA_SOL_RPC / the provider.", key="pay:rpc")
+
+
+def _rpc_ok():
+    if _RPC["alerted"]:
+        log.info("[pay] rpc recovered")
+    _RPC.update({"fail_since": 0.0, "alerted": False})
+    HEARTBEAT["payments"] = _time.time()   # only a pass that actually read the chain counts as alive
+
+
+def _mark_seen(st: dict, seen: list, sig: str):
+    if sig not in seen:
+        seen.append(sig)
+    st["seen"] = seen[-SEEN_CAP:]
+
+
+async def _retry_activations(st: dict):
+    """Sessions paid on chain whose activate() blew up (Discord hiccup, sold-out seat, file error). Bounded so a
+    permanently broken one ends in a loud alert instead of a daily grant attempt forever."""
+    for sid, s in list((st.get("sessions") or {}).items()):
+        if not (s.get("paid") and s.get("activated") is False) or s.get("activate_gave_up"):
+            continue
+        tries = int(s.get("activate_tries") or 0)
+        if tries >= ACTIVATE_RETRIES:
+            s["activate_gave_up"] = True
+            save_payments(st)
+            await ops_alert(f"GIVING UP activating <@{s['user_id']}> ({s['plan']}) after {tries} tries - paid tx {s.get('tx')}. "
+                            f"Grant by hand from /admin desk.", key=f"pay:act:giveup:{sid}")
+            continue
+        await _after_paid(st, s, sid, s.get("tx"))
+
+
+async def _watch_once_inner() -> int | None:
     st = prune(load_payments())
-    seen = set(st.get("seen") or [])
+    seen = list(st.get("seen") or [])
+    seen_set = set(seen)
+    await _retry_activations(st)
     try:
-        sigs = await recent_signatures()
+        sigs = await recent_signatures(seen_set)
     except Exception as e:
         print(f"[pay] rpc error: {e}", flush=True)
-        return 0
-    new = [s for s in sigs if s not in seen]
+        await _rpc_failed(e)
+        return None
+    _rpc_ok()
+    retry = st.get("retry") or {}
+    cutoff = _time.time() - PAY_LATE_GRACE_H * 3600
+    new, skipped = [], 0
+    for sig in sigs:
+        if sig in seen_set:
+            continue
+        bt = BLOCK_TIMES.get(sig)
+        if bt and bt < cutoff and sig not in retry:
+            _mark_seen(st, seen, sig); seen_set.add(sig); skipped += 1   # older than any quote it could match - never worth a fetch
+            continue
+        new.append(sig)
     if not new:
+        if skipped:
+            save_payments(st)
         return 0
     found = 0
     for sig in reversed(new):              # oldest first
@@ -628,13 +815,12 @@ async def _watch_once_inner() -> int:
             tries = st.setdefault("retry", {})
             tries[sig] = tries.get(sig, 0) + 1
             if tries[sig] >= 20:
-                tries.pop(sig, None); seen.add(sig); st["seen"] = list(seen)
+                tries.pop(sig, None); _mark_seen(st, seen, sig)
                 await ops_alert(f"payment watcher: transaction {sig} never loaded from the RPC after 20 tries - check it on solscan: https://solscan.io/tx/{sig}", key=f"pay:null:{sig[:12]}")
             save_payments(st)
             continue
         st.get("retry", {}).pop(sig, None)
-        seen.add(sig)
-        st["seen"] = list(seen)
+        _mark_seen(st, seen, sig)
         for token, amt in received_all(tx, SOL_WALLET):
             if amt < PAY_TOKENS[token]["min"]:
                 print(f"[pay] dust ignored {amt:.6f} {token} {sig[:12]}", flush=True)
@@ -665,6 +851,14 @@ async def _settle_transfer(st: dict, sig: str, token: str, amt: float):
         if worth_guess is not None:
             sid = match_by_value(st.get("sessions", {}), worth_guess, token)
             how = "value" if sid else ""
+    if sid is not None and accepted and how in ("fee", "value"):
+        # a non-exact match is a judgement call - the admin should see every one, an exact tail match stays silent
+        s0 = st["sessions"][sid]
+        open_q = [f"<@{x['user_id']}> {x['plan']} {fmt_amt(float(x['amount']), x.get('token', 'SOL'))} (${x['usd']:,.0f})"
+                  for _sid, x, _c in _live(st.get("sessions", {}), _now()) if _sid != sid]
+        await ops_alert(f"{how.upper()} match: {shown} received -> <@{s0['user_id']}> {s0['plan']} quoted {fmt_amt(float(s0['amount']), token)} "
+                        f"(${s0['usd']:,.0f}). https://solscan.io/tx/{sig}\nOther open quotes: {', '.join(open_q) or 'none'}",
+                        key=f"pay:{how}:{sig[:12]}")
     if sid is None:
         st.setdefault("unmatched", []).append({"sig": sig, "amount": amt, "token": token, "at": _now().isoformat()})
         st["unmatched"] = st["unmatched"][-50:]
@@ -694,31 +888,42 @@ async def _settle_transfer(st: dict, sig: str, token: str, amt: float):
         except Exception:
             pass
         return
-    s.update({"paid": True, "tx": sig, "paid_at": _now().isoformat(), "received": amt, "match": how})
+    # paid is recorded first so a crash here can never match the same transfer twice; activated flips only after
+    # activate() returned, and the watcher retries anything left in between
+    s.update({"paid": True, "tx": sig, "paid_at": _now().isoformat(), "received": amt, "match": how, "activated": False})
     save_payments(st)
     await _after_paid(st, s, sid, sig)
 
 
 async def _after_paid(st: dict, s: dict, sid: str, sig: str):
-    if s.get("promo"):
+    if s.get("promo") and not s.get("promo_done"):
         plansvc.promo_consume(s["promo"])
         pr = plansvc.promos().get(s["promo"])
         row = plansvc.record_referral(st, pr, s, sig)
+        s["promo_done"] = True                  # consumed once even if activation below needs another pass
+        save_payments(st)
         if row:
-            save_payments(st)
             await mod_log(f"**Referral** `{row['code']}` -> {row.get('owner_name') or row['owner_id']} earns ${row['share_usd']:,.2f} "
                           f"({row['share_pct']:g}% of ${row['usd']:,.0f}) from {s.get('user')}", color=GOLD)
     try:
         await activate(int(s["user_id"]), s["plan"], by="chain", tx=sig, usd=s["usd"])
+        s["activated"] = True
+        s.pop("activate_error", None)
+        save_payments(st)
     except Exception as e:
-        print(f"[pay] activate failed {sid}: {e}", flush=True)
-        await ops_alert(f"payment matched but activation failed for <@{s['user_id']}> ({s['plan']}): {e} - tx {sig}", key=f"pay:act:{sid}")
+        s["activate_tries"] = int(s.get("activate_tries") or 0) + 1
+        s["activate_error"] = f"{type(e).__name__}: {str(e)[:160]}"
+        save_payments(st)
+        print(f"[pay] activate failed {sid} (try {s['activate_tries']}): {e}", flush=True)
+        await ops_alert(f"payment matched but activation failed for <@{s['user_id']}> ({s['plan']}): {e} - tx {sig}"
+                        f" - retrying next pass ({s['activate_tries']}/{ACTIVATE_RETRIES})", key=f"pay:act:{sid}")
 
 
 @tasks.loop(seconds=PAY_POLL_SEC)
 async def payment_watch_loop():
-    HEARTBEAT["payments"] = __import__("time").time()
-    await _watch_once()
+    if not SOL_WALLET:
+        HEARTBEAT["payments"] = _time.time()   # nothing to watch - the loop itself is still alive
+    await _watch_once()                        # heartbeat otherwise comes from a pass that read the chain
 
 
 @payment_watch_loop.before_loop
@@ -735,9 +940,10 @@ async def post_panel(channel: discord.abc.Messageable) -> discord.Message:
         await msg.pin()
     except Exception:
         pass
-    st = load_payments()
-    st["panel"] = {"channel_id": channel.id, "message_id": msg.id}
-    save_payments(st)
+    async with PAY_LOCK:
+        st = load_payments()
+        st["panel"] = {"channel_id": channel.id, "message_id": msg.id}
+        save_payments(st)
     return msg
 
 
@@ -780,15 +986,20 @@ def members_embed(guild: discord.Guild, view: str = "overview") -> discord.Embed
             rows.append((0 if life else dl, f"{s.get('name', uid)} · {_plan_short(s.get('plan'))} · {exp}"))
         rows.sort(key=lambda r: (r[0] == 0, r[0]))
         e.title = f"Members - active Pro ({len(rows)})"
-        chunk, cur, n = [], [], 0
+        # Discord caps an embed at 6000 chars in total - stop well under it and say how many rows didn't fit
+        budget, used, chunk, cur, n, shown = 5500, len(e.title) + 120, [], [], 0, 0
         for _, line in rows:
+            if used + len(line) + 1 > budget:
+                break
             if n + len(line) + 1 > 1000:
                 chunk.append("\n".join(cur)); cur, n = [], 0
-            cur.append(line); n += len(line) + 1
+            cur.append(line); n += len(line) + 1; used += len(line) + 1; shown += 1
         if cur:
             chunk.append("\n".join(cur))
-        for i, c in enumerate(chunk[:6]):
+        for i, c in enumerate(chunk):
             e.add_field(name=("Soonest expiry first" if i == 0 else "\u200b"), value=c, inline=False)
+        if shown < len(rows):
+            e.add_field(name="\u200b", value=f"**+{len(rows) - shown} more** - use Export CSV for the full list", inline=False)
         if not rows:
             e.description = "No active subscriptions on record."
         e.set_footer(text="Sigma Trading - members · CSV via the button")
@@ -820,7 +1031,7 @@ def members_embed(guild: discord.Guild, view: str = "overview") -> discord.Embed
         e.add_field(name=f"Unmatched ({len(st.get('unmatched') or [])})",
                     value=("\n".join(f"{fmt_amt(u['amount'], u.get('token', 'SOL'))} · [tx](https://solscan.io/tx/{u['sig']}) · <t:{int(datetime.fromisoformat(u['at']).timestamp())}:R>" for u in reversed(unm)) or "none"), inline=False)
         e.add_field(name="Wallet", value=(f"`{SOL_WALLET}`" if SOL_WALLET else "NOT SET"), inline=False)
-        e.set_footer(text="Sigma Trading - payments · unmatched = resolve with /admin grant, tx in note")
+        e.set_footer(text="Sigma Trading - payments · unmatched = resolve from /admin desk (member -> plan -> Grant, tx in note)")
         return e
     if view == "unrecorded":
         from sigma.config import SUB_ROLE_ID
@@ -829,7 +1040,7 @@ def members_embed(guild: discord.Guild, view: str = "overview") -> discord.Embed
         missing = [m for m in holders if str(m.id) not in subs]
         e.title = f"Pro role without a record ({len(missing)} of {len(holders)})"
         e.description = ("These members have the Pro role but no subscription record - the old bot tracked them. "
-                         "Import each with `/admin grant member plan expires:<date from the old bot>` so expiry and reminders work here.\n\n"
+                         "Import each from `/admin desk` (pick the member -> plan -> Grant, set the expiry from the old bot) so expiry and reminders work here.\n\n"
                          + ("\n".join(f"{m.mention} · {m.display_name}" for m in missing[:40]) if missing else "none - everyone is on record"))
         if len(missing) > 40:
             e.set_footer(text=f"+{len(missing) - 40} more")
@@ -864,8 +1075,8 @@ def members_csv(subs: dict):
     w.writerow(["user_id", "name", "plan", "started", "expires", "paid_usd_total", "last_tx"])
     for uid, s in subs.items():
         hist = s.get("history", [])
-        w.writerow([uid, s.get("name"), s.get("plan"), (s.get("started") or "")[:10], (s.get("expires") or "")[:10],
-                    sum(float(h.get("usd") or h.get("price") or 0) for h in hist), (hist[-1].get("tx") or "") if hist else ""])
+        w.writerow([csv_safe(c) for c in (uid, s.get("name"), s.get("plan"), (s.get("started") or "")[:10], (s.get("expires") or "")[:10],
+                    sum(float(h.get("usd") or h.get("price") or 0) for h in hist), (hist[-1].get("tx") or "") if hist else "")])
     out = io.BytesIO(buf.getvalue().encode("utf-8-sig")); out.seek(0)
     return out
 
@@ -1058,7 +1269,7 @@ def import_preview_embed(res: dict) -> discord.Embed:
     for i in range(0, len(lines), 15):
         e.add_field(name="\u200b" if i else "Members", value="\n".join(lines[i:i + 15])[:1024], inline=False)
     if res["skipped"]:
-        e.add_field(name=f"No trace found ({len(res['skipped'])}) - import by hand with /admin grant expires:",
+        e.add_field(name=f"No trace found ({len(res['skipped'])}) - import by hand from /admin desk (Grant with an expiry)",
                     value="\n".join(f"<@{u}> · {n}" for u, n in res["skipped"][:20])[:1024], inline=False)
     e.set_footer(text="(est.) = plan card only or plan unknown - check the ones that matter")
     return e
@@ -1081,17 +1292,18 @@ async def apply_import(by: str) -> tuple[int, int, int]:
         except Exception as ex:
             print(f"[import] {uid} failed: {ex}", flush=True)
             skipped += 1
-    st = load_payments()
     archived = 0
-    if pending_lapsed:
-        have = {(l.get("uid"), l.get("expires")) for l in (st.get("lapsed") or [])}
-        for l in pending_lapsed:
-            if (l.get("uid"), l.get("expires")) in have:
-                continue
-            st.setdefault("lapsed", []).append(l)
-            archived += 1
-        st["lapsed"] = st["lapsed"][-1000:]
-    st["import_preview"] = {}
-    st["import_lapsed"] = []
-    save_payments(st)
+    async with PAY_LOCK:
+        st = load_payments()
+        if pending_lapsed:
+            have = {(l.get("uid"), l.get("expires")) for l in (st.get("lapsed") or [])}
+            for l in pending_lapsed:
+                if (l.get("uid"), l.get("expires")) in have:
+                    continue
+                st.setdefault("lapsed", []).append(l)
+                archived += 1
+            st["lapsed"] = st["lapsed"][-1000:]
+        st["import_preview"] = {}
+        st["import_lapsed"] = []
+        save_payments(st)
     return done, skipped, archived

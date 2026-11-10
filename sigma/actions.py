@@ -39,9 +39,18 @@ def parse_targets(text, limit: int) -> list:
     return [p.lstrip("$") for p in parts]
 
 
+CHART_MAX_BYTES = 8 * 1024 * 1024       # Discord's upload cap without boosts - a bigger file fails the send anyway
+
+
 async def chart_file(attachment) -> discord.File:
     """Attachment -> File named chart.<ext>. A fixed ASCII name keeps the embed's attachment:// reference
     matching whatever Discord stores (it rewrites spaces and odd characters on upload)."""
+    ctype = (getattr(attachment, "content_type", "") or "").lower()
+    if not ctype.startswith("image/"):
+        raise UserError("The chart must be an image (PNG / JPG).")
+    size = getattr(attachment, "size", None)
+    if isinstance(size, (int, float)) and size > CHART_MAX_BYTES:
+        raise UserError(f"That chart is {size / 1024 / 1024:.1f} MB - keep it under 8 MB.")
     f = await attachment.to_file()
     ext = (str(getattr(attachment, "filename", "") or "").rsplit(".", 1)[-1] or "png").lower()
     if ext not in ("png", "jpg", "jpeg", "webp", "gif"):
@@ -54,28 +63,40 @@ def card_view(kind: str, key) -> discord.ui.View:
     return SpotCardView(key) if kind == store.SPOT else TradeSizerView(key)
 
 
+async def _step(failed: list, name: str, rec: dict, coro):
+    """One after-save step. The record is already on disk, so a Discord hiccup here must not surface as an error
+    that reads like the change was lost - log it, remember the step name for the reply, carry on."""
+    try:
+        await coro
+    except Exception as ex:
+        failed.append(name)
+        print(f"[actions] {name} failed for {rec.get('pair')}: {ex!r}", flush=True)
+
+
+def _with_failures(summary: str, failed: list) -> str:
+    if not failed:
+        return summary
+    return summary + f"\n⚠ Saved, but the {', '.join(failed)} update failed - press Manage again later or ping ops."
+
+
 async def commit(kind: str, key: str, rec: dict, data: dict, out: svc.Outcome, note: str = None) -> str:
     """Persist + refresh + announce one applied event / close. Returns the reply line."""
     spot = kind == store.SPOT
     data[key] = rec
     store.save(kind, data)
-    try:
-        await refresh_and_edit(rec, spot_mode=spot)
-    except Exception as ex:
-        print(f"[actions] card refresh failed for {rec.get('pair')}: {ex}", flush=True)
-    await refresh_board()
+    failed = []
+    await _step(failed, "card", rec, refresh_and_edit(rec, spot_mode=spot))
+    await _step(failed, "board", rec, refresh_board())
     if not out.silent:
         line = out.line or out.desc
         if note:
             line += f"\n> {note}"
-        await post_update_feed(rec, out.title or out.desc, out.color, line, footer=(SPOT_FOOTER if spot else FUT_FOOTER))
-    await thread_note(rec, f"**{out.desc}{out.result_txt}**" + (f" - {note}" if note else ""))
+        await _step(failed, "feed", rec, post_update_feed(rec, out.title or out.desc, out.color, line, footer=(SPOT_FOOTER if spot else FUT_FOOTER)))
+    await _step(failed, "thread", rec, thread_note(rec, f"**{out.desc}{out.result_txt}**" + (f" - {note}" if note else "")))
     if out.closed:
-        try:
-            await _results_watch_tick()      # results card + summary now, not on the next poll
-        except Exception as ex:
-            print(f"[actions] results post failed: {ex}", flush=True)
-    return f"{'Closed' if out.closed else 'Updated'}: {out.desc}{out.result_txt}" + (f"\n{out.extra}" if out.extra else "")
+        await _step(failed, "results", rec, _results_watch_tick())      # results card + summary now, not on the next poll
+    summary = f"{'Closed' if out.closed else 'Updated'}: {out.desc}{out.result_txt}" + (f"\n{out.extra}" if out.extra else "")
+    return _with_failures(summary, failed)
 
 
 async def commit_edit(kind: str, key: str, rec: dict, data: dict, changes: list, notes: str = None) -> str:
@@ -83,29 +104,25 @@ async def commit_edit(kind: str, key: str, rec: dict, data: dict, changes: list,
     spot = kind == store.SPOT
     data[key] = rec
     store.save(kind, data)
-    try:
-        await refresh_and_edit(rec, spot_mode=spot)
-    except Exception as ex:
-        print(f"[actions] card refresh failed for {rec.get('pair')}: {ex}", flush=True)
-    await refresh_board()
+    failed = []
+    await _step(failed, "card", rec, refresh_and_edit(rec, spot_mode=spot))
+    await _step(failed, "board", rec, refresh_board())
     changed_txt = ", ".join(changes)
-    await thread_note(rec, f"**Edited** - corrected: {changed_txt}")
+    await _step(failed, "thread", rec, thread_note(rec, f"**Edited** - corrected: {changed_txt}"))
     if notes is not None:
-        await thread_note(rec, f"**{'Thesis' if spot else 'Reasoning'} (updated):** {notes[:1900]}")
-    return f"Edited: {changed_txt}"
+        await _step(failed, "thread", rec, thread_note(rec, f"**{'Thesis' if spot else 'Reasoning'} (updated):** {notes[:1900]}"))
+    return _with_failures(f"Edited: {changed_txt}", failed)
 
 
 async def commit_fix(kind: str, key: str, rec: dict, data: dict, change: str, note: str = None) -> str:
     """Persist a fill correction and refresh. Returns the reply line."""
     data[key] = rec
     store.save(kind, data)
-    try:
-        await refresh_and_edit(rec, spot_mode=(kind == store.SPOT))
-    except Exception as ex:
-        print(f"[actions] card refresh failed for {rec.get('pair')}: {ex}", flush=True)
-    await refresh_board()
-    await thread_note(rec, f"**Correction** - {change}" + (f" - {note}" if note else ""))
-    return f"Fixed: {change}"
+    failed = []
+    await _step(failed, "card", rec, refresh_and_edit(rec, spot_mode=(kind == store.SPOT)))
+    await _step(failed, "board", rec, refresh_board())
+    await _step(failed, "thread", rec, thread_note(rec, f"**Correction** - {change}" + (f" - {note}" if note else "")))
+    return _with_failures(f"Fixed: {change}", failed)
 
 
 async def replace_chart(kind: str, key: str, rec: dict, data: dict, attachment) -> str:
@@ -152,17 +169,15 @@ async def reopen_trade(kind: str, key: str, rec: dict, data: dict) -> str:
                         pass
             removed = True
     save_results(state)
-    try:
-        await refresh_and_edit(rec, spot_mode=spot)
-    except Exception:
-        pass
-    await refresh_board()
-    await refresh_results_summary(repost=True)
-    await post_update_feed(rec, "Setup reopened", BLUE,
-                           "Previous close was recorded in error and has been reversed. "
-                           + ("The play is live again." if spot else "The setup is live again - auto-tracking is off for it (manual updates)."),
-                           footer=(SPOT_FOOTER if spot else FUT_FOOTER))
-    return f"Reopened {rec.get('pair', '?').upper()}." + (" Wrong results card deleted, summary rebuilt." if removed else "")
+    failed = []
+    await _step(failed, "card", rec, refresh_and_edit(rec, spot_mode=spot))
+    await _step(failed, "board", rec, refresh_board())
+    await _step(failed, "results", rec, refresh_results_summary(repost=True))
+    await _step(failed, "feed", rec, post_update_feed(rec, "Setup reopened", BLUE,
+                "Previous close was recorded in error and has been reversed. "
+                + ("The play is live again." if spot else "The setup is live again - auto-tracking is off for it (manual updates)."),
+                footer=(SPOT_FOOTER if spot else FUT_FOOTER)))
+    return _with_failures(f"Reopened {rec.get('pair', '?').upper()}." + (" Wrong results card deleted, summary rebuilt." if removed else ""), failed)
 
 
 async def ensure_card_views():

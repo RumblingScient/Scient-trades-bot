@@ -27,10 +27,31 @@ def parse_sl(text):
     cond = re.sub(r"\s+", " ", cond).strip()[:60]
     return num, (cond or None)
 
+# one number, scientific notation allowed ("1.234e-05" is what str() gives for tiny-price coins)
+_NUM_RE = r"(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][-+]?\d+)?"
+# "63000 - 62500", "0.5/0.45": two prices with a separator between them (a bare "63000 4h" is not a range)
+_RANGE_RE = r"\d[\d,.]*(?:[eE][-+]?\d+)?\s*[-–/]\s*\d"
+
+def num_str(x) -> str:
+    """Float -> plain decimal text ("0.00001234", "63000.5"), never scientific notation - this is what goes
+    back into records and modal defaults, and every parser here reads plain decimals."""
+    if x is None:
+        return ""
+    s = f"{float(x):.10f}".rstrip("0").rstrip(".")
+    return s or "0"
+
 def parse_num(val):
     if val is None:
         return None
-    cleaned = "".join(c for c in str(val).replace(",", "") if c in "0123456789.")
+    raw = str(val).replace(",", "").replace("$", "").strip()
+    # float() first so "1.234e-05" keeps its exponent; the digit filter would read it as 1.23405
+    try:
+        v = float(raw)
+        if v == v and abs(v) != float("inf"):
+            return v
+    except ValueError:
+        pass
+    cleaned = "".join(c for c in raw if c in "0123456789.")
     try:
         return float(cleaned)
     except ValueError:
@@ -40,7 +61,7 @@ def first_num(s):
     if s is None:
         return None
     s = re.sub(r"\([^)]*\)", "", str(s))
-    nums = re.findall(r"\d+(?:\.\d+)?", s.replace(",", ""))
+    nums = re.findall(_NUM_RE, s.replace(",", ""))
     return float(nums[0]) if nums else None
 
 def entry_weights(t):
@@ -58,9 +79,11 @@ def entry_num(t):
     e2 = first_num(t.get("entry2")) if t.get("entry2") else None
     if e2 is None:
         s = re.sub(r"\([^)]*\)", "", str(t.get("entry", "")))
-        nums = [float(x) for x in re.findall(r"\d+(?:\.\d+)?", s.replace(",", ""))]
-        if len(nums) >= 2:
-            return (nums[0] + nums[1]) / 2
+        # only a written range ("63000 - 62500") averages; "63000 4h" is one price plus a note
+        if re.search(_RANGE_RE, s.replace(",", "")):
+            nums = [float(x) for x in re.findall(_NUM_RE, s.replace(",", ""))]
+            if len(nums) >= 2:
+                return (nums[0] + nums[1]) / 2
         return e1
     f1, f2 = t.get("entry1_filled"), t.get("entry2_filled")
     w1, w2 = entry_weights(t)

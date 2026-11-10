@@ -12,7 +12,8 @@ import functools as _functools
 from sigma.logging_setup import print
 from sigma.config import ALERT_CHECK_MIN, FREE_ALERT_LIMIT, GREEN, NAVY, RED
 from sigma.core import bot
-from sigma.storage import load_alerts, load_watchlists, save_alerts, save_watchlists
+from sigma.ops import HEARTBEAT
+from sigma.storage import ALERTS_LOCK, load_alerts, load_watchlists, save_alerts, save_watchlists
 from sigma.market_data import is_tradfi, md_price, md_ticker24, md_tradfi
 from sigma.calculations import fnum, parse_num
 from sigma.members import member_is_pro
@@ -32,25 +33,26 @@ async def alert_cmd(interaction: discord.Interaction, coin: str, price: str):
     if cur is None:
         await interaction.followup.send(f"Couldn't find **{symbol}** on Binance or Bybit - check the symbol.", ephemeral=True)
         return
-    alerts = load_alerts()
     uid = str(interaction.user.id)
-    user_alerts = alerts.get(uid, [])
     is_pro = member_is_pro(interaction.user)
-    if not is_pro and len(user_alerts) >= FREE_ALERT_LIMIT:
-        await interaction.followup.send(
-            f"You've hit the free limit of **{FREE_ALERT_LIMIT} active alerts**. "
-            f"Delete one with `/alerts` or upgrade for unlimited alerts.",
-            ephemeral=True,
-        )
-        return
     direction = "above" if target > cur else "below"
-    user_alerts.append({
-        "pair": pair, "symbol": symbol, "target": target,
-        "direction": direction, "set_price": cur,
-        "created": datetime.now(timezone.utc).isoformat(),
-    })
-    alerts[uid] = user_alerts
-    save_alerts(alerts)
+    async with ALERTS_LOCK:          # the check loop holds a loaded copy across awaits; an unlocked save here would be lost
+        alerts = load_alerts()
+        user_alerts = alerts.get(uid, [])
+        if not is_pro and len(user_alerts) >= FREE_ALERT_LIMIT:
+            await interaction.followup.send(
+                f"You've hit the free limit of **{FREE_ALERT_LIMIT} active alerts**. "
+                f"Delete one with `/alerts` or upgrade for unlimited alerts.",
+                ephemeral=True,
+            )
+            return
+        user_alerts.append({
+            "pair": pair, "symbol": symbol, "target": target,
+            "direction": direction, "set_price": cur,
+            "created": datetime.now(timezone.utc).isoformat(),
+        })
+        alerts[uid] = user_alerts
+        save_alerts(alerts)
     left = "unlimited" if is_pro else f"{FREE_ALERT_LIMIT - len(user_alerts)} left"
     await interaction.followup.send(
         f"\u2705 Alert set: **{symbol}** {direction} **{fnum(target)}** (now {fnum(cur)}).\n"
@@ -96,11 +98,12 @@ class AlertDeleteButton(Button):
         if str(interaction.user.id) != self.uid:
             await interaction.response.send_message("Not your alert.", ephemeral=True)
             return
-        alerts = load_alerts()
-        arr = alerts.get(self.uid, [])
-        arr = [x for x in arr if not (x["pair"] == self.pair and x["target"] == self.target)]
-        alerts[self.uid] = arr
-        save_alerts(alerts)
+        async with ALERTS_LOCK:
+            alerts = load_alerts()
+            arr = alerts.get(self.uid, [])
+            arr = [x for x in arr if not (x["pair"] == self.pair and x["target"] == self.target)]
+            alerts[self.uid] = arr
+            save_alerts(alerts)
         self.disabled = True
         await interaction.response.edit_message(content="Alert removed.", view=None)
 
@@ -217,6 +220,11 @@ async def calendar_cmd(interaction: discord.Interaction):
 
 @tasks.loop(minutes=ALERT_CHECK_MIN)
 async def alert_check_loop():
+    async with ALERTS_LOCK:
+        await _alert_check_tick()
+    HEARTBEAT["alerts"] = _time.time()
+
+async def _alert_check_tick():
     alerts = load_alerts()
     if not alerts:
         return

@@ -16,4 +16,5 @@ intents = discord.Intents.default()
 
 intents.members = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix="!", intents=intents,
+                   allowed_mentions=discord.AllowedMentions.none())   # nothing the bot relays can ping @everyone / @here

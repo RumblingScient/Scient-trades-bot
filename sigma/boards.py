@@ -9,6 +9,7 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta, time as dt_time
 import logging, logging.handlers, builtins, time as _time, traceback as _tb
 import functools as _functools
+from sigma.logging_setup import print
 from sigma.config import ANALYSTS, NAVY, OPEN_BOARD_CHANNEL_ID
 from sigma.core import bot
 from sigma.storage import load_board, load_spot, load_spot_board, load_trades, save_board, save_spot_board
@@ -102,9 +103,11 @@ async def refresh_board():
             await msg.edit(embed=embed)
             return
         except discord.NotFound:
-            pass
-        except discord.HTTPException:
-            pass
+            pass                                       # the pinned board is gone - post a fresh one below
+        except discord.HTTPException as ex:
+            # rate limit / outage / permissions: the board still exists, so re-posting would stack duplicates and pins
+            print(f"[board] refresh failed ({ex}) - keeping the existing board", flush=True)
+            return
     msg = await ch.send(embed=embed)
     try:
         await msg.pin()

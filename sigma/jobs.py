@@ -12,8 +12,9 @@ import functools as _functools
 from pathlib import Path
 _ROOT = Path(__file__).resolve().parent.parent   # repo root: .env, logs/, *.json live here
 from sigma.logging_setup import print
-from sigma.config import IST, LIQ_CHANNEL_ID, NAVY
+from sigma.config import BACKUP_DIR, IST, LIQ_CHANNEL_ID, NAVY
 from sigma.core import bot
+from sigma.ops import HEARTBEAT, _note_error, ops_alert
 from sigma.market_data import fetch_agg_rows
 
 
@@ -34,6 +35,7 @@ _funding_guard_state = {}   # base -> {"last_fire": ts, "armed": True}
 async def funding_guard_loop():
     try:
         await _funding_guard_tick()
+        HEARTBEAT["funding"] = _time.time()
     except Exception as e:
         print(f"[fguard] tick error: {e}", flush=True)
 
@@ -85,26 +87,44 @@ async def _funding_guard_tick():
 async def _before_funding_guard():
     await bot.wait_until_ready()
 
+def last_backup_age():
+    """Seconds since the newest backup folder was written, or None when there is none (health embed)."""
+    try:
+        folders = [d for d in BACKUP_DIR.iterdir() if d.is_dir()]
+        if not folders:
+            return None
+        return max(0.0, _time.time() - max(d.stat().st_mtime for d in folders))
+    except Exception:
+        return None
+
+def _backup_once() -> int:
+    """Copy every root *.json into BACKUP_DIR/<yyyymmdd>, keep the newest 7 days. Returns files copied."""
+    import shutil
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    ddir = BACKUP_DIR / datetime.now(IST).strftime("%Y%m%d")
+    ddir.mkdir(exist_ok=True)
+    n = 0
+    for f in _ROOT.glob("*.json"):
+        shutil.copy2(f, ddir / f.name)
+        n += 1
+    os.utime(ddir)                     # folder mtime = time of the last successful copy, which is what last_backup_age reads
+    for old in sorted(d for d in BACKUP_DIR.iterdir() if d.is_dir())[:-7]:
+        shutil.rmtree(old, ignore_errors=True)
+    print(f"[backup] {n} files -> {ddir}", flush=True)
+    return n
+
 @tasks.loop(time=dt_time(hour=21, minute=30, tzinfo=timezone.utc))  # 3:00 AM IST
 async def backup_loop():
     try:
-        import shutil
-        bdir = Path.home() / "bot_backups"
-        bdir.mkdir(exist_ok=True)
-        stamp = datetime.now(IST).strftime("%Y%m%d")
-        ddir = bdir / stamp
-        ddir.mkdir(exist_ok=True)
-        n = 0
-        for f in _ROOT.glob("*.json"):
-            shutil.copy2(f, ddir / f.name)
-            n += 1
-        # rotate: keep newest 7 daily folders
-        folders = sorted([d for d in bdir.iterdir() if d.is_dir()])
-        for old in folders[:-7]:
-            shutil.rmtree(old, ignore_errors=True)
-        print(f"[backup] {n} files -> {ddir}", flush=True)
+        n = await asyncio.to_thread(_backup_once)
     except Exception as e:
-        print(f"[backup] error: {e}", flush=True)
+        _note_error("backup", e)
+        await ops_alert(f"nightly backup FAILED: `{type(e).__name__}: {str(e)[:160]}` (dir {BACKUP_DIR})", key="backup")
+        return
+    if n == 0:
+        await ops_alert(f"nightly backup copied 0 files - nothing matched *.json under {_ROOT}", key="backup")
+        return
+    HEARTBEAT["backup"] = _time.time()
 
 @backup_loop.before_loop
 async def before_backup():

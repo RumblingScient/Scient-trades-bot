@@ -12,6 +12,7 @@ import functools as _functools
 from sigma.logging_setup import print
 from sigma.config import ANALYST_ROLE_NAME, TWITTERAPIS_KEY, X_AUTO_ENABLED, X_AUTO_USERNAME, X_FEED_CHANNEL_ID, X_PING_ROLE_ID, X_POLL_MINUTES
 from sigma.core import bot
+from sigma.ops import HEARTBEAT, ops_alert
 from sigma.http import http
 from sigma.storage import load_xseen, save_xseen
 from sigma.calculations import fix_x_link
@@ -20,6 +21,22 @@ from sigma.members import is_analyst
 
 _POSTED: set = set()          # ids posted by this process - a second line of defence if the seen-file can't be saved
 _HISTORY_SCAN = 60            # how many recent feed messages to check before posting
+_TASKS: set = set()           # strong refs to fire-and-forget alert tasks
+_FAIL = {"n": 0}              # consecutive failed polls; the admin hears about it at _FAIL_ALERT_AT
+_FAIL_ALERT_AT = 3
+
+
+def _keep(task):
+    _TASKS.add(task)
+    task.add_done_callback(_TASKS.discard)
+    return task
+
+
+async def _poll_failed(why: str):
+    _FAIL["n"] += 1
+    print(f"[x_poll] {why} (consecutive failures: {_FAIL['n']})")
+    if _FAIL["n"] == _FAIL_ALERT_AT:
+        await ops_alert(f"X feed: {_FAIL['n']} polls in a row failed - last: {why[:160]}. Check the twitterapis key/credit.", key="xfeed")
 
 
 async def _already_in_channel(channel, tid: str) -> bool:
@@ -43,8 +60,7 @@ def _remember(seen: dict, ids: list) -> bool:
     except Exception as e:
         print(f"[x_poll] seen-file save FAILED - {e}", flush=True)
         try:
-            from sigma.ops import ops_alert
-            asyncio.create_task(ops_alert(f"X feed: can't save x_posted.json ({e}). Posting is guarded by channel history until this is fixed.", key="xseen-save"))
+            _keep(asyncio.create_task(ops_alert(f"X feed: can't save x_posted.json ({e}). Posting is guarded by channel history until this is fixed.", key="xseen-save")))
         except Exception:
             pass
         return False
@@ -65,12 +81,17 @@ async def x_poll_loop():
         async with http() as session:
             async with session.get(url, params=params, headers=headers, timeout=30) as resp:
                 if resp.status != 200:
-                    print(f"[x_poll] non-200: {resp.status}")
+                    await _poll_failed(f"HTTP {resp.status}")
                     return
                 data = await resp.json()
     except Exception as e:
-        print(f"[x_poll] error: {e}")
+        await _poll_failed(f"error: {e}")
         return
+    if not isinstance(data, dict):
+        await _poll_failed(f"unexpected body: {type(data).__name__}")    # an error page or a quota notice, not the feed
+        return
+    _FAIL["n"] = 0
+    HEARTBEAT["x_poll"] = _time.time()
     tweets = data.get("tweets", []) or []
     if not tweets:
         return

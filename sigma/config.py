@@ -14,19 +14,42 @@ _ROOT = Path(__file__).resolve().parent.parent   # repo root: .env, logs/, *.jso
 
 
 
-OPS_CHANNEL_ID = int(os.getenv("SIGMA_OPS_CHANNEL_ID", "0") or 0)   # BACKSTAGE ops channel for alerts
+def _parse_env_line(line: str):
+    """One .env line -> (key, value) or None. Accepts `export KEY=v`, strips matching quotes, skips comments/blanks."""
+    s = line.strip()
+    if not s or s.startswith("#") or "=" not in s:
+        return None
+    if s.startswith("export "):
+        s = s[7:].lstrip()
+    k, v = s.split("=", 1)
+    k, v = k.strip(), v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+        v = v[1:-1]
+    return (k, v) if k else None
+
+
+def _env_int(name: str, default: int = 0) -> int:
+    """Integer env var; a typo in .env fails loudly here instead of as a bare ValueError deep in the import."""
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        raise ValueError(f"{name} must be an integer (got {raw!r}) - fix it in .env") from None
+
 
 _env_file = _ROOT.joinpath(".env")
 
 if _env_file.exists():
     for _line in _env_file.read_text().splitlines():
-        if "=" in _line and not _line.strip().startswith("#"):
-            _k, _v = _line.split("=", 1)
-            os.environ.setdefault(_k.strip(), _v.strip())
+        _kv = _parse_env_line(_line)
+        if _kv:
+            os.environ.setdefault(_kv[0], _kv[1])
 
 BOT_TOKEN = os.getenv("SCIENT_BOT_TOKEN", "PASTE_TOKEN_HERE")
 
-OPS_CHANNEL_ID = int(os.getenv("SIGMA_OPS_CHANNEL_ID", "0") or 0)   # re-read now that .env is loaded
+OPS_CHANNEL_ID = _env_int("SIGMA_OPS_CHANNEL_ID")   # BACKSTAGE ops channel for alerts
 
 TWITTERAPIS_KEY = os.getenv("TWITTERAPIS_KEY", "")
 
@@ -57,11 +80,11 @@ SUB_PLANS = {
 
 SUB_REMINDER_DAYS = (7, 3, 1)   # DM a renewal reminder at each of these days-before-expiry
 
-ALUMNI_ROLE_ID = int(os.getenv("SIGMA_ALUMNI_ROLE_ID", "0") or 0)        # lapsed members, read-only (0 = off)
-MOD_LOG_CHANNEL_ID = int(os.getenv("SIGMA_MODLOG_CHANNEL_ID", "0") or 0)  # every grant/revoke/expiry lands here (0 = ops channel)
+ALUMNI_ROLE_ID = _env_int("SIGMA_ALUMNI_ROLE_ID")        # lapsed members, read-only (0 = off)
+MOD_LOG_CHANNEL_ID = _env_int("SIGMA_MODLOG_CHANNEL_ID")  # every grant/revoke/expiry lands here (0 = ops channel)
 
 # ─── Payments: SOL to a fixed wallet, unique amount per session, chain-verified ───
-PAYMENT_CHANNEL_ID = int(os.getenv("SIGMA_PAYMENT_CHANNEL_ID", "0") or 0)   # #join-via-payment
+PAYMENT_CHANNEL_ID = _env_int("SIGMA_PAYMENT_CHANNEL_ID")   # #join-via-payment
 SOL_WALLET = os.getenv("SIGMA_SOL_WALLET", "").strip()                      # receiving address - .env only
 SOL_RPC = os.getenv("SIGMA_SOL_RPC", "https://api.mainnet-beta.solana.com").strip()
 PAY_SESSION_MIN = 30          # quote valid this long
@@ -199,6 +222,7 @@ EMA_PERIODS = [20, 50, 100, 200]  # change to match Scient 4EMA periods
 EMA_COLORS = ["#E8590C", "#FAC775", SG_CYAN, "#5B9CFF"]
 
 ANALYST_ROLE_NAME = "Analyst"
+ANALYST_ROLE_ID = _env_int("SIGMA_ANALYST_ROLE_ID")   # preferred over the name: a mod with Manage Roles can mint a role called "Analyst"
 
 PING_ROLE_ID = 1525861312729452704
 
@@ -311,3 +335,5 @@ SIGMA_EMBED_CYAN = discord.Color.from_str(SIGMA_CYAN)
 RESULTS_FILE = _ROOT.joinpath("results_board.json")
 
 ACCEPTED_TOKENS = [k for k, v in PAY_TOKENS.items() if v.get("accept", True)]
+
+BACKUP_DIR = Path(os.getenv("SIGMA_BACKUP_DIR", "") or (_ROOT / "backups"))   # daily JSON backups (was ~/, which systemd may not have)

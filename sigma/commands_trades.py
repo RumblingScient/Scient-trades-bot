@@ -15,7 +15,7 @@ from sigma.config import ANALYST_ROLE_NAME, BLUE, DGREY, EDIT_WINDOW_MIN, FRAMEW
 from sigma.core import bot
 from sigma.storage import load_results, load_spot, load_trades, save_board, save_results, save_spot, save_trades
 from sigma.calculations import _in_window, _is_tp_fill, _stats_window, _sync_tp_flags, entry_num, fills_pct, finalize_close, first_num, fnum, parse_num, parse_sl, parse_spot_split, sl_num, spot_num, spot_ref_entry, spot_result_r, spot_signed_r, spot_weighted_entry, spot_weighted_exit, tf
-from sigma.members import analyst_color_hex, is_analyst, resolve_analyst
+from sigma.members import analyst_color_hex, csv_safe, is_analyst, member_is_pro, resolve_analyst
 from sigma.cards import _ac_label, _ac_sortkey, build_embed, build_spot_embed, emo, jump_url, post_update_feed, refresh_and_edit, thread_note, within_edit_window
 from sigma.sizer import TradeSizerView
 from sigma.boards import _fit_lines, build_combined_board_embed, refresh_board, refresh_spot_board
@@ -23,9 +23,20 @@ from sigma.tracker import _with_state_lock
 from sigma.results import refresh_results_summary
 
 
+PRO_ONLY = "Sigma Pro only - live entries and stops are for members. Pick a plan in the payment channel to unlock them."
+
+
+def can_see_live(interaction: discord.Interaction) -> bool:
+    """Open positions carry entry / SL - the paid product. Pro members, analysts and admins only."""
+    return member_is_pro(interaction.user) or is_analyst(interaction)
+
+
 @bot.tree.command(name="open", description="Every live setup and spot play right now")
 async def open_cmd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
+    if not can_see_live(interaction):
+        await interaction.followup.send(PRO_ONLY, ephemeral=True)
+        return
     await interaction.followup.send(embed=build_combined_board_embed(), ephemeral=True)
 
 @bot.tree.command(name="recent", description="Latest closed setups and spot plays with results")
@@ -84,7 +95,8 @@ async def board_cmd(interaction: discord.Interaction):
     await refresh_board()
     await interaction.followup.send("Board rebuilt.", ephemeral=True)
 
-def build_trades_csv(trades: list, analyst_name: str) -> io.BytesIO:
+def build_trades_csv(trades: list, analyst_name: str, pro: bool = True) -> io.BytesIO:
+    """pro=False: open trades are listed without entry / stops / targets - closed results only are public."""
     import csv as _csv
     buf = io.StringIO()
     w = _csv.writer(buf)
@@ -92,17 +104,19 @@ def build_trades_csv(trades: list, analyst_name: str) -> io.BytesIO:
                 "entry", "entry2", "sl", "final_sl", "risk_pct", "tp1", "tp2", "tp3", "tp4",
                 "fills", "avg_exit", "result", "result_r", "status", "frameworks", "edited"])
     for t in trades:
-        fills = "; ".join(f"{f.get('label','')}@{f.get('price','')}x{f.get('pct','')}%" for f in t.get("fills", []) or [])
+        hide = not pro and not t.get("closed")
+        fills = "" if hide else "; ".join(f"{f.get('label','')}@{f.get('price','')}x{f.get('pct','')}%" for f in t.get("fills", []) or [])
         status = "CLOSED" if t.get("closed") else ("BE-set" if t.get("be") else "OPEN")
         created = t.get("created_at", "") or ""
-        w.writerow([
+        lv = (lambda k: "") if hide else (lambda k: t.get(k, ""))
+        w.writerow([csv_safe(c) for c in (
             created[:10], analyst_name, t.get("pair", ""), t.get("direction", ""),
             t.get("timeframe", ""), t.get("entry_type", ""),
-            t.get("entry", ""), t.get("entry2", ""), t.get("initial_sl") or t.get("sl", ""), t.get("sl", ""), t.get("risk", ""),
-            t.get("tp1", ""), t.get("tp2", ""), t.get("tp3", ""), t.get("tp4", ""),
-            fills, t.get("avg_exit", ""), t.get("result", ""), t.get("result_r", ""),
+            lv("entry"), lv("entry2"), ("" if hide else (t.get("initial_sl") or t.get("sl", ""))), lv("sl"), lv("risk"),
+            lv("tp1"), lv("tp2"), lv("tp3"), lv("tp4"),
+            fills, lv("avg_exit"), t.get("result", ""), t.get("result_r", ""),
             status, " + ".join(t.get("frameworks", []) or []), "yes" if t.get("edited") else "",
-        ])
+        )])
     out = io.BytesIO(buf.getvalue().encode("utf-8-sig"))  # BOM so Excel opens it cleanly
     out.seek(0)
     return out
@@ -117,7 +131,11 @@ class StatsCSVView(View):
         self.add_item(btn)
 
     async def send_csv(self, interaction: discord.Interaction):
-        f = discord.File(build_trades_csv(self.trades, self.analyst_name),
+        # the view can outlive the member's role (10 min timeout) - decide on the click, not on the /stats call
+        if not can_see_live(interaction):
+            await interaction.response.send_message(PRO_ONLY, ephemeral=True)
+            return
+        f = discord.File(build_trades_csv(self.trades, self.analyst_name, pro=True),
                          filename=f"{self.analyst_name}_journal.csv")
         await interaction.response.send_message(file=f, ephemeral=True)
 
